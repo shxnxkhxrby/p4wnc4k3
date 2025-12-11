@@ -321,8 +321,6 @@ enum MenuState {
   ASCII_ART_VIEWER
 };
 
-int screenBrightness = 255;
-
 MenuState currentState = BOOT_ANIMATION;
 MenuState previousState = MAIN_MENU;
 int selectedIndex = 0;
@@ -543,7 +541,6 @@ int skimmerScrollOffset = 0;
 void drawMainMenu();
 void drawWiFiMenu();
 void drawBLEMenu();
-void drawSnifferMenu();
 void drawAttackMenu();
 void drawBLEJammerMenu();
 void showMessage(const char* msg, uint16_t color);
@@ -2459,7 +2456,7 @@ void drawSettingsMenu() {
   
   const char* menuItems[] = {
     "Device Info",
-    "Brightness",
+    "SD Card",
     "Show ASCII Art",
     "Reboot Device"
   };
@@ -2469,33 +2466,6 @@ void drawSettingsMenu() {
     drawMenuItem(menuItems[i], i, y, hoveredIndex == i, false);
     y += MENU_ITEM_HEIGHT + MENU_SPACING;
   }
-  
-  // ✅ Show brightness UI inline (symmetrical design)
-  int brightY = HEADER_HEIGHT + 10 + (1 * (MENU_ITEM_HEIGHT + MENU_SPACING));
-  
-  // Draw brightness controls on the same line as "Brightness"
-  int controlsX = 145;  // Aligned to right side
-  
-  // Minus button
-  tft.fillRect(controlsX, brightY + 3, 20, 16, COLOR_HEADER);
-  tft.drawRect(controlsX, brightY + 3, 20, 16, COLOR_DARK_GREEN);
-  tft.setTextSize(1);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(controlsX + 7, brightY + 7);
-  tft.print("-");
-  
-  // Percentage display (centered)
-  tft.setTextColor(COLOR_CYAN);
-  tft.setCursor(controlsX + 25, brightY + 7);
-  int percentage = (screenBrightness * 100) / 255;
-  tft.printf("%3d%%", percentage);
-  
-  // Plus button
-  tft.fillRect(controlsX + 60, brightY + 3, 20, 16, COLOR_HEADER);
-  tft.drawRect(controlsX + 60, brightY + 3, 20, 16, COLOR_DARK_GREEN);
-  tft.setTextColor(COLOR_GREEN);
-  tft.setCursor(controlsX + 67, brightY + 7);
-  tft.print("+");
   
   // Back button
   int backY = 305;
@@ -2819,15 +2789,6 @@ void displayIntegratedBootCentered() {
   }
   
   delete[] lines;
-}
-
-void setBrightness(int brightness) {
-  screenBrightness = constrain(brightness, 0, 255);
-  analogWrite(TFT_BL, screenBrightness);
-  
-  Serial.printf("[*] Brightness set to %d%% (%d/255)\n", 
-                (screenBrightness * 100) / 255, 
-                screenBrightness);
 }
 
 void drawBeaconManager() {
@@ -3305,52 +3266,6 @@ void drawBLEJammerMenu() {
   tft.print("[ESC] Back");
 }
 
-void drawSnifferMenu() {
-  tft.fillScreen(COLOR_BG);
-  drawTerminalHeader("sniffer");
-  
-  const char* menuItems[] = {
-    "Start Sniffer",
-    "Stop Sniffer"
-  };
-  
-  int y = HEADER_HEIGHT + 10;
-  for (int i = 0; i < 2; i++) {
-    drawMenuItem(menuItems[i], i, y, hoveredIndex == i, false);
-    y += MENU_ITEM_HEIGHT + MENU_SPACING;
-  }
-  
-  // Status
-  y += 20;
-  tft.setTextSize(1);
-  tft.setTextColor(COLOR_DARK_GREEN);
-  tft.setCursor(SIDE_MARGIN, y);
-  tft.printf("Channel: ");
-  tft.setTextColor(COLOR_CYAN);
-  tft.printf("Ch %d", snifferChannel);
-  
-  y += 15;
-  tft.setTextColor(COLOR_DARK_GREEN);
-  tft.setCursor(SIDE_MARGIN, y);
-  tft.printf("Status: ");
-  tft.setTextColor(snifferActive ? COLOR_ORANGE : COLOR_GREEN);
-  tft.printf(snifferActive ? "ACTIVE" : "STOPPED");
-  
-  y += 15;
-  tft.setTextColor(COLOR_DARK_GREEN);
-  tft.setCursor(SIDE_MARGIN, y);
-  tft.printf("Packets: ");
-  tft.setTextColor(COLOR_GREEN);
-  tft.printf("%d", packetCount);
-  
-  // Back button (consistent style)
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(85, backY + 3);
-  tft.print("[ESC] Back");
-}
-
 void drawMoreToolsMenu() {
   tft.fillScreen(COLOR_BG);
   drawTerminalHeader("more tools");
@@ -3776,10 +3691,6 @@ void handleTouch() {
       case BEACON_ADD:
         handleBeaconAddTouch(touchX, touchY);
         break;
-        
-      case SNIFFER_MENU:
-        handleSnifferMenuTouch(touchX, touchY);
-        break;
 
       case WIFI_BLE_NRF_JAM:
         // Handle both deauth flood and combined jammer
@@ -3793,11 +3704,24 @@ void handleTouch() {
         break;
         
       case SNIFFER_ACTIVE:
-        // Just stop, don't redraw yet
-        stopSniffer();
-        currentState = SNIFFER_MENU;
-        drawSnifferMenu();
-        break;
+        Serial.println("\n[!] ===== SNIFFER STOP INITIATED =====");
+        Serial.printf("Before: snifferActive=%d, currentState=%d\n", snifferActive, currentState);
+        esp_wifi_set_promiscuous(false);
+        Serial.println("[1] Promiscuous mode disabled");
+        snifferActive = false;
+        Serial.printf("[2] snifferActive = %d\n", snifferActive);
+        currentState = MAIN_MENU;
+        Serial.printf("[3] currentState = %d (MAIN_MENU)\n", currentState);
+        delay(50);
+        tft.fillScreen(COLOR_BG);
+        Serial.println("[4] Screen cleared");
+        drawMainMenu();
+        Serial.println("[5] Main menu drawn");
+        addToConsole("Sniffer stopped");
+        
+        Serial.printf("After: snifferActive=%d, currentState=%d\n", snifferActive, currentState);
+        Serial.println("[✓] ===== SNIFFER STOPPED =====\n");
+        return;
         
       case HANDSHAKE_CAPTURE:
         // Just stop, don't redraw yet
@@ -3994,8 +3918,15 @@ void handleBackButton() {
   
   // Stop active operations
   if (currentState == BLE_JAM_ACTIVE) stopBLEJammer();
-  if (currentState == SNIFFER_ACTIVE) stopSniffer();
   if (currentState == NRF_JAM_ACTIVE) stopNRFJammer();
+
+  if (currentState == SNIFFER_ACTIVE) {
+    stopSniffer();
+    currentState = MAIN_MENU;
+    hoveredIndex = -1;
+    drawMainMenu();
+    return;
+  }
   
   if (currentState == WIFI_BLE_NRF_JAM) {
     stopCombinedJammer();
@@ -4007,7 +3938,6 @@ void handleBackButton() {
     // Top level menus go back to main
     case WIFI_MENU:
     case BLE_MENU:
-    case SNIFFER_MENU:
     case MORE_TOOLS_MENU:
       currentState = MAIN_MENU;
       hoveredIndex = -1;
@@ -4172,9 +4102,9 @@ void handleMainMenuTouch(int x, int y) {
           drawBLEMenu();
           break;
         case 2: // Packet Sniffer
-          currentState = SNIFFER_MENU;
-          hoveredIndex = -1;
-          drawSnifferMenu();
+          snifferScrollOffset = 0;
+          packetHistoryIndex = 0;
+          startSniffer();
           break;
         case 3: // More Tools
           currentState = MORE_TOOLS_MENU;
@@ -4201,30 +4131,7 @@ void handleSettingsMenuTouch(int x, int y) {
   }
   
   int startY = HEADER_HEIGHT + 10;
-  
-  // ✅ Check brightness +/- buttons FIRST (higher priority)
-  int brightY = startY + (1 * (MENU_ITEM_HEIGHT + MENU_SPACING));
   int controlsX = 145;
-  
-  // Minus button hit area
-  if (y >= brightY + 3 && y <= brightY + 19) {
-    if (x >= controlsX && x <= controlsX + 20) {
-      // Decrease brightness
-      screenBrightness = max(32, screenBrightness - 32);  // Decrease by ~12.5%
-      setBrightness(screenBrightness);
-      drawSettingsMenu();
-      return;
-    }
-    
-    // Plus button hit area
-    if (x >= controlsX + 60 && x <= controlsX + 80) {
-      // Increase brightness
-      screenBrightness = min(255, screenBrightness + 32);  // Increase by ~12.5%
-      setBrightness(screenBrightness);
-      drawSettingsMenu();
-      return;
-    }
-  }
   
   // Calculate which menu item was touched
   if (y >= startY && y < startY + (4 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {
@@ -4245,16 +4152,7 @@ void handleSettingsMenuTouch(int x, int y) {
         drawDeviceInfo();
         break;
         
-      case 1: // Brightness - clicking the label also toggles
-        // Cycle through presets: 255 -> 192 -> 128 -> 64 -> 32 -> 255
-        if (screenBrightness == 255) screenBrightness = 192;
-        else if (screenBrightness == 192) screenBrightness = 128;
-        else if (screenBrightness == 128) screenBrightness = 64;
-        else if (screenBrightness == 64) screenBrightness = 32;
-        else screenBrightness = 255;
-        
-        setBrightness(screenBrightness);
-        drawSettingsMenu();
+      case 1: Serial.println("SD Card initializing...");
         break;
         
       case 2: // Show ASCII Art
@@ -4428,46 +4326,6 @@ void handleBeaconManagerTouch(int x, int y) {
   if (y >= scrollY && y <= scrollY + 15 && customBeaconCount > MAX_DISPLAY_BEACONS) {
     beaconDisplayOffset = (beaconDisplayOffset + MAX_DISPLAY_BEACONS) % customBeaconCount;
     drawBeaconManager();
-  }
-}
-
-void handleSnifferMenuTouch(int x, int y) {
-  // Back button
-  if (y > 300 && currentState == SNIFFER_MENU) {
-    currentState = MAIN_MENU;
-    hoveredIndex = -1;
-    drawMainMenu();
-    return;
-  }
-  
-  // Sniffer is active - ONLY stop button (no pagination)
-  if (currentState == SNIFFER_ACTIVE) {
-    if (y > 300) {
-      // Stop button
-      stopSniffer();
-      currentState = SNIFFER_MENU;
-      drawSnifferMenu();
-    }
-    // All other touches ignored (auto-scroll, no manual control)
-    return;
-  }
-  
-  // Menu interaction
-  int startY = HEADER_HEIGHT + 10;
-  int buttonIndex = getTouchedButtonIndex(y, startY);
-  
-  if (buttonIndex < 0 || buttonIndex > 1) return;
-  
-  switch (buttonIndex) {
-    case 0:  // Start Sniffer
-      snifferScrollOffset = 0;
-      packetHistoryIndex = 0;
-      startSniffer();
-      break;
-    case 1:  // Stop Sniffer
-      stopSniffer();
-      drawSnifferMenu();
-      break;
   }
 }
 
@@ -4811,7 +4669,7 @@ void loop() {
   
   // ==================== TURBO MODE: nRF24 JAMMER ONLY ====================
   if (nrfJammerActive && nrfTurboMode) {
-    // ⚡ CRITICAL: ONLY jamming + minimal touch checking
+    // ONLY jamming + minimal touch checking
     
     // Ultra-fast touch check: only every 5000 hops (~50ms at 100K/sec)
     static uint32_t lastTouchCheck = 0;
@@ -5001,13 +4859,25 @@ void loop() {
     }
   }
   
+  // Fast channel hopping sniffer with proper display
   if (snifferActive && currentState == SNIFFER_ACTIVE) {
+    static unsigned long lastChannelHop = 0;
     static unsigned long lastSnifferUpdate = 0;
-    if (millis() - lastSnifferUpdate > 500) {
+    
+    // Fast channel hopping - 200ms per channel (5 channels/sec like Marauder)
+    if (millis() - lastChannelHop > 200) {
+      snifferChannel = (snifferChannel % 13) + 1;  // Cycle through channels 1-13
+      esp_wifi_set_channel(snifferChannel, WIFI_SECOND_CHAN_NONE);
+      lastChannelHop = millis();
+    }
+    
+    // Update display every 300ms (smooth without flicker)
+    if (millis() - lastSnifferUpdate > 300) {
       displaySnifferActive();
       lastSnifferUpdate = millis();
     }
     
+    // Check for handshake capture
     static bool lastCapturedState = false;
     if (capturedHandshake.captured && !lastCapturedState) {
       Serial.println("[+] FULL HANDSHAKE CAPTURED!");
@@ -6250,6 +6120,7 @@ void startSniffer() {
   beaconCount = 0;
   dataCount = 0;
   deauthCount = 0;
+  snifferChannel = 1;
   
   WiFi.disconnect();
   WiFi.mode(WIFI_STA);
@@ -6260,7 +6131,10 @@ void startSniffer() {
   esp_wifi_set_channel(snifferChannel, WIFI_SECOND_CHAN_NONE);
   
   currentState = SNIFFER_ACTIVE;
-  addToConsole("Sniffer started on Ch" + String(snifferChannel));
+  addToConsole("Sniffer started - Fast hop");
+  
+  Serial.println("[+] Sniffer started with fast channel hopping");
+  Serial.println("    Hopping through channels 1-13 at 200ms intervals");
   
   displaySnifferActive();
 }
@@ -6269,6 +6143,8 @@ void stopSniffer() {
   snifferActive = false;
   esp_wifi_set_promiscuous(false);
   addToConsole("Sniffer stopped");
+  
+  Serial.printf("[+] Sniffer stopped - %d packets captured\n", packetCount);
 }
 
 void displaySnifferActive() {
@@ -6280,7 +6156,7 @@ void displaySnifferActive() {
   blink = !blink;
   tft.fillCircle(220, 12, 3, blink ? COLOR_RED : COLOR_DARK_GREEN);
   
-  // Stats bar - compact single line
+  // Stats bar - COMPACT single line
   int statsY = HEADER_HEIGHT + 5;
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT);
@@ -6288,7 +6164,7 @@ void displaySnifferActive() {
   tft.printf("Ch%d", snifferChannel);
   
   tft.setTextColor(COLOR_CYAN);
-  tft.setCursor(45, statsY);
+  tft.setCursor(55, statsY);
   tft.printf("T:%d", packetCount);
   
   tft.setTextColor(COLOR_GREEN);
@@ -6296,16 +6172,16 @@ void displaySnifferActive() {
   tft.printf("B:%d", beaconCount);
   
   tft.setTextColor(COLOR_YELLOW);
-  tft.setCursor(140, statsY);
+  tft.setCursor(135, statsY);
   tft.printf("D:%d", dataCount);
   
   tft.setTextColor(COLOR_RED);
-  tft.setCursor(185, statsY);
+  tft.setCursor(175, statsY);
   tft.printf("X:%d", deauthCount);
   
   // Column headers
   int listY = HEADER_HEIGHT + 22;
-  tft.drawFastHLine(0, listY - 2, 240, COLOR_DARK_GREEN);
+  tft.drawFastHLine(0, listY - 3, 240, COLOR_DARK_GREEN);
   
   tft.setTextSize(1);
   tft.setTextColor(COLOR_DARK_GREEN);
@@ -6313,15 +6189,14 @@ void displaySnifferActive() {
   tft.print("TYPE");
   tft.setCursor(40, listY);
   tft.print("RSSI");
-  tft.setCursor(80, listY);
+  tft.setCursor(75, listY);
   tft.print("CH");
-  tft.setCursor(110, listY);
+  tft.setCursor(100, listY);
   tft.print("AGE");
   
   tft.drawFastHLine(0, listY + 12, 240, COLOR_DARK_GREEN);
   listY += 15;
-  
-  // Auto-scroll display (Marauder style) - show last 12 packets
+
   const int MAX_DISPLAY = 12;
   int totalPackets = min((uint32_t)MAX_SNIFFER_PACKETS, packetCount);
   
@@ -6330,6 +6205,9 @@ void displaySnifferActive() {
     tft.setTextColor(COLOR_TEXT);
     tft.setCursor(SIDE_MARGIN, listY + 60);
     tft.print("Waiting for packets...");
+    tft.setCursor(SIDE_MARGIN, listY + 75);
+    tft.setTextColor(COLOR_DARK_GREEN);
+    tft.print("Fast channel hopping...");
   } else {
     // Display last N packets (newest at bottom, auto-scroll up)
     int startIdx = max(0, totalPackets - MAX_DISPLAY);
@@ -6362,26 +6240,26 @@ void displaySnifferActive() {
       
       tft.setTextColor(typeColor);
       tft.setTextSize(1);
-      tft.setCursor(SIDE_MARGIN, y);
+      tft.setCursor(SIDE_MARGIN, y+4);
       tft.print(typeName);
       
-      // RSSI - just value
+      // RSSI
       int rssi = packetHistory[idx].rssi;
       uint16_t rssiColor = (rssi > -50) ? COLOR_GREEN : (rssi > -70) ? COLOR_YELLOW : COLOR_RED;
       
       tft.setTextColor(rssiColor);
-      tft.setCursor(40, y);
+      tft.setCursor(40, y+4);
       tft.printf("%3d", rssi);
       
       // Channel
       tft.setTextColor(COLOR_CYAN);
-      tft.setCursor(80, y);
+      tft.setCursor(75, y+4);
       tft.printf("%2d", packetHistory[idx].channel);
       
       // Time ago
       unsigned long ago = (millis() - packetHistory[idx].timestamp) / 1000;
       tft.setTextColor(COLOR_TEXT);
-      tft.setCursor(110, y);
+      tft.setCursor(100, y+4);
       if (ago < 60) {
         tft.printf("%2ds", ago);
       } else if (ago < 3600) {
@@ -6392,13 +6270,59 @@ void displaySnifferActive() {
     }
   }
   
-  // Stop button (consistent with other screens)
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
+  // ✅ LEGEND - Right side, aligned properly
+  int legendY = listY + 60;
+  int legendX = 160;
+  
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(legendX, legendY);
+  tft.print("LEGEND:");
+  
+  legendY += 16;
+  tft.setTextColor(COLOR_GREEN);
+  tft.setCursor(legendX, legendY);
+  tft.print("B");
+  tft.setTextColor(COLOR_TEXT);
+  tft.print("=Beacon");
+  
+  legendY += 12;
+  tft.setTextColor(COLOR_CYAN);
+  tft.setCursor(legendX, legendY);
+  tft.print("D");
+  tft.setTextColor(COLOR_TEXT);
+  tft.print("=Data");
+  
+  legendY += 12;
   tft.setTextColor(COLOR_RED);
-  tft.setCursor(75, backY + 3);
-  tft.print("[TAP] Stop");
+  tft.setCursor(legendX, legendY);
+  tft.print("X");
+  tft.setTextColor(COLOR_TEXT);
+  tft.print("=Deauth");
+  
+  legendY += 12;
+  tft.setTextColor(COLOR_PURPLE);
+  tft.setCursor(legendX, legendY);
+  tft.print("P");
+  tft.setTextColor(COLOR_TEXT);
+  tft.print("=Probe");
+  
+  legendY += 12;
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(legendX, legendY);
+  tft.print("T=Total");
+
+  legendY += 30;
+  tft.setTextColor(COLOR_RED);
+  tft.setCursor(legendX -15, legendY);
+  tft.print("Tap anywhere");
+
+  legendY += 12;
+  tft.setTextColor(COLOR_RED);
+  tft.setCursor(legendX, legendY);
+  tft.print("To stop");
 }
+
 
 // ==================== BLE Functions ====================
 
@@ -8371,9 +8295,13 @@ void toggleDeauth() {
 
 void toggleSniffer() {
   if (!snifferActive) {
+    snifferScrollOffset = 0;
+    packetHistoryIndex = 0;
     startSniffer();
   } else {
     stopSniffer();
+    currentState = MAIN_MENU;
+    drawMainMenu();
   }
 }
 
