@@ -173,6 +173,47 @@ PacketInfo packetHistory[MAX_SNIFFER_PACKETS];
 int packetHistoryIndex = 0;
 int snifferScrollOffset = 0;
 
+// ==================== ROGUE AP DETECTOR STRUCTURES ====================
+struct RogueAP {
+  String ssid;
+  uint8_t legitimateBSSID[6];
+  uint8_t rogueBSSID[6];
+  int32_t legitimateRSSI;
+  int32_t rogueRSSI;
+  uint8_t legitimateChannel;
+  uint8_t rogueChannel;
+  unsigned long firstSeen;
+  unsigned long lastSeen;
+  int detectionCount;
+  uint8_t confidenceScore;  // 0-100%
+  String suspiciousReason;
+};
+
+struct APHistory {
+  String ssid;
+  uint8_t bssid[6];
+  int32_t rssi;
+  uint8_t channel;
+  unsigned long firstSeen;
+  unsigned long lastSeen;
+  bool inWhitelist;
+  int signalFluctuations;
+  int channelChanges;
+};
+
+RogueAP detectedRogues[20];
+int rogueAPCount = 0;
+
+APHistory apHistoryList[50];
+int apHistoryCount = 0;
+
+uint8_t whitelistedBSSIDs[30][6];
+String whitelistedSSIDs[30];
+int whitelistCount = 0;
+
+bool rogueAPScanActive = false;
+int rogueScrollOffset = 0;
+
 // ==================== BLE JAMMER VARIABLES ====================
 bool bleJammerActive = false;
 unsigned long lastBLEJamTime = 0;
@@ -313,6 +354,7 @@ enum MenuState {
   DEAUTH_SNIFFER,
   DEAUTH_SNIFFER_ACTIVE,
   WARDRIVING_MODE,
+  ROGUE_AP_DETECTOR,
   SPAM_MENU,
   MORE_TOOLS_MENU,
   CONSOLE_VIEW,
@@ -1271,16 +1313,32 @@ void displayContinuousWiFiScan() {
   tft.drawFastHLine(0, listY + 12, 240, COLOR_DARK_GREEN);
   listY += 15;
   
-  // Display networks (scrollable list)
-  int displayCount = min(networkCount - wifiScrollOffset, MAX_WIFI_DISPLAY);
+  // Calculate safe display area (stop before back button)
+  const int BACK_BUTTON_Y = 305;
+  const int SAFE_BOTTOM = BACK_BUTTON_Y - 25; // Safe margin
+  const int ITEM_HEIGHT = 22;
+  const int MAX_ITEMS = (SAFE_BOTTOM - listY) / ITEM_HEIGHT;
+  
+  // Ensure scroll offset is valid
+  if (wifiScrollOffset >= networkCount) {
+    wifiScrollOffset = max(0, networkCount - MAX_ITEMS);
+  }
+  if (wifiScrollOffset < 0) {
+    wifiScrollOffset = 0;
+  }
+  
+  int displayCount = min(networkCount - wifiScrollOffset, MAX_ITEMS);
   
   for (int i = 0; i < displayCount; i++) {
     int idx = wifiScrollOffset + i;
-    int y = listY + (i * 22);
+    int y = listY + (i * ITEM_HEIGHT);
+    
+    // Stop if too close to back button
+    if (y + ITEM_HEIGHT > SAFE_BOTTOM) break;
     
     // Highlight if hovered
     if (hoveredIndex == i) {
-      tft.fillRect(0, y - 2, 240, 22, COLOR_HOVER_BG);
+      tft.fillRect(0, y - 2, 240, ITEM_HEIGHT, COLOR_HOVER_BG);
     }
     
     // New network indicator
@@ -1322,19 +1380,18 @@ void displayContinuousWiFiScan() {
     tft.print(networks[idx].isEncrypted ? "WPA" : "OPEN");
   }
   
-  // Scroll indicator
-  if (networkCount > MAX_WIFI_DISPLAY) {
-    int scrollY = listY + (MAX_WIFI_DISPLAY * 22) + 5;
+  // Scroll indicator (if needed)
+  if (networkCount > MAX_ITEMS) {
+    int scrollY = SAFE_BOTTOM + 2;
     tft.setTextColor(COLOR_DARK_GREEN);
     tft.setTextSize(1);
-    tft.setCursor(85, scrollY);
-    tft.printf("[%d-%d/%d]", 
-               wifiScrollOffset + 1, 
-               wifiScrollOffset + displayCount, 
-               networkCount);
+    tft.setCursor(70, scrollY);
+    tft.printf("Page %d/%d [Tap scroll]", 
+               (wifiScrollOffset / MAX_ITEMS) + 1,
+               (networkCount + MAX_ITEMS - 1) / MAX_ITEMS);
   }
   
-  // Back button (minimal terminal style)
+  // Back button
   int backY = 305;
   tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
   tft.setTextColor(COLOR_RED);
@@ -1414,7 +1471,6 @@ void processWiFiScanResults() {
 }
 
 // ==================== SELECT TARGET - SCROLLABLE LIST ====================
-// ==================== FIXED: drawSelectTargetMenu() - With Pagination ====================
 void drawSelectTargetMenu() {
   if (networkCount == 0) {
     showMessage("No networks found!", COLOR_RED);
@@ -1453,16 +1509,32 @@ void drawSelectTargetMenu() {
   tft.drawFastHLine(0, listY + 12, 240, COLOR_DARK_GREEN);
   listY += 15;
   
-  // Display networks with pagination
-  int displayCount = min(networkCount - wifiScrollOffset, MAX_WIFI_DISPLAY);
+  // Calculate safe display area (stop before back button at y=305)
+  const int BACK_BUTTON_Y = 305;
+  const int SAFE_BOTTOM = BACK_BUTTON_Y - 25; // 25px margin for scroll indicator
+  const int ITEM_HEIGHT = 28;
+  const int MAX_ITEMS = (SAFE_BOTTOM - listY) / ITEM_HEIGHT; // Calculate max items that fit
+  
+  // Ensure scroll offset is valid
+  if (wifiScrollOffset >= networkCount) {
+    wifiScrollOffset = max(0, networkCount - MAX_ITEMS);
+  }
+  if (wifiScrollOffset < 0) {
+    wifiScrollOffset = 0;
+  }
+  
+  int displayCount = min(networkCount - wifiScrollOffset, MAX_ITEMS);
   
   for (int i = 0; i < displayCount; i++) {
     int idx = wifiScrollOffset + i;
-    int y = listY + (i * 28);
+    int y = listY + (i * ITEM_HEIGHT);
+    
+    // Stop if we're too close to back button
+    if (y + ITEM_HEIGHT > SAFE_BOTTOM) break;
     
     // Hover effect
     if (hoveredIndex == i) {
-      tft.fillRect(0, y - 2, 240, 28, COLOR_HOVER_BG);
+      tft.fillRect(0, y - 2, 240, ITEM_HEIGHT, COLOR_HOVER_BG);
     }
     
     // SSID
@@ -1500,16 +1572,15 @@ void drawSelectTargetMenu() {
                networks[idx].bssid[4], networks[idx].bssid[5]);
   }
   
-  // Scroll indicator
-  if (networkCount > MAX_WIFI_DISPLAY) {
-    int scrollY = listY + (MAX_WIFI_DISPLAY * 28) + 5;
+  // Scroll indicator (only if needed)
+  if (networkCount > MAX_ITEMS) {
+    int scrollY = SAFE_BOTTOM + 2;
     tft.setTextColor(COLOR_DARK_GREEN);
     tft.setTextSize(1);
-    tft.setCursor(85, scrollY);
-    tft.printf("[%d-%d/%d]", 
-               wifiScrollOffset + 1, 
-               wifiScrollOffset + displayCount, 
-               networkCount);
+    tft.setCursor(70, scrollY);
+    tft.printf("Page %d/%d [Tap scroll]", 
+               (wifiScrollOffset / MAX_ITEMS) + 1,
+               (networkCount + MAX_ITEMS - 1) / MAX_ITEMS);
   }
   
   // Back button
@@ -1607,6 +1678,7 @@ void startDeauthSniffer() {
   deauthEventCount = 0;
   detectedDeauths = 0;
   deauthScrollOffset = 0;
+  snifferChannel = 1;  // Start on channel 1
   
   WiFi.disconnect();
   WiFi.mode(WIFI_STA);
@@ -1619,8 +1691,8 @@ void startDeauthSniffer() {
   currentState = DEAUTH_SNIFFER_ACTIVE;
   addToConsole("Deauth sniffer started");
   
-  Serial.println("[+] Deauth Sniffer Active");
-  Serial.printf("    Monitoring channel %d for deauth attacks\n", snifferChannel);
+  Serial.println("[+] Deauth Sniffer Active - Channel Hopping Mode");
+  Serial.printf("    Monitoring channels 1-13 (150ms per channel)\n");
   
   displayDeauthSnifferActive();
 }
@@ -1633,66 +1705,6 @@ void stopDeauthSniffer() {
   Serial.printf("[+] Deauth sniffer stopped - %d deauths detected\n", detectedDeauths);
 }
 
-void drawDeauthSnifferMenu() {
-  tft.fillScreen(COLOR_BG);
-  drawTerminalHeader("deauth sniffer");
-  
-  const char* menuItems[] = {
-    "Start Sniffer",
-    "Stop Sniffer",
-    "Change Channel"
-  };
-  
-  int y = HEADER_HEIGHT + 10;
-  for (int i = 0; i < 3; i++) {
-    drawMenuItem(menuItems[i], i, y, hoveredIndex == i, false);
-    y += MENU_ITEM_HEIGHT + MENU_SPACING;
-  }
-  
-  // Status
-  y += 20;
-  tft.setTextSize(1);
-  tft.setTextColor(COLOR_DARK_GREEN);
-  tft.setCursor(SIDE_MARGIN, y);
-  tft.printf("Channel: ");
-  tft.setTextColor(COLOR_CYAN);
-  tft.printf("Ch %d", snifferChannel);
-  
-  y += 15;
-  tft.setTextColor(COLOR_DARK_GREEN);
-  tft.setCursor(SIDE_MARGIN, y);
-  tft.printf("Status: ");
-  tft.setTextColor(deauthSnifferActive ? COLOR_ORANGE : COLOR_GREEN);
-  tft.printf(deauthSnifferActive ? "ACTIVE" : "STOPPED");
-  
-  y += 15;
-  tft.setTextColor(COLOR_DARK_GREEN);
-  tft.setCursor(SIDE_MARGIN, y);
-  tft.printf("Detected: ");
-  tft.setTextColor(detectedDeauths > 0 ? COLOR_RED : COLOR_GREEN);
-  tft.printf("%d deauths", detectedDeauths);
-  
-  // Info
-  y += 30;
-  tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
-  y += 10;
-  
-  tft.setTextSize(1);
-  tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(SIDE_MARGIN, y);
-  tft.println("Detects deauth attacks from");
-  y += 12;
-  tft.setCursor(SIDE_MARGIN, y);
-  tft.println("other devices on the network");
-  
-  // Back button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(85, backY + 3);
-  tft.print("[ESC] Back");
-}
-
 void displayDeauthSnifferActive() {
   tft.fillScreen(COLOR_BG);
   drawTerminalHeader("deauth sniffer");
@@ -1702,15 +1714,28 @@ void displayDeauthSnifferActive() {
   blink = !blink;
   tft.fillCircle(220, 12, 3, blink ? COLOR_RED : COLOR_DARK_GREEN);
   
-  // Stats bar - compact
+  // Stats bar - COMPACT single line with channel controls
   int statsY = HEADER_HEIGHT + 5;
   tft.setTextSize(1);
-  tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(SIDE_MARGIN, statsY);
-  tft.printf("Ch:%d", snifferChannel);
   
+  // Channel display - show current channel being monitored
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, statsY);
+  tft.print("Ch:");
+  
+  // Current channel number (updates automatically)
+  tft.setTextColor(COLOR_GREEN);
+  tft.setCursor(SIDE_MARGIN + 18, statsY);
+  tft.printf("%2d", snifferChannel);
+  
+  // Channel hopping indicator
+  tft.setTextColor(COLOR_CYAN);
+  tft.setCursor(SIDE_MARGIN + 40, statsY);
+  tft.print("[AUTO]");
+  
+  // Deauth count
   tft.setTextColor(detectedDeauths > 0 ? COLOR_RED : COLOR_GREEN);
-  tft.setCursor(80, statsY);
+  tft.setCursor(95, statsY);
   tft.printf("Deauths:%d", detectedDeauths);
   
   // Alert if deauths detected
@@ -1727,38 +1752,55 @@ void displayDeauthSnifferActive() {
   tft.setTextSize(1);
   tft.setTextColor(COLOR_DARK_GREEN);
   tft.setCursor(SIDE_MARGIN, listY);
-  tft.print("SOURCE -> TARGET");
-  tft.setCursor(180, listY);
+  tft.print("ATTACKER -> VICTIM");
+  tft.setCursor(150, listY);
+  tft.print("CH");
+  tft.setCursor(175, listY);
+  tft.print("PWR");
+  tft.setCursor(205, listY);
   tft.print("AGE");
   
   tft.drawFastHLine(0, listY + 12, 240, COLOR_DARK_GREEN);
   listY += 15;
   
-  // Calculate pagination
-  const int EVENTS_PER_PAGE = 9;
-  int totalEvents = deauthEventCount;
-  int totalPages = (totalEvents + EVENTS_PER_PAGE - 1) / EVENTS_PER_PAGE;
-  int currentPage = deauthScrollOffset / EVENTS_PER_PAGE;
+  // Calculate safe display area - leave room for footer
+  const int FOOTER_Y = 270;
+  const int ITEM_HEIGHT = 26;
+  const int MAX_ITEMS = (FOOTER_Y - listY) / ITEM_HEIGHT;
   
-  if (totalEvents == 0) {
+  if (deauthEventCount == 0) {
     tft.setTextSize(1);
     tft.setTextColor(COLOR_GREEN);
-    tft.setCursor(SIDE_MARGIN, listY + 60);
+    tft.setCursor(SIDE_MARGIN, listY + 40);
     tft.print("No deauth attacks detected");
-    tft.setCursor(SIDE_MARGIN, listY + 75);
+    
+    tft.setCursor(SIDE_MARGIN, listY + 55);
     tft.setTextColor(COLOR_TEXT);
     tft.print("Network is clean");
+    
+    tft.setCursor(SIDE_MARGIN, listY + 75);
+    tft.setTextColor(COLOR_DARK_GREEN);
+    tft.print("Auto-hopping Ch 1-13...");
   } else {
+    // Calculate pagination
+    int totalPages = (deauthEventCount + MAX_ITEMS - 1) / MAX_ITEMS;
+    int currentPage = deauthScrollOffset / MAX_ITEMS;
+    
+    // Ensure scroll offset is valid
+    if (deauthScrollOffset >= deauthEventCount) {
+      deauthScrollOffset = max(0, deauthEventCount - MAX_ITEMS);
+    }
+    
     // Display events for current page (newest first)
     int startIdx = deauthScrollOffset;
-    int endIdx = min(startIdx + EVENTS_PER_PAGE, totalEvents);
+    int endIdx = min(startIdx + MAX_ITEMS, deauthEventCount);
     
     for (int i = 0; i < (endIdx - startIdx); i++) {
-      int idx = totalEvents - 1 - startIdx - i;
+      int idx = deauthEventCount - 1 - startIdx - i;  // Reverse order (newest first)
       
-      if (idx < 0 || idx >= totalEvents) continue;
+      if (idx < 0 || idx >= deauthEventCount) continue;
       
-      int y = listY + (i * 28);
+      int y = listY + (i * ITEM_HEIGHT);
       
       // Warning indicator
       tft.setTextColor(COLOR_RED);
@@ -1766,9 +1808,9 @@ void displayDeauthSnifferActive() {
       tft.setCursor(SIDE_MARGIN, y);
       tft.print("[!]");
       
-      // Source MAC (first 3 octets)
+      // Source MAC (attacker) - First 3 octets
       tft.setTextColor(COLOR_ORANGE);
-      tft.setCursor(SIDE_MARGIN + 20, y);
+      tft.setCursor(SIDE_MARGIN + 18, y);
       tft.printf("%02X:%02X:%02X", 
                  deauthEvents[idx].sourceMAC[0],
                  deauthEvents[idx].sourceMAC[1],
@@ -1776,124 +1818,97 @@ void displayDeauthSnifferActive() {
       
       // Arrow
       tft.setTextColor(COLOR_DARK_GREEN);
-      tft.setCursor(SIDE_MARGIN + 70, y);
+      tft.setCursor(SIDE_MARGIN + 64, y);
       tft.print("->");
       
-      // Target MAC (first 3 octets)
+      // Target MAC (victim) - First 3 octets
       tft.setTextColor(COLOR_CYAN);
-      tft.setCursor(SIDE_MARGIN + 90, y);
+      tft.setCursor(SIDE_MARGIN + 82, y);
       tft.printf("%02X:%02X:%02X", 
                  deauthEvents[idx].targetMAC[0],
                  deauthEvents[idx].targetMAC[1],
                  deauthEvents[idx].targetMAC[2]);
       
+      // Channel
+      tft.setTextColor(COLOR_YELLOW);
+      tft.setCursor(150, y);
+      tft.printf("%2d", deauthEvents[idx].channel);
+      
+      // RSSI (power)
+      int rssi = deauthEvents[idx].rssi;
+      tft.setTextColor(rssi > -50 ? COLOR_RED : rssi > -70 ? COLOR_ORANGE : COLOR_YELLOW);
+      tft.setCursor(175, y);
+      tft.printf("%3d", rssi);
+      
       // Time ago
       unsigned long ago = (millis() - deauthEvents[idx].timestamp) / 1000;
       tft.setTextColor(COLOR_TEXT);
-      tft.setCursor(180, y);
+      tft.setCursor(205, y);
       if (ago < 60) {
-        tft.printf("%ds", ago);
+        tft.printf("%2ds", ago);
       } else {
-        tft.printf("%dm", ago / 60);
+        tft.printf("%2dm", ago / 60);
       }
       
-      // Details line (channel + RSSI)
+      // Second line: Full MACs (smaller text)
       tft.setTextColor(COLOR_DARK_GREEN);
-      tft.setCursor(SIDE_MARGIN + 20, y + 10);
-      tft.printf("Ch%d", deauthEvents[idx].channel);
+      tft.setCursor(SIDE_MARGIN + 18, y + 10);
+      tft.printf("A:%02X:%02X:%02X:%02X:%02X:%02X", 
+                 deauthEvents[idx].sourceMAC[0], deauthEvents[idx].sourceMAC[1],
+                 deauthEvents[idx].sourceMAC[2], deauthEvents[idx].sourceMAC[3],
+                 deauthEvents[idx].sourceMAC[4], deauthEvents[idx].sourceMAC[5]);
       
-      tft.setTextColor(COLOR_YELLOW);
-      tft.setCursor(SIDE_MARGIN + 60, y + 10);
-      tft.printf("%ddBm", deauthEvents[idx].rssi);
+      tft.setCursor(SIDE_MARGIN + 18, y + 18);
+      tft.printf("V:%02X:%02X:%02X:%02X:%02X:%02X", 
+                 deauthEvents[idx].targetMAC[0], deauthEvents[idx].targetMAC[1],
+                 deauthEvents[idx].targetMAC[2], deauthEvents[idx].targetMAC[3],
+                 deauthEvents[idx].targetMAC[4], deauthEvents[idx].targetMAC[5]);
+    }
+    
+    // Scroll pagination indicator
+    if (totalPages > 1) {
+      int scrollY = FOOTER_Y;
+      tft.drawFastHLine(0, scrollY, 240, COLOR_DARK_GREEN);
+      tft.setTextSize(1);
+      tft.setTextColor(COLOR_CYAN);
+      tft.setCursor(70, scrollY + 5);
+      tft.printf("Page %d/%d [Tap scroll]", currentPage + 1, totalPages);
     }
   }
   
-  // ✅ FIXED: Footer with pagination - no overlap with stop button
-  int footerY = 275;  // Moved up from 280 to avoid overlap
-  
-  if (totalPages > 1) {
-    tft.drawFastHLine(0, footerY, 240, COLOR_DARK_GREEN);
-    tft.setTextSize(1);
-    tft.setTextColor(COLOR_CYAN);
-    tft.setCursor(SIDE_MARGIN, footerY + 5);
-    tft.printf("Page %d/%d", currentPage + 1, totalPages);
-    
-    tft.setTextColor(COLOR_TEXT);
-    tft.setCursor(120, footerY + 5);
-    tft.print("Tap to scroll");
-  }
-  
-  // ✅ FIXED: Consistent stop button style
+  // Footer with controls
   int backY = 305;
   tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
   tft.setTextColor(COLOR_RED);
+  tft.setTextSize(1);
   tft.setCursor(75, backY + 3);
   tft.print("[TAP] Stop");
 }
 
 void handleDeauthSnifferMenuTouch(int x, int y) {
-  // Back button
-  if (y > 300) {
-    if (deauthSnifferActive) stopDeauthSniffer();
+  // We're always in active state now, no menu
+  if (currentState != DEAUTH_SNIFFER_ACTIVE) return;
+  
+  // Stop button (bottom) or anywhere really
+  if (y > 280) {
+    stopDeauthSniffer();
     currentState = MORE_TOOLS_MENU;
     hoveredIndex = -1;
     drawMoreToolsMenu();
     return;
   }
   
-  // Deauth sniffer is active - handle scrolling and stop
-  if (currentState == DEAUTH_SNIFFER_ACTIVE) {
-    int totalEvents = deauthEventCount;
+  // Scroll through deauth events (tap anywhere in middle)
+  if (deauthEventCount > 0 && y > HEADER_HEIGHT + 40 && y < 270) {
     const int EVENTS_PER_PAGE = 9;
-    int totalPages = (totalEvents + EVENTS_PER_PAGE - 1) / EVENTS_PER_PAGE;
+    int totalPages = (deauthEventCount + EVENTS_PER_PAGE - 1) / EVENTS_PER_PAGE;
     
-    if (y > 300) {
-      // Stop button
-      stopDeauthSniffer();
-      currentState = DEAUTH_SNIFFER;
-      drawDeauthSnifferMenu();
-    } else if (y > 280) {
-      // Footer area - ignore
-      return;
-    } else if (totalPages > 1) {
-      // Scroll through pages
+    if (totalPages > 1) {
       int currentPage = deauthScrollOffset / EVENTS_PER_PAGE;
       currentPage = (currentPage + 1) % totalPages;
       deauthScrollOffset = currentPage * EVENTS_PER_PAGE;
       displayDeauthSnifferActive();
     }
-    return;
-  }
-  
-  // Menu interaction
-  int startY = HEADER_HEIGHT + 10;
-  int buttonIndex = getTouchedButtonIndex(y, startY);
-  
-  if (buttonIndex < 0 || buttonIndex > 2) return;
-  
-  switch (buttonIndex) {
-    case 0:  // Start Sniffer
-      if (!deauthSnifferActive) {
-        deauthScrollOffset = 0;
-        startDeauthSniffer();
-      }
-      break;
-      
-    case 1:  // Stop Sniffer
-      if (deauthSnifferActive) {
-        stopDeauthSniffer();
-        currentState = DEAUTH_SNIFFER;
-        drawDeauthSnifferMenu();
-      }
-      break;
-      
-    case 2:  // Change Channel
-      snifferChannel = (snifferChannel % 13) + 1;
-      if (deauthSnifferActive) {
-        esp_wifi_set_channel(snifferChannel, WIFI_SECOND_CHAN_NONE);
-      }
-      drawDeauthSnifferMenu();
-      break;
   }
 }
 
@@ -2385,7 +2400,7 @@ void drawMainMenu() {
     "WiFi Tools",
     "Bluetooth Tools",
     "Packet Sniffer",
-    "More Tools",
+    "Defensive Tools",
     "Settings"
   };
   
@@ -2458,11 +2473,12 @@ void drawSettingsMenu() {
     "Device Info",
     "SD Card",
     "Show ASCII Art",
+    "Console",        // ← MOVED HERE
     "Reboot Device"
   };
   
   int y = HEADER_HEIGHT + 10;
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < 5; i++) {  // Changed from 4 to 5
     drawMenuItem(menuItems[i], i, y, hoveredIndex == i, false);
     y += MENU_ITEM_HEIGHT + MENU_SPACING;
   }
@@ -3268,17 +3284,17 @@ void drawBLEJammerMenu() {
 
 void drawMoreToolsMenu() {
   tft.fillScreen(COLOR_BG);
-  drawTerminalHeader("more tools");
+  drawTerminalHeader("defensive tools");
   
   const char* menuItems[] = {
-    "Deauth Sniffer",  // NEW - moved to top
+    "Deauth Sniffer",
     "Skimmer Detect",
-    "Wardriving",
-    "Console"
+    "Rogue AP Detector",
+    "Wardriving"
   };
   
   int y = HEADER_HEIGHT + 10;
-  for (int i = 0; i < 4; i++) {  // Changed from 3 to 4
+  for (int i = 0; i < 4; i++) {  // Changed from 5 to 4
     drawMenuItem(menuItems[i], i, y, hoveredIndex == i, false);
     y += MENU_ITEM_HEIGHT + MENU_SPACING;
   }
@@ -3565,7 +3581,7 @@ void drawNRFJammerMenu() {
 }
 
 void showConsole() {
-  previousState = currentState;
+  previousState = currentState;  // Save where we came from
   currentState = CONSOLE_VIEW;
   
   tft.fillScreen(COLOR_BG);
@@ -3613,15 +3629,20 @@ void handleSelectTargetTouch(int x, int y) {
   if (y > 300) {
     currentState = WIFI_MENU;
     hoveredIndex = -1;
+    wifiScrollOffset = 0; // Reset scroll
     drawWiFiMenu();
     return;
   }
   
   int listY = HEADER_HEIGHT + 35;
-  int itemHeight = 28;
+  const int BACK_BUTTON_Y = 305;
+  const int SAFE_BOTTOM = BACK_BUTTON_Y - 25;
+  const int ITEM_HEIGHT = 28;
+  const int MAX_ITEMS = (SAFE_BOTTOM - listY) / ITEM_HEIGHT;
   
-  if (y >= listY && y <= listY + (MAX_WIFI_DISPLAY * itemHeight)) {
-    int clickedIndex = (y - listY) / itemHeight;
+  // Check if touch is in the list area
+  if (y >= listY && y < SAFE_BOTTOM) {
+    int clickedIndex = (y - listY) / ITEM_HEIGHT;
     int actualIndex = wifiScrollOffset + clickedIndex;
     
     if (actualIndex >= 0 && actualIndex < networkCount) {
@@ -3629,18 +3650,18 @@ void handleSelectTargetTouch(int x, int y) {
       selectedIndex = actualIndex;
       currentState = WIFI_ATTACK_MENU;
       hoveredIndex = -1;
+      wifiScrollOffset = 0; // Reset for next time
       drawAttackMenu();
       addToConsole("Target: " + selectedSSID);
     }
   }
-  // Scroll up
-  else if (y < listY && wifiScrollOffset > 0) {
-    wifiScrollOffset = max(0, wifiScrollOffset - MAX_WIFI_DISPLAY);
-    drawSelectTargetMenu();
-  }
-  // Scroll down
-  else if (y > 270 && y < 300 && wifiScrollOffset + MAX_WIFI_DISPLAY < networkCount) {
-    wifiScrollOffset = min(networkCount - MAX_WIFI_DISPLAY, wifiScrollOffset + MAX_WIFI_DISPLAY);
+  // Scroll functionality - tap scroll indicator area to go to next page
+  else if (y >= SAFE_BOTTOM && y < 300 && networkCount > MAX_ITEMS) {
+    // Calculate next page
+    wifiScrollOffset += MAX_ITEMS;
+    if (wifiScrollOffset >= networkCount) {
+      wifiScrollOffset = 0; // Wrap to start
+    }
     drawSelectTargetMenu();
   }
 }
@@ -3755,17 +3776,32 @@ void handleTouch() {
         break;
         
       case BLE_SCAN_RESULTS:
-        if (touchY > 300) {
-          // STOP SCAN FIRST, change state, THEN draw
-          continuousBLEScan = false;
-          if (pBLEScan != nullptr) {
-            pBLEScan->stop();
-            BLEDevice::deinit(false);
+        {
+          const int BACK_BUTTON_Y = 305;
+          const int SAFE_BOTTOM = BACK_BUTTON_Y - 25;
+          const int listY = HEADER_HEIGHT + 37;
+          const int ITEM_HEIGHT = 26;
+          const int MAX_ITEMS = (SAFE_BOTTOM - listY) / ITEM_HEIGHT;
+          
+          if (touchY > 300) {
+            // Stop scan and go back
+            continuousBLEScan = false;
+            if (pBLEScan != nullptr) {
+              pBLEScan->stop();
+              BLEDevice::deinit(false);
+            }
+            currentState = BLE_MENU;
+            hoveredIndex = -1;
+            delay(100);
+            drawBLEMenu();
+          } else if (touchY >= SAFE_BOTTOM && touchY < 300 && bleDeviceCount > MAX_ITEMS) {
+            // Scroll to next page
+            bleScrollOffset += MAX_ITEMS;
+            if (bleScrollOffset >= bleDeviceCount) {
+              bleScrollOffset = 0; // Wrap to start
+            }
+            displayBLEScanResults();
           }
-          currentState = BLE_MENU;  // Change state BEFORE drawing
-          hoveredIndex = -1;
-          delay(100);  // Small delay to ensure scan stops
-          drawBLEMenu();
         }
         break;
         
@@ -3795,29 +3831,10 @@ void handleTouch() {
         hoveredIndex = -1;
         drawNRFJammerMenu();
         break;
-
-      case DEAUTH_SNIFFER:
-        handleDeauthSnifferMenuTouch(touchX, touchY);
-        break;
-
+      
       case DEAUTH_SNIFFER_ACTIVE:
-        if (touchY > 300) {
-          stopDeauthSniffer();
-          currentState = DEAUTH_SNIFFER;
-          drawDeauthSnifferMenu();
-        } else {
-          // Scroll through deauth events
-          int listY = HEADER_HEIGHT + 35;
-          if (touchY > listY && touchY < 280) {
-            if (deauthScrollOffset + MAX_DEAUTH_DISPLAY < deauthEventCount) {
-              deauthScrollOffset++;
-              displayDeauthSnifferActive();
-            }
-          } else if (touchY < listY && deauthScrollOffset > 0) {
-            deauthScrollOffset--;
-            displayDeauthSnifferActive();
-          }
-        }
+        // Direct handling - no menu needed
+        handleDeauthSnifferMenuTouch(touchX, touchY);
         break;
         
       // ===== FIXED: AirTag Scanner =====
@@ -3853,11 +3870,32 @@ void handleTouch() {
         break;
         
       // ===== FIXED: Wardriving =====
+      case ROGUE_AP_DETECTOR:
+        if (touchY > 300) {
+          // Stop scan
+          stopRogueAPDetector();
+          currentState = MORE_TOOLS_MENU;
+          hoveredIndex = -1;
+          delay(100);
+          drawMoreToolsMenu();
+        } else if (rogueAPCount > 0 && touchY > HEADER_HEIGHT + 40 && touchY < 280) {
+          // Scroll through rogue APs
+          const int MAX_ROGUE_DISPLAY = 7;
+          int totalPages = (rogueAPCount + MAX_ROGUE_DISPLAY - 1) / MAX_ROGUE_DISPLAY;
+          
+          if (totalPages > 1) {
+            int currentPage = rogueScrollOffset / MAX_ROGUE_DISPLAY;
+            currentPage = (currentPage + 1) % totalPages;
+            rogueScrollOffset = currentPage * MAX_ROGUE_DISPLAY;
+            displayRogueAPDetector();
+          }
+        }
+        break;
+
       case WARDRIVING_MODE:
         if (touchY > 300) {
-          // Stop scan, change state, THEN draw
           WiFi.scanDelete();
-          currentState = MORE_TOOLS_MENU;  // Change state BEFORE drawing
+          currentState = MORE_TOOLS_MENU;
           hoveredIndex = -1;
           delay(100);
           drawMoreToolsMenu();
@@ -4056,6 +4094,8 @@ void handleBackButton() {
         drawMainMenu();
       } else if (previousState == MORE_TOOLS_MENU) {
         drawMoreToolsMenu();
+      } else if (previousState == SETTINGS_MENU) {  // ← ADD THIS
+        drawSettingsMenu();
       }
       break;
       
@@ -4106,7 +4146,7 @@ void handleMainMenuTouch(int x, int y) {
           packetHistoryIndex = 0;
           startSniffer();
           break;
-        case 3: // More Tools
+        case 3: // Defensive Tools
           currentState = MORE_TOOLS_MENU;
           hoveredIndex = -1;
           drawMoreToolsMenu();
@@ -4131,10 +4171,9 @@ void handleSettingsMenuTouch(int x, int y) {
   }
   
   int startY = HEADER_HEIGHT + 10;
-  int controlsX = 145;
   
   // Calculate which menu item was touched
-  if (y >= startY && y < startY + (4 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {
+  if (y >= startY && y < startY + (5 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {  // Changed from 4 to 5
     int relativeY = y - startY;
     int buttonIndex = relativeY / (MENU_ITEM_HEIGHT + MENU_SPACING);
     
@@ -4143,7 +4182,7 @@ void handleSettingsMenuTouch(int x, int y) {
     if (y < buttonY || y > buttonY + MENU_ITEM_HEIGHT) return;
     
     // Ensure index is valid
-    if (buttonIndex < 0 || buttonIndex > 3) return;
+    if (buttonIndex < 0 || buttonIndex > 4) return;  // Changed from 3 to 4
     
     switch (buttonIndex) {
       case 0: // Device Info
@@ -4152,7 +4191,8 @@ void handleSettingsMenuTouch(int x, int y) {
         drawDeviceInfo();
         break;
         
-      case 1: Serial.println("SD Card initializing...");
+      case 1: // SD Card
+        Serial.println("SD Card initializing...");
         break;
         
       case 2: // Show ASCII Art
@@ -4160,7 +4200,11 @@ void handleSettingsMenuTouch(int x, int y) {
         drawASCIIArtViewer();
         break;
         
-      case 3: // Reboot
+      case 3: // Console ← NEW
+        showConsole();
+        break;
+        
+      case 4: // Reboot
         Serial.println("\n[*] Rebooting device...");
         addToConsole("Rebooting...");
         delay(1000);
@@ -4526,7 +4570,7 @@ void handleMoreToolsTouch(int x, int y) {
   
   int startY = HEADER_HEIGHT + 10;
   
-  if (y >= startY && y < startY + (4 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {  // Changed from 3 to 4
+  if (y >= startY && y < startY + (4 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {  // Changed from 5 to 4
     int relativeY = y - startY;
     int buttonIndex = relativeY / (MENU_ITEM_HEIGHT + MENU_SPACING);
     
@@ -4534,18 +4578,16 @@ void handleMoreToolsTouch(int x, int y) {
     if (y >= buttonY && y <= buttonY + MENU_ITEM_HEIGHT) {
       switch (buttonIndex) {
         case 0:  // Deauth Sniffer
-          currentState = DEAUTH_SNIFFER;
-          hoveredIndex = -1;
-          drawDeauthSnifferMenu();
+          startDeauthSniffer();
           break;
         case 1:  // Skimmer Detect
           startSkimmerDetector();
           break;
-        case 2:  // Wardriving
-          startWardriving();
+        case 2:  // Rogue AP Detector
+          startRogueAPDetector();
           break;
-        case 3:  // Console
-          showConsole();
+        case 3:  // Wardriving
+          startWardriving();
           break;
       }
     }
@@ -4563,10 +4605,14 @@ void handleWiFiScanTouch(int x, int y) {
   }
   
   int listY = HEADER_HEIGHT + 35;
-  int itemHeight = 22;
+  const int BACK_BUTTON_Y = 305;
+  const int SAFE_BOTTOM = BACK_BUTTON_Y - 25;
+  const int ITEM_HEIGHT = 22;
+  const int MAX_ITEMS = (SAFE_BOTTOM - listY) / ITEM_HEIGHT;
   
-  if (y >= listY && y <= listY + (MAX_WIFI_DISPLAY * itemHeight)) {
-    int clickedIndex = (y - listY) / itemHeight;
+  // Check if touch is in list area
+  if (y >= listY && y < SAFE_BOTTOM) {
+    int clickedIndex = (y - listY) / ITEM_HEIGHT;
     int actualIndex = wifiScrollOffset + clickedIndex;
     
     if (actualIndex >= 0 && actualIndex < networkCount) {
@@ -4579,12 +4625,12 @@ void handleWiFiScanTouch(int x, int y) {
       addToConsole("Target: " + selectedSSID);
     }
   }
-  else if (y < listY && wifiScrollOffset > 0) {
-    wifiScrollOffset = max(0, wifiScrollOffset - MAX_WIFI_DISPLAY);
-    displayContinuousWiFiScan();
-  }
-  else if (y > 270 && y < 300 && wifiScrollOffset + MAX_WIFI_DISPLAY < networkCount) {
-    wifiScrollOffset = min(networkCount - MAX_WIFI_DISPLAY, wifiScrollOffset + MAX_WIFI_DISPLAY);
+  // Scroll functionality - tap scroll indicator area
+  else if (y >= SAFE_BOTTOM && y < 300 && networkCount > MAX_ITEMS) {
+    wifiScrollOffset += MAX_ITEMS;
+    if (wifiScrollOffset >= networkCount) {
+      wifiScrollOffset = 0; // Wrap to start
+    }
     displayContinuousWiFiScan();
   }
 }
@@ -4694,6 +4740,43 @@ void loop() {
       if (millis() - lastFloodDisplay > 300) {
         updateDeauthFloodDisplay();
         lastFloodDisplay = millis();
+      }
+    }
+
+    if (deauthSnifferActive && currentState == DEAUTH_SNIFFER_ACTIVE) {
+    static unsigned long lastChannelHop = 0;
+    static unsigned long lastSnifferUpdate = 0;
+    
+      // Fast channel hopping - 150ms per channel (optimal for deauth detection)
+      if (millis() - lastChannelHop > 150) {
+        snifferChannel = (snifferChannel % 13) + 1;  // Cycle 1-13
+        esp_wifi_set_channel(snifferChannel, WIFI_SECOND_CHAN_NONE);
+        lastChannelHop = millis();
+      }
+      
+      // Update display every 300ms
+      if (millis() - lastSnifferUpdate > 300) {
+        displayDeauthSnifferActive();
+        lastSnifferUpdate = millis();
+      }
+    }
+
+    if (rogueAPScanActive && currentState == ROGUE_AP_DETECTOR) {
+      processRogueAPScan();
+      
+      static unsigned long lastRogueDisplay = 0;
+      if (millis() - lastRogueDisplay > 1000) {
+        displayRogueAPDetector();
+        lastRogueDisplay = millis();
+      }
+    }
+
+    // Regular Wardriving (only when Rogue AP detector is NOT active)
+    if (!rogueAPScanActive && currentState == WARDRIVING_MODE) {
+      static unsigned long lastWardrivingUpdate = 0;
+      if (millis() - lastWardrivingUpdate > 1000) {
+        displayWardrivingResults();
+        lastWardrivingUpdate = millis();
       }
     }
     
@@ -5599,15 +5682,9 @@ void startHandshakeCapture() {
 }
 
 void displayHandshakeCapture() {
-  static bool needsFullRedraw = true;
-  static bool lastCapturedState = false;
-  
-  if (needsFullRedraw || (capturedHandshake.captured != lastCapturedState)) {
-    tft.fillScreen(COLOR_BG);
-    drawTerminalHeader("handshake capture");
-    needsFullRedraw = false;
-    lastCapturedState = capturedHandshake.captured;
-  }
+  // ✅ FIX: Always do full redraw to prevent double UI
+  tft.fillScreen(COLOR_BG);
+  drawTerminalHeader("handshake capture");
   
   // Live indicator
   static bool blink = false;
@@ -5615,9 +5692,6 @@ void displayHandshakeCapture() {
   tft.fillCircle(220, 12, 3, blink ? COLOR_GREEN : COLOR_DARK_GREEN);
   
   int y = HEADER_HEIGHT + 10;
-  
-  // Clear dynamic area only
-  tft.fillRect(0, y, 240, 270, COLOR_BG);
   
   // Target info - compact
   tft.setTextSize(1);
@@ -5682,11 +5756,22 @@ void displayHandshakeCapture() {
   if (capturedHandshake.captured) {
     // BLINK EFFECT when captured
     static unsigned long captureBlinkTime = 0;
-    if (captureBlinkTime == 0) captureBlinkTime = millis();
+    static bool captureBlinkState = false;
+    
+    if (captureBlinkTime == 0) {
+      captureBlinkTime = millis();
+      captureBlinkState = true;
+    }
     
     bool showText = true;
     if (millis() - captureBlinkTime < 5000) {
-      showText = (millis() / 200) % 2 == 0;
+      if (millis() / 200 % 2 == 0) {
+        showText = true;
+      } else {
+        showText = false;
+      }
+    } else {
+      showText = true; // Always show after 5 seconds
     }
     
     if (showText) {
@@ -5753,7 +5838,7 @@ void displayHandshakeCapture() {
   tft.setTextColor(COLOR_CYAN);
   tft.printf("%d sec", runtime);
   
-  // ✅ FIXED: Consistent stop button style
+  // Stop button
   int backY = 305;
   tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
   tft.setTextColor(COLOR_RED);
@@ -6377,21 +6462,22 @@ void displayBLEScanResults() {
   blink = !blink;
   tft.fillCircle(220, 12, 3, blink ? COLOR_GREEN : COLOR_DARK_GREEN);
   
-  // Status line
+  // Stats bar - COMPACT single line
+  int statsY = HEADER_HEIGHT + 5;
   tft.setTextSize(1);
   tft.setTextColor(COLOR_CYAN);
-  tft.setCursor(SIDE_MARGIN, HEADER_HEIGHT + 5);
+  tft.setCursor(SIDE_MARGIN, statsY);
   tft.print("Scanning...");
   
   tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(120, HEADER_HEIGHT + 5);
+  tft.setCursor(120, statsY);
   tft.printf("Found: ");
   tft.setTextColor(COLOR_GREEN);
   tft.printf("%d", bleDeviceCount);
   
   // Column headers
-  int listY = HEADER_HEIGHT + 20;
-  tft.drawFastHLine(0, listY - 2, 240, COLOR_DARK_GREEN);
+  int listY = HEADER_HEIGHT + 22;
+  tft.drawFastHLine(0, listY - 3, 240, COLOR_DARK_GREEN);
   
   tft.setTextSize(1);
   tft.setTextColor(COLOR_DARK_GREEN);
@@ -6403,19 +6489,28 @@ void displayBLEScanResults() {
   tft.drawFastHLine(0, listY + 12, 240, COLOR_DARK_GREEN);
   listY += 15;
   
-  // Display devices with pagination
-  const int MAX_BLE_DISPLAY = 9;
+  // Calculate safe display area
+  const int BACK_BUTTON_Y = 305;
+  const int SAFE_BOTTOM = BACK_BUTTON_Y - 25;
+  const int ITEM_HEIGHT = 26;
+  const int MAX_ITEMS = (SAFE_BOTTOM - listY) / ITEM_HEIGHT;
   
   // Ensure scroll offset is valid
   if (bleScrollOffset >= bleDeviceCount) {
-    bleScrollOffset = max(0, bleDeviceCount - MAX_BLE_DISPLAY);
+    bleScrollOffset = max(0, bleDeviceCount - MAX_ITEMS);
+  }
+  if (bleScrollOffset < 0) {
+    bleScrollOffset = 0;
   }
   
-  int displayCount = min(bleDeviceCount - bleScrollOffset, MAX_BLE_DISPLAY);
+  int displayCount = min(bleDeviceCount - bleScrollOffset, MAX_ITEMS);
   
   for (int i = 0; i < displayCount; i++) {
     int idx = bleScrollOffset + i;
-    int y = listY + (i * 26);
+    int y = listY + (i * ITEM_HEIGHT);
+    
+    // Stop if too close to back button
+    if (y + ITEM_HEIGHT > SAFE_BOTTOM) break;
     
     // Name
     String displayName = bleDevices[idx].name;
@@ -6441,24 +6536,23 @@ void displayBLEScanResults() {
     tft.printf("%d", rssi);
   }
   
-  // Scroll indicator
-  if (bleDeviceCount > MAX_BLE_DISPLAY) {
-    int scrollY = listY + (MAX_BLE_DISPLAY * 26) + 5;
+  // Scroll indicator (if needed)
+  if (bleDeviceCount > MAX_ITEMS) {
+    int scrollY = SAFE_BOTTOM + 2;
     tft.setTextColor(COLOR_DARK_GREEN);
     tft.setTextSize(1);
-    tft.setCursor(85, scrollY);
-    tft.printf("[%d-%d/%d]", 
-               bleScrollOffset + 1, 
-               bleScrollOffset + displayCount, 
-               bleDeviceCount);
+    tft.setCursor(70, scrollY);
+    tft.printf("Page %d/%d [Tap scroll]", 
+               (bleScrollOffset / MAX_ITEMS) + 1,
+               (bleDeviceCount + MAX_ITEMS - 1) / MAX_ITEMS);
   }
   
   // Back button
   int backY = 305;
   tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
   tft.setTextColor(COLOR_RED);
-  tft.setCursor(85, backY + 3);
-  tft.print("[ESC] Back");
+  tft.setCursor(75, backY + 3);
+  tft.print("[TAP] Stop");
 }
 
 // ==================== BLE JAMMER Functions ====================
@@ -8190,6 +8284,455 @@ void displayWardrivingResults() {
   tft.print("[ESC] Back");
 }
 
+// ==================== ROGUE AP DETECTOR FUNCTIONS ====================
+
+void startRogueAPDetector() {
+  rogueAPScanActive = true;
+  rogueAPCount = 0;
+  apHistoryCount = 0;
+  rogueScrollOffset = 0;
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+  
+  currentState = ROGUE_AP_DETECTOR;  // ← CHANGED FROM WARDRIVING_MODE
+  
+  addToConsole("Rogue AP scan started");
+  Serial.println("[+] Rogue AP Detector started");
+  Serial.println("    Monitoring for evil twins and suspicious APs...");
+  
+  displayRogueAPDetector();
+  
+  // Start async WiFi scan
+  WiFi.scanNetworks(true, false, false, 300);
+}
+
+void stopRogueAPDetector() {
+  rogueAPScanActive = false;
+  WiFi.scanDelete();
+  
+  Serial.printf("[+] Rogue AP Detector stopped - %d rogues detected\n", rogueAPCount);
+  addToConsole("Rogue AP scan stopped");
+}
+
+void processRogueAPScan() {
+  if (!rogueAPScanActive) return;
+  
+  int scanStatus = WiFi.scanComplete();
+  
+  if (scanStatus >= 0) {
+    // Process scan results
+    for (int i = 0; i < scanStatus; i++) {
+      String ssid = WiFi.SSID(i);
+      uint8_t* bssid = WiFi.BSSID(i);
+      int32_t rssi = WiFi.RSSI(i);
+      uint8_t channel = WiFi.channel(i);
+      
+      if (ssid.length() == 0) continue;  // Skip hidden networks
+      
+      // Update or add to history
+      updateAPHistory(ssid, bssid, rssi, channel);
+      
+      // Check for suspicious patterns
+      checkForRogueAP(ssid, bssid, rssi, channel);
+    }
+    
+    // Clean up and start next scan
+    WiFi.scanDelete();
+    if (rogueAPScanActive) {
+      WiFi.scanNetworks(true, false, false, 300);
+    }
+  }
+}
+
+void updateAPHistory(String ssid, uint8_t* bssid, int32_t rssi, uint8_t channel) {
+  // Find existing entry
+  int existingIndex = -1;
+  for (int i = 0; i < apHistoryCount; i++) {
+    if (apHistoryList[i].ssid == ssid && 
+        memcmp(apHistoryList[i].bssid, bssid, 6) == 0) {
+      existingIndex = i;
+      break;
+    }
+  }
+  
+  unsigned long now = millis();
+  
+  if (existingIndex >= 0) {
+    // Update existing
+    APHistory* ap = &apHistoryList[existingIndex];
+    
+    // Track signal fluctuations
+    if (abs(ap->rssi - rssi) > 15) {
+      ap->signalFluctuations++;
+    }
+    
+    // Track channel changes
+    if (ap->channel != channel) {
+      ap->channelChanges++;
+    }
+    
+    ap->rssi = rssi;
+    ap->channel = channel;
+    ap->lastSeen = now;
+    
+  } else if (apHistoryCount < 50) {
+    // Add new entry
+    APHistory* ap = &apHistoryList[apHistoryCount];
+    ap->ssid = ssid;
+    memcpy(ap->bssid, bssid, 6);
+    ap->rssi = rssi;
+    ap->channel = channel;
+    ap->firstSeen = now;
+    ap->lastSeen = now;
+    ap->inWhitelist = isWhitelisted(bssid);
+    ap->signalFluctuations = 0;
+    ap->channelChanges = 0;
+    
+    apHistoryCount++;
+  }
+}
+
+bool isWhitelisted(uint8_t* bssid) {
+  for (int i = 0; i < whitelistCount; i++) {
+    if (memcmp(whitelistedBSSIDs[i], bssid, 6) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void checkForRogueAP(String ssid, uint8_t* bssid, int32_t rssi, uint8_t channel) {
+  // Skip whitelisted APs
+  if (isWhitelisted(bssid)) return;
+  
+  // Look for duplicate SSIDs with different BSSIDs
+  for (int i = 0; i < apHistoryCount; i++) {
+    APHistory* other = &apHistoryList[i];
+    
+    // Same SSID but different BSSID
+    if (other->ssid == ssid && memcmp(other->bssid, bssid, 6) != 0) {
+      
+      // Calculate confidence score
+      uint8_t confidence = 0;
+      String reason = "";
+      
+      int32_t signalDiff = abs(rssi - other->rssi);
+      
+      // Pattern 1: One AP much stronger (likely attacker nearby)
+      if (signalDiff > 20) {
+        confidence += 40;
+        reason = "Strong signal diff";
+      }
+      
+      // Pattern 2: Same channel (classic evil twin)
+      if (channel == other->channel) {
+        confidence += 30;
+        reason += " + Same channel";
+      }
+      
+      // Pattern 3: Suspiciously strong signal
+      if (rssi > -40 || other->rssi > -40) {
+        confidence += 20;
+        reason += " + Very close";
+      }
+      
+      // Pattern 4: Rapid appearance
+      unsigned long now = millis();
+      if ((now - other->firstSeen) < 5000) {
+        confidence += 10;
+        reason += " + Sudden appear";
+      }
+      
+      // If confidence high enough, log as rogue
+      if (confidence >= 50) {
+        addRogueAP(ssid, other->bssid, bssid, other->rssi, rssi, 
+                   other->channel, channel, confidence, reason);
+      }
+    }
+  }
+  
+  // Check for suspicious behavior patterns
+  for (int i = 0; i < apHistoryCount; i++) {
+    APHistory* ap = &apHistoryList[i];
+    
+    if (memcmp(ap->bssid, bssid, 6) == 0) {
+      // Pattern 5: Excessive channel changes
+      if (ap->channelChanges > 3) {
+        uint8_t confidence = min(70, 40 + (ap->channelChanges * 10));
+        addRogueAP(ssid, ap->bssid, bssid, ap->rssi, rssi, 
+                   ap->channel, channel, confidence, "Channel hopping");
+      }
+      
+      // Pattern 6: Extreme signal fluctuations (AP being moved?)
+      if (ap->signalFluctuations > 5) {
+        uint8_t confidence = min(60, 30 + (ap->signalFluctuations * 5));
+        addRogueAP(ssid, ap->bssid, bssid, ap->rssi, rssi, 
+                   ap->channel, channel, confidence, "Signal instability");
+      }
+    }
+  }
+}
+
+void addRogueAP(String ssid, uint8_t* legitBSSID, uint8_t* rogueBSSID, 
+                int32_t legitRSSI, int32_t rogueRSSI, 
+                uint8_t legitCh, uint8_t rogueCh,
+                uint8_t confidence, String reason) {
+  
+  // Check if already logged
+  for (int i = 0; i < rogueAPCount; i++) {
+    if (detectedRogues[i].ssid == ssid &&
+        memcmp(detectedRogues[i].rogueBSSID, rogueBSSID, 6) == 0) {
+      // Update existing
+      detectedRogues[i].detectionCount++;
+      detectedRogues[i].lastSeen = millis();
+      detectedRogues[i].rogueRSSI = rogueRSSI;
+      
+      // Increase confidence with repeated detections
+      detectedRogues[i].confidenceScore = min(100, confidence + (detectedRogues[i].detectionCount * 5));
+      return;
+    }
+  }
+  
+  // Add new rogue if space available
+  if (rogueAPCount < 20) {
+    RogueAP* rogue = &detectedRogues[rogueAPCount];
+    rogue->ssid = ssid;
+    memcpy(rogue->legitimateBSSID, legitBSSID, 6);
+    memcpy(rogue->rogueBSSID, rogueBSSID, 6);
+    rogue->legitimateRSSI = legitRSSI;
+    rogue->rogueRSSI = rogueRSSI;
+    rogue->legitimateChannel = legitCh;
+    rogue->rogueChannel = rogueCh;
+    rogue->firstSeen = millis();
+    rogue->lastSeen = millis();
+    rogue->detectionCount = 1;
+    rogue->confidenceScore = confidence;
+    rogue->suspiciousReason = reason;
+    
+    rogueAPCount++;
+    
+    // Alert
+    Serial.printf("\n[!] ROGUE AP DETECTED!\n");
+    Serial.printf("    SSID: %s\n", ssid.c_str());
+    Serial.printf("    Confidence: %d%%\n", confidence);
+    Serial.printf("    Reason: %s\n", reason.c_str());
+    
+    addToConsole("ROGUE: " + ssid);
+  }
+}
+
+void displayRogueAPDetector() {
+  tft.fillScreen(COLOR_BG);
+  drawTerminalHeader("rogue ap detector");
+  
+  // Live indicator
+  static bool blink = false;
+  blink = !blink;
+  tft.fillCircle(220, 12, 3, blink ? COLOR_RED : COLOR_DARK_GREEN);
+  
+  // Stats bar - COMPACT
+  int statsY = HEADER_HEIGHT + 5;
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_CYAN);
+  tft.setCursor(SIDE_MARGIN, statsY);
+  tft.print("Scanning...");
+  
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(100, statsY);
+  tft.printf("APs:");
+  tft.setTextColor(COLOR_GREEN);
+  tft.printf("%d", apHistoryCount);
+  
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(155, statsY);
+  tft.printf("Rogues:");
+  tft.setTextColor(rogueAPCount > 0 ? COLOR_RED : COLOR_GREEN);
+  tft.printf("%d", rogueAPCount);
+  
+  // Column headers
+  int listY = HEADER_HEIGHT + 22;
+  tft.drawFastHLine(0, listY - 2, 240, COLOR_DARK_GREEN);
+  
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setTextSize(1);
+  tft.setCursor(SIDE_MARGIN, listY);
+  tft.print("NETWORK");
+  tft.setCursor(130, listY);
+  tft.print("CONF");
+  tft.setCursor(175, listY);
+  tft.print("DETC");
+  
+  tft.drawFastHLine(0, listY + 12, 240, COLOR_DARK_GREEN);
+  listY += 15;
+  
+  // Calculate safe display area
+  const int BACK_BUTTON_Y = 305;
+  const int SAFE_BOTTOM = BACK_BUTTON_Y - 25;
+  const int ITEM_HEIGHT = 32;
+  const int MAX_ITEMS = (SAFE_BOTTOM - listY) / ITEM_HEIGHT;
+  
+  if (rogueAPCount == 0) {
+    // No rogues detected - show status
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_GREEN);
+    tft.setCursor(SIDE_MARGIN, listY + 30);
+    tft.print("â No rogue APs detected");
+    
+    tft.setTextColor(COLOR_TEXT);
+    tft.setCursor(SIDE_MARGIN, listY + 50);
+    tft.print("Network appears clean");
+    
+    tft.setTextColor(COLOR_DARK_GREEN);
+    tft.setCursor(SIDE_MARGIN, listY + 70);
+    tft.printf("Monitoring %d APs...", apHistoryCount);
+    
+    tft.setCursor(SIDE_MARGIN, listY + 90);
+    tft.print("Looking for:");
+    
+    tft.setTextColor(COLOR_TEXT);
+    tft.setCursor(SIDE_MARGIN + 5, listY + 105);
+    tft.print("• Duplicate SSIDs");
+    tft.setCursor(SIDE_MARGIN + 5, listY + 117);
+    tft.print("• Channel hopping");
+    tft.setCursor(SIDE_MARGIN + 5, listY + 129);
+    tft.print("• Signal anomalies");
+    tft.setCursor(SIDE_MARGIN + 5, listY + 141);
+    tft.print("• Evil Twin attacks");
+    
+  } else {
+    // Display detected rogues with pagination
+    
+    // Ensure scroll offset is valid
+    if (rogueScrollOffset >= rogueAPCount) {
+      rogueScrollOffset = max(0, rogueAPCount - MAX_ITEMS);
+    }
+    if (rogueScrollOffset < 0) {
+      rogueScrollOffset = 0;
+    }
+    
+    int displayCount = min(rogueAPCount - rogueScrollOffset, MAX_ITEMS);
+    
+    for (int i = 0; i < displayCount; i++) {
+      int idx = rogueScrollOffset + i;
+      int y = listY + (i * ITEM_HEIGHT);
+      
+      // Stop if too close to back button
+      if (y + ITEM_HEIGHT > SAFE_BOTTOM) break;
+      
+      RogueAP* rogue = &detectedRogues[idx];
+      
+      // Alert icon with color based on confidence
+      uint8_t conf = rogue->confidenceScore;
+      uint16_t alertColor;
+      if (conf >= 80) alertColor = COLOR_RED;
+      else if (conf >= 60) alertColor = COLOR_ORANGE;
+      else alertColor = COLOR_YELLOW;
+      
+      tft.setTextColor(alertColor);
+      tft.setTextSize(1);
+      tft.setCursor(SIDE_MARGIN, y + 2);
+      tft.print("[!]");
+      
+      // SSID (line 1)
+      tft.setTextColor(COLOR_TEXT);
+      tft.setCursor(SIDE_MARGIN + 18, y + 2);
+      String displaySSID = rogue->ssid;
+      if (displaySSID.length() > 15) displaySSID = displaySSID.substring(0, 14) + "~";
+      tft.print(displaySSID);
+      
+      // Confidence percentage
+      uint16_t confColor;
+      if (conf >= 80) confColor = COLOR_RED;
+      else if (conf >= 60) confColor = COLOR_ORANGE;
+      else confColor = COLOR_YELLOW;
+      
+      tft.setTextColor(confColor);
+      tft.setCursor(130, y + 2);
+      tft.printf("%d%%", conf);
+      
+      // Detection count
+      tft.setTextColor(COLOR_CYAN);
+      tft.setCursor(175, y + 2);
+      tft.printf("x%d", rogue->detectionCount);
+      
+      // BSSID comparison (line 2)
+      tft.setTextColor(COLOR_DARK_GREEN);
+      tft.setCursor(SIDE_MARGIN + 18, y + 12);
+      tft.print("L:");
+      tft.printf("%02X:%02X:%02X", 
+                 rogue->legitimateBSSID[3],
+                 rogue->legitimateBSSID[4],
+                 rogue->legitimateBSSID[5]);
+      
+      tft.setTextColor(COLOR_RED);
+      tft.setCursor(SIDE_MARGIN + 65, y + 12);
+      tft.print("R:");
+      tft.printf("%02X:%02X:%02X", 
+                 rogue->rogueBSSID[3],
+                 rogue->rogueBSSID[4],
+                 rogue->rogueBSSID[5]);
+      
+      // RSSI and Channel info (line 3)
+      tft.setTextColor(COLOR_CYAN);
+      tft.setCursor(SIDE_MARGIN + 18, y + 22);
+      tft.printf("Ch%d/%d", rogue->legitimateChannel, rogue->rogueChannel);
+      
+      tft.setTextColor(COLOR_YELLOW);
+      tft.setCursor(SIDE_MARGIN + 55, y + 22);
+      tft.printf("%ddB/%ddB", rogue->legitimateRSSI, rogue->rogueRSSI);
+      
+      // Threat reason (abbreviated)
+      tft.setTextColor(COLOR_ORANGE);
+      tft.setCursor(130, y + 22);
+      if (rogue->suspiciousReason.indexOf("signal diff") >= 0 || 
+          rogue->suspiciousReason.indexOf("Strong") >= 0) {
+        tft.print("SIGNAL");
+      } else if (rogue->suspiciousReason.indexOf("channel") >= 0 || 
+                 rogue->suspiciousReason.indexOf("hopping") >= 0) {
+        tft.print("CH-HOP");
+      } else if (rogue->suspiciousReason.indexOf("close") >= 0 || 
+                 rogue->suspiciousReason.indexOf("Very") >= 0) {
+        tft.print("CLOSE");
+      } else if (rogue->suspiciousReason.indexOf("instability") >= 0) {
+        tft.print("UNSTBL");
+      } else {
+        tft.print("SUSP");
+      }
+    }
+    
+    // Scroll indicator (if needed)
+    if (rogueAPCount > MAX_ITEMS) {
+      int scrollY = SAFE_BOTTOM + 2;
+      tft.setTextColor(COLOR_DARK_GREEN);
+      tft.setTextSize(1);
+      tft.setCursor(70, scrollY);
+      tft.printf("Page %d/%d [Tap scroll]", 
+                 (rogueScrollOffset / MAX_ITEMS) + 1,
+                 (rogueAPCount + MAX_ITEMS - 1) / MAX_ITEMS);
+    }
+  }
+  
+  // Legend at bottom (compact)
+  int legendY = 240;
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, legendY);
+  tft.print("L=Legit R=Rogue CONF=Risk%");
+  
+  legendY += 12;
+  tft.setCursor(SIDE_MARGIN, legendY);
+  tft.print("DETC=Times seen");
+  
+  // Back button
+  int backY = 305;
+  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
+  tft.setTextColor(COLOR_RED);
+  tft.setCursor(75, backY + 3);
+  tft.print("[TAP] Stop");
+}
+
 // ==================== Serial Commands ====================
 
 void handleSerialCommands() {
@@ -8272,6 +8815,15 @@ void handleSerialCommands() {
     }
     else if (cmd == "info") {
       printSystemInfo();
+    }
+    else if (cmd == "rogue" || cmd == "rogueap") {
+      if (!rogueAPScanActive) {
+        startRogueAPDetector();
+      } else {
+        stopRogueAPDetector();
+        currentState = MORE_TOOLS_MENU;
+        drawMoreToolsMenu();
+      }
     }
     else {
       Serial.println("Unknown command. Type 'help' for commands.");
