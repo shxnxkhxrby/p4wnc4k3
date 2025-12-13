@@ -228,6 +228,18 @@ uint32_t nrf1Packets = 0;
 uint32_t nrf2Packets = 0;
 unsigned long lastNRFJamTime = 0;
 
+// WiFi Clown V2 sweep variables
+const byte wifi_ch1_sweep[] = {7, 9, 11, 13, 15, 17};   // WiFi Channel 1 (2412 MHz)
+const byte wifi_ch6_sweep[] = {32, 34, 36, 38, 40, 42}; // WiFi Channel 6 (2437 MHz)
+const byte wifi_ch11_sweep[] = {57, 59, 61, 63, 65, 67}; // WiFi Channel 11 (2462 MHz)
+
+byte wifi_jam_mode = 0;  // 0=Ch1, 1=Ch6, 2=Ch11
+byte sweep_index_radio1 = 0;
+byte sweep_index_radio2 = 3; // Offset for dual coverage
+
+unsigned long lastChannelChange = 0;
+const unsigned long DWELL_TIME_MS = 20; // Stay 20ms per channel
+
 // Smoochiee's hopping pattern variables
 unsigned int flag_radio1 = 0;   // Direction flag for radio 1
 unsigned int flag_radio2 = 0;   // Direction flag for radio 2
@@ -3626,13 +3638,13 @@ void drawNRFJammerMenu() {
   tft.println("BLE advertising only.");
   y += 11;
   
-  // ===== MODE 4: WIFI CLOWN (NEW) =====
+  // ===== MODE 4: WIFI CLOWN V2 (UPDATED) =====
   tft.setTextColor(COLOR_PURPLE);
   tft.setCursor(SIDE_MARGIN, y);
   tft.print("WIFI CLOWN");
   tft.setTextColor(COLOR_TEXT);
   tft.print(" = ");
-  tft.println("WiFi Ch 1,6,11 block.");
+  tft.println("WiFi Ch1,6,11 multi-sweep");
   
   // Back button
   int backY = 305;
@@ -4571,9 +4583,16 @@ void handleNRFJamMenuTouch(int x, int y) {
       switch (buttonIndex) {
         case 0:  // Start/Stop Jammer
           if (!nrfJammerActive) {
+            if (!nrf1Available && !nrf2Available) {
+              showMessage("No nRF24 modules!", COLOR_WARNING);
+              delay(1500);
+              drawNRFJammerMenu();
+              return;
+            }
             startNRFJammer();
           } else {
             stopNRFJammer();
+            delay(100);
             drawNRFJammerMenu();
           }
           break;
@@ -4833,20 +4852,62 @@ void loop() {
   if (nrfJammerActive && nrfTurboMode) {
     // ONLY jamming + minimal touch checking
     
-    // Ultra-fast touch check: only every 5000 hops (~50ms at 100K/sec)
-    static uint32_t lastTouchCheck = 0;
-    if ((nrfJamPackets - lastTouchCheck) > 5000) {
+    // ✅ IMPROVED: Check touch EVERY LOOP (not every 3000 hops)
+    static unsigned long lastTouchTime = 0;
+    static bool lastTouchState = false;
+    
+    // Check touch every 50ms (responsive but not too frequent)
+    if (millis() - lastTouchTime > 50) {
       uint16_t touchX, touchY;
-      // Single fast check - no delay, no verification
-      if (tft.getTouch(&touchX, &touchY)) {
-        // ANY touch stops jammer
-        stopNRFJammer();
+      bool touchNow = tft.getTouch(&touchX, &touchY);
+      
+      // Detect touch PRESS (rising edge)
+      if (touchNow && !lastTouchState) {
+        Serial.println("\n[!] ===== STOP BUTTON PRESSED =====");
+        
+        // Immediate stop
+        nrfJammerActive = false;
+        nrfTurboMode = false;
+        
+        // Stop radios
+        if (nrf1Available) {
+          radio1.stopConstCarrier();
+          radio1.powerDown();
+          delay(50);
+          radio1.powerUp();
+        }
+        if (nrf2Available) {
+          radio2.stopConstCarrier();
+          radio2.powerDown();
+          delay(50);
+          radio2.powerUp();
+        }
+        
+        Serial.println("[✓] Radios stopped");
+        
+        // Print stats
+        unsigned long runtime = (millis() - lastNRFJamTime) / 1000;
+        if (runtime > 0) {
+          Serial.printf("[+] Runtime: %lu sec, Hops: %lu (%lu/sec)\n", 
+                        runtime, nrfJamPackets, nrfJamPackets/runtime);
+        }
+        
+        addToConsole("nRF24 stopped");
+        
+        // Navigate back
+        delay(200);
         currentState = NRF_JAM_MENU;
         hoveredIndex = -1;
+        tft.fillScreen(COLOR_BG);
+        delay(100);
         drawNRFJammerMenu();
-        return;
+        
+        Serial.println("[✓] Returned to menu");
+        return; // Exit loop immediately
       }
-      lastTouchCheck = nrfJamPackets;
+      
+      lastTouchState = touchNow;
+      lastTouchTime = millis();
     }
 
     if (deauthFloodActive && currentState == WIFI_BLE_NRF_JAM) {
@@ -4942,28 +5003,65 @@ void loop() {
         break;
         
       case NRF_WIFI_CLOWN:
-        // ⚡ RF-CLOWN V2: Block WiFi channels 1, 6, 11 at FULL POWER
-        // Radio 1: Primary WiFi channel with carrier
-        if (nrf1Available) {
-          radio1.setChannel(wifi_channels_nrf[wifi_jam_index]);
-          // ✅ CRITICAL: Ensure max power is maintained
-          radio1.setPALevel(RF24_PA_MAX);
-          SAFE_INCREMENT(nrf1Packets);
-        }
-        
-        // Radio 2: Secondary WiFi channel (offset) with carrier
-        if (nrf2Available && dualNRFMode) {
-          byte offset_index = (wifi_jam_index + 1) % 3;
-          radio2.setChannel(wifi_channels_nrf[offset_index]);
-          // ✅ CRITICAL: Ensure max power is maintained
-          radio2.setPALevel(RF24_PA_MAX);
-          SAFE_INCREMENT(nrf2Packets);
-        }
-        
-        // Slower channel rotation (every 5000 hops = ~50-100ms at 100K/sec)
-        // This gives each WiFi channel MORE jamming time
-        if ((nrfJamPackets % 5000) == 0) {
-          wifi_jam_index = (wifi_jam_index + 1) % 3;
+        // Check if time to change channels (20ms dwell per channel)
+        if (millis() - lastChannelChange >= DWELL_TIME_MS) {
+          lastChannelChange = millis();
+          
+          // Get current WiFi channel sweep array
+          const byte* current_sweep;
+          int sweep_length = 6;
+          
+          switch (wifi_jam_mode) {
+            case 0:  // WiFi Channel 1 (2412 MHz)
+              current_sweep = wifi_ch1_sweep;
+              break;
+            case 1:  // WiFi Channel 6 (2437 MHz)
+              current_sweep = wifi_ch6_sweep;
+              break;
+            case 2:  // WiFi Channel 11 (2462 MHz)
+              current_sweep = wifi_ch11_sweep;
+              break;
+            default:
+              wifi_jam_mode = 0;
+              current_sweep = wifi_ch1_sweep;
+          }
+          
+          // ===== RADIO 1: Primary sweep =====
+          if (nrf1Available) {
+            byte ch1 = current_sweep[sweep_index_radio1];
+            radio1.setChannel(ch1); // Change channel while carrier ON
+            radio1.setPALevel(RF24_PA_MAX);
+            SAFE_INCREMENT(nrf1Packets);
+            
+            sweep_index_radio1 = (sweep_index_radio1 + 1) % sweep_length;
+          }
+          
+          // ===== RADIO 2: Offset sweep (different channels simultaneously) =====
+          if (nrf2Available && dualNRFMode) {
+            byte ch2 = current_sweep[sweep_index_radio2];
+            radio2.setChannel(ch2); // Change channel while carrier ON
+            // ✅ CRITICAL: Ensure max power is maintained
+            radio2.setPALevel(RF24_PA_MAX);
+            SAFE_INCREMENT(nrf2Packets);
+            
+            sweep_index_radio2 = (sweep_index_radio2 + 1) % sweep_length;
+          }
+          
+          // Rotate WiFi channels every ~2 seconds (100 changes × 20ms)
+          // This means each WiFi channel gets ~2 seconds of jamming
+          if ((nrfJamPackets % 100) == 0 && nrfJamPackets > 0) {
+            wifi_jam_mode = (wifi_jam_mode + 1) % 3;
+            
+            // Reset sweep indices when changing WiFi channel
+            sweep_index_radio1 = 0;
+            sweep_index_radio2 = 3;
+            
+            const char* channel_name = (wifi_jam_mode == 0) ? "WiFi Ch1 (2412MHz)" :
+                                       (wifi_jam_mode == 1) ? "WiFi Ch6 (2437MHz)" :
+                                                               "WiFi Ch11 (2462MHz)";
+            
+            Serial.printf("[WiFi Clown] Now jamming: %s\n", channel_name);
+          }
         }
         break;
     }
@@ -4985,13 +5083,28 @@ void loop() {
       unsigned long runtime = (millis() - lastNRFJamTime) / 1000;
       if (runtime > 0) {
         unsigned long hopsPerSec = nrfJamPackets / runtime;
-        Serial.printf("[nRF24] %lu hops | %lu/sec | R1:%lu R2:%lu\n", 
-                      nrfJamPackets, hopsPerSec, packets1, packets2);
         
-        if (hopsPerSec > 50000) Serial.println("        ✓ EXCELLENT");
-        else if (hopsPerSec > 30000) Serial.println("        ✓ VERY GOOD");
-        else if (hopsPerSec > 15000) Serial.println("        ✓ GOOD");
-        else Serial.println("        ⚠ Check hardware");
+        // Mode-specific stats
+        if (nrfJamMode == NRF_WIFI_CLOWN) {
+          // WiFi Clown uses slower but more effective timing
+          Serial.printf("[WiFi Clown] %lu channel changes | %lu/sec | R1:%lu R2:%lu\n", 
+                        nrfJamPackets, hopsPerSec, packets1, packets2);
+          
+          if (hopsPerSec > 40) Serial.println("             ✅ EXCELLENT - Optimal disruption");
+          else if (hopsPerSec > 25) Serial.println("             ✅ VERY GOOD - Strong jamming");
+          else if (hopsPerSec > 15) Serial.println("             ✅ GOOD - Working well");
+          else Serial.println("             ⚠️  TOO SLOW - Check PA+LNA modules!");
+          
+        } else {
+          // Other modes use fast hopping
+          Serial.printf("[nRF24] %lu hops | %lu/sec | R1:%lu R2:%lu\n", 
+                        nrfJamPackets, hopsPerSec, packets1, packets2);
+          
+          if (hopsPerSec > 50000) Serial.println("        ✅ EXCELLENT");
+          else if (hopsPerSec > 30000) Serial.println("        ✅ VERY GOOD");
+          else if (hopsPerSec > 15000) Serial.println("        ✅ GOOD");
+          else Serial.println("        ⚠️  Check hardware");
+        }
       }
     }
     
@@ -7247,13 +7360,12 @@ void updateBLEJammerDisplay() {
 }
 
 // ==================== nRF24 Jammer Functions ====================
-
 void startNRFJammer() {
   if (nrfJammerActive) return;
   
-  Serial.println("\n╔═══════════════════════════════════════╗");
+  Serial.println("\n╔════════════════════════════════════════╗");
   Serial.println("║   nRF24 JAMMER - SMOOCHIEE METHOD    ║");
-  Serial.println("╚═══════════════════════════════════════╝");
+  Serial.println("╚════════════════════════════════════════╝");
   
   // ✅ CRITICAL: Stop ALL BLE operations first (SPI conflict!)
   if (bleJammerActive) {
@@ -7284,29 +7396,52 @@ void startNRFJammer() {
     delay(200);
   }
   
+  // ✅ ADD THIS: Reset radios if they were previously active
+  if (nrf1Available) {
+    radio1.stopConstCarrier();
+    radio1.powerDown();
+    delay(50);
+    radio1.powerUp();
+    delay(50);
+  }
+  if (nrf2Available) {
+    radio2.stopConstCarrier();
+    radio2.powerDown();
+    delay(50);
+    radio2.powerUp();
+    delay(50);
+  }
+  
   if (!nrf1Available && !nrf2Available) {
     showMessage("No nRF24 modules!", COLOR_WARNING);
     Serial.println("[✗] No nRF24 radios available!");
     return;
   }
   
-  // ⭐ SMOOCHIEE METHOD: Start/Restart constant carrier
   Serial.println("\n[*] Starting constant carrier transmission...");
   
   if (nrf1Available) {
     radio1.stopConstCarrier();  // Stop if already running
     delay(50);
-    radio1.startConstCarrier(RF24_PA_MAX, hopping_channel[0]);
+    radio1.setPALevel(RF24_PA_MAX); // Ensure MAX power
+    
+    // Set initial channel based on mode
+    byte initial_ch1 = (nrfJamMode == NRF_WIFI_CLOWN) ? wifi_ch1_sweep[0] : hopping_channel[0];
+    radio1.startConstCarrier(RF24_PA_MAX, initial_ch1);
     delay(50);
-    Serial.printf("    Radio 1: Carrier ON (Ch %d)\n", hopping_channel[0]);
+    Serial.printf("    Radio 1: Carrier ON (Ch %d)\n", initial_ch1);
   }
   
   if (nrf2Available) {
     radio2.stopConstCarrier();  // Stop if already running
     delay(50);
-    radio2.startConstCarrier(RF24_PA_MAX, hopping_channel[ptr_hop2]);
+    radio2.setPALevel(RF24_PA_MAX); // Ensure MAX power
+    
+    // Set initial channel based on mode
+    byte initial_ch2 = (nrfJamMode == NRF_WIFI_CLOWN) ? wifi_ch1_sweep[3] : hopping_channel[ptr_hop2];
+    radio2.startConstCarrier(RF24_PA_MAX, initial_ch2);
     delay(50);
-    Serial.printf("    Radio 2: Carrier ON (Ch %d)\n", hopping_channel[ptr_hop2]);
+    Serial.printf("    Radio 2: Carrier ON (Ch %d)\n", initial_ch2);
   }
   
   // Reset counters
@@ -7317,39 +7452,70 @@ void startNRFJammer() {
   nrf2Packets = 0;
   lastNRFJamTime = millis();
   nrfLastStats = 0;
+  lastChannelChange = millis();
   
   // Reset sweep pattern to start position
   flag_radio1 = 0;
   flag_radio2 = 0;
   nrf_ch1 = 2;
   nrf_ch2 = 45;
+  sweep_index_radio1 = 0;
+  sweep_index_radio2 = 3;
+  wifi_jam_mode = 0;
   
   currentState = NRF_JAM_ACTIVE;
   
+  // Show mode-specific info
   Serial.println("\n╔═══════════════════════════════════════╗");
-  Serial.println("║         JAMMING STARTED!             ║");
+  Serial.println("║         JAMMING STARTED!              ║");
   Serial.println("╚═══════════════════════════════════════╝");
   Serial.printf("Mode: %s\n", dualNRFMode ? "DUAL (2 radios)" : "SINGLE");
   
   // Show jamming mode
   const char* modeName = "";
   switch (nrfJamMode) {
-    case NRF_SWEEP:   modeName = "SWEEP (Smoochiee)"; break;
-    case NRF_RANDOM:  modeName = "RANDOM"; break;
-    case NRF_FOCUSED: modeName = "FOCUSED (BLE)"; break;
-    case NRF_WIFI_CLOWN: modeName = "WIFI CLOWN (Ch 1,6,11 @ MAX PWR)"; break;
+    case NRF_SWEEP:   
+      modeName = "SWEEP (Smoochiee)"; 
+      Serial.println("Pattern: SWEEP (Smoochiee)");
+      Serial.println("⚡ METHOD: Constant Carrier + Channel Hop");
+      Serial.println("⚡ Expected: 50K-150K hops/sec");
+      break;
+    case NRF_RANDOM:  
+      modeName = "RANDOM"; 
+      Serial.println("Pattern: RANDOM");
+      Serial.println("⚡ METHOD: Chaotic hopping");
+      Serial.println("⚡ Expected: 30K-100K hops/sec");
+      break;
+    case NRF_FOCUSED: 
+      modeName = "FOCUSED (BLE)"; 
+      Serial.println("Pattern: FOCUSED (BLE advertising)");
+      Serial.println("⚡ METHOD: BLE channel jamming");
+      Serial.println("⚡ Expected: 20K-80K hops/sec");
+      break;
+    case NRF_WIFI_CLOWN: 
+      modeName = "WIFI CLOWN V2"; 
+      Serial.println("Pattern: WIFI CLOWN V2 (Ch 1,6,11 @ MAX PWR)");
+      Serial.println("⚡ METHOD: Multi-channel sweep + Constant Carrier");
+      Serial.println("⚡ Dwell: 20ms per channel (optimal)");
+      Serial.println("⚡ Expected: WiFi networks DISAPPEAR");
+      Serial.println("");
+      Serial.println("🔥 WIFI CLOWN V2 REQUIREMENTS:");
+      Serial.println("   - PA+LNA modules (NOT basic nRF24!)");
+      Serial.println("   - 100µF capacitors on EACH module");
+      Serial.println("   - Heatsinks (gets HOT at max power)");
+      Serial.println("   - External 8dBi antennas (recommended)");
+      Serial.println("   - Test at 1-5 meters first");
+      break;
   }
-  Serial.printf("Pattern: %s\n", modeName);
   
-  Serial.println("\n⚡ METHOD: Constant Carrier + Channel Hop");
-  Serial.println("⚡ Expected: 50K-150K hops/sec");
-  Serial.println("⚡ TFT FROZEN - Stats to serial!");
+  Serial.println("\n⚡ TFT FROZEN - Stats to serial!");
   Serial.println("💡 TO STOP: Tap screen or type 'nrfjam'");
-  Serial.println("───────────────────────────────────────────\n");
+  Serial.println("══════════════════════════════════════════\n");
   
   displayNRFJammerActive();
-  addToConsole("nRF24: SMOOCHIEE MODE");
+  addToConsole("nRF24: " + String(modeName));
 }
+
 
 void stopNRFJammer() {
   if (!nrfJammerActive) return;
@@ -7358,17 +7524,26 @@ void stopNRFJammer() {
   nrfTurboMode = false;
   Serial.println("\n[*] Stopping nRF24 jammer...");
   
-  // ✅ Stop constant carrier properly
+  // ✅ CRITICAL: Stop constant carrier AND reset radios properly
   if (nrf1Available) {
     radio1.stopConstCarrier();
-    Serial.println("    Radio 1: Carrier stopped");
-  }
-  if (nrf2Available) {
-    radio2.stopConstCarrier();
-    Serial.println("    Radio 2: Carrier stopped");
+    delay(50);
+    radio1.powerDown(); // Ensure clean shutdown
+    delay(50);
+    radio1.powerUp();   // Reset to normal state
+    Serial.println("    Radio 1: Stopped and reset");
   }
   
-  delay(100);  // Let radios settle
+  if (nrf2Available) {
+    radio2.stopConstCarrier();
+    delay(50);
+    radio2.powerDown(); // Ensure clean shutdown
+    delay(50);
+    radio2.powerUp();   // Reset to normal state
+    Serial.println("    Radio 2: Stopped and reset");
+  }
+  
+  delay(200);  // Let radios fully settle
   
   // Print final statistics
   unsigned long runtime = (millis() - lastNRFJamTime) / 1000;
@@ -7376,9 +7551,9 @@ void stopNRFJammer() {
   
   unsigned long hopsPerSec = nrfJamPackets / runtime;
   
-  Serial.println("\n╔═══════════════════════════════════════╗");
+  Serial.println("\n╔════════════════════════════════════════╗");
   Serial.println("║   JAMMING STOPPED - FINAL STATS      ║");
-  Serial.println("╚═══════════════════════════════════════╝");
+  Serial.println("╚════════════════════════════════════════╝");
   Serial.printf("Total runtime: %lu seconds\n", runtime);
   Serial.printf("Total hops: %lu\n", nrfJamPackets);
   Serial.printf("Average rate: %lu hops/sec\n", hopsPerSec);
@@ -7414,14 +7589,19 @@ void stopNRFJammer() {
     Serial.println("   4. Good quality USB cable/charger?");
     Serial.println("   5. Wiring matches pin definitions?");
   }
-  Serial.println("═════════════════════════════════════════════\n");
+  Serial.println("═══════════════════════════════════════════\n");
   Serial.println("\n💡 TIP: Tap screen or type 'nrfjam' to stop next time!\n");
   
   addToConsole("nRF24 stopped");
   
+  // ✅ CRITICAL: Force full redraw with delay
+  delay(300);
+  
   // Redraw menu
   if (currentState == NRF_JAM_ACTIVE) {
     currentState = NRF_JAM_MENU;
+    tft.fillScreen(COLOR_BG); // Clear screen first
+    delay(100);
     drawNRFJammerMenu();
   }
 }
@@ -7449,89 +7629,91 @@ void displayNRFJammerActive() {
   tft.setTextColor(COLOR_CYAN);
   tft.setCursor(SIDE_MARGIN, y);
   
-  // Show current mode
+  // Show current mode with details (COMPACT)
   switch (nrfJamMode) {
     case NRF_SWEEP:
       tft.println("SWEEP MODE");
       y += 12;
       tft.setCursor(SIDE_MARGIN, y);
       tft.setTextColor(COLOR_TEXT);
-      tft.println("(Smoochiee pattern)");
+      tft.println("(Smoochiee)");
       break;
     case NRF_RANDOM:
       tft.println("RANDOM MODE");
       y += 12;
       tft.setCursor(SIDE_MARGIN, y);
       tft.setTextColor(COLOR_TEXT);
-      tft.println("(Chaotic hopping)");
+      tft.println("(Chaotic)");
       break;
     case NRF_FOCUSED:
       tft.println("FOCUSED MODE");
       y += 12;
       tft.setCursor(SIDE_MARGIN, y);
       tft.setTextColor(COLOR_TEXT);
-      tft.println("(BLE channels)");
+      tft.println("(BLE only)");
       break;
     case NRF_WIFI_CLOWN:
-      tft.println("WIFI CLOWN MODE");
+      tft.println("WIFI CLOWN V2");
+      y += 12;
+      tft.setCursor(SIDE_MARGIN, y);
+      tft.setTextColor(COLOR_PURPLE);
+      const char* wifi_ch_name = (wifi_jam_mode == 0) ? "Ch1" :
+                                 (wifi_jam_mode == 1) ? "Ch6" : "Ch11";
+      tft.printf("WiFi %s", wifi_ch_name);
       y += 12;
       tft.setCursor(SIDE_MARGIN, y);
       tft.setTextColor(COLOR_TEXT);
-      tft.println("(WiFi blackout ⚡)");
-      y += 12;
-      tft.setCursor(SIDE_MARGIN, y);
-      tft.setTextColor(COLOR_CYAN);
-      tft.printf("Jamming Ch %d", wifi_channels_nrf[wifi_jam_index]);
+      tft.println("(Multi-sweep)");
       break;
   }
   
-  y += 30;
+  y += 25;
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT);
   tft.setCursor(SIDE_MARGIN, y);
   tft.println("Display frozen for");
   
-  y += 15;
+  y += 12;
   tft.setCursor(SIDE_MARGIN, y);
-  tft.println("MAXIMUM PERFORMANCE");
+  tft.println("MAX PERFORMANCE");
   
-  y += 30;
+  y += 20;
   tft.setTextColor(COLOR_CYAN);
   tft.setCursor(SIDE_MARGIN, y);
-  tft.println("Check serial monitor");
+  tft.println("Check serial for");
   
-  y += 15;
+  y += 12;
   tft.setCursor(SIDE_MARGIN, y);
-  tft.println("for live statistics");
+  tft.println("live statistics");
   
-  y += 30;
+  y += 20;
   tft.setTextColor(COLOR_DARK_GREEN);
   tft.setCursor(SIDE_MARGIN, y);
   tft.print("Mode: ");
   tft.setTextColor(dualNRFMode ? COLOR_GREEN : COLOR_CYAN);
   tft.println(dualNRFMode ? "DUAL" : "SINGLE");
   
-  y += 15;
+  y += 12;
   tft.setTextColor(COLOR_DARK_GREEN);
   tft.setCursor(SIDE_MARGIN, y);
   tft.print("Radio 1: ");
   tft.setTextColor(nrf1Available ? COLOR_GREEN : COLOR_RED);
   tft.println(nrf1Available ? "OK" : "OFF");
   
-  y += 15;
+  y += 12;
   tft.setTextColor(COLOR_DARK_GREEN);
   tft.setCursor(SIDE_MARGIN, y);
   tft.print("Radio 2: ");
   tft.setTextColor(nrf2Available ? COLOR_GREEN : COLOR_RED);
   tft.println(nrf2Available ? "OK" : "OFF");
   
-  // Instructions
-  int backY = 285;
-  tft.drawFastHLine(0, backY, 240, COLOR_DARK_GREEN);
+  // Back button - CONSISTENT WITH OTHER SCREENS (y=305)
+  int backY = 305;
+  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
   tft.setTextColor(COLOR_RED);
   tft.setTextSize(1);
-  tft.setCursor(50, backY + 8);
-  tft.print("Tap to stop jamming");
+  tft.setCursor(75, backY + 3);
+  tft.print("[TAP] Stop");
 }
 
 void drawBLEJammerActive() {
