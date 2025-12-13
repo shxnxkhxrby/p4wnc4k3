@@ -325,6 +325,50 @@ int deauthEventCount = 0;
 int deauthScrollOffset = 0;
 #define MAX_DEAUTH_DISPLAY 8
 
+// ==================== RF CAPTURE STRUCTURES ====================
+struct RFSignal {
+  uint8_t channel;
+  uint8_t data[32];
+  uint8_t dataLen;
+  int8_t rssi;
+  unsigned long timestamp;
+  uint32_t frequency;
+  String description;
+};
+
+RFSignal capturedSignals[50];
+int capturedSignalCount = 0;
+int rfCaptureScrollOffset = 0;
+bool rfCaptureActive = false;
+
+// Forward declaration for RF functions
+String generatePacketName(RFSignal* signal);
+
+// Forward declaration for RF functions
+String generatePacketName(RFSignal* signal);
+
+
+// ==================== RF MENU STATE VARIABLES ====================
+enum RFType {
+  RF_NONE,
+  RF_NRF24,
+  RF_SUBGHZ
+};
+
+RFType selectedRFType = RF_NONE;
+
+// RF Monitor animation variables
+float wavePhase = 0.0;
+unsigned long lastWaveUpdate = 0;
+
+// RF Monitor animation variables
+
+uint8_t channelActivity[126];  // Track activity on each channel
+unsigned long lastChannelScan = 0;
+
+// RF Replay
+int selectedSignalIndex = -1;
+
 // ==================== MENU STATES ====================
 enum MenuState {
   BOOT_ANIMATION,
@@ -341,6 +385,13 @@ enum MenuState {
   BLE_SCAN_RESULTS,
   BLE_JAM_MENU,
   BLE_JAM_ACTIVE,
+  // ⬇️ ADD THESE 5 LINES HERE
+  RF_MENU,
+  RF_TYPE_MENU,
+  RF_MONITOR,
+  RF_CAPTURE,
+  RF_REPLAY,
+  // ⬆️ END OF NEW LINES
   NRF_JAM_MENU,
   NRF_JAM_ACTIVE,
   WIFI_BLE_NRF_JAM,
@@ -2399,13 +2450,14 @@ void drawMainMenu() {
   const char* menuItems[] = {
     "WiFi Tools",
     "Bluetooth Tools",
-    "Packet Sniffer",
+    "Radio Frequency Tools",
     "Defensive Tools",
+    "Sniffer Tools",
     "Settings"
   };
   
   int y = HEADER_HEIGHT + 10;
-  for (int i = 0; i < 5; i++) {
+  for (int i = 0; i < 6; i++) {
     drawMenuItem(menuItems[i], i, y, hoveredIndex == i, false);
     y += MENU_ITEM_HEIGHT + MENU_SPACING;
   }
@@ -3199,25 +3251,24 @@ void drawBLEMenu() {
   drawTerminalHeader("bluetooth tools");
   
   const char* menuItems[] = {
-    "nRF24 Jammer",      // Real disconnection attack
-    "Apple/Android Spam", // BLE spam attacks
-    "Scan BLE",          // Keep for info only
-    "AirTag Scan",       // Keep for detection
-    "Skimmer Detect"     // Keep for detection
+    "Scan Bluetooth",
+    "Spammer",
+    "Jammer"
   };
   
   int y = HEADER_HEIGHT + 10;
-  for (int i = 0; i < 5; i++) {
+  for (int i = 0; i < 3; i++) {
     drawMenuItem(menuItems[i], i, y, hoveredIndex == i, false);
     y += MENU_ITEM_HEIGHT + MENU_SPACING;
   }
   
   // Warning message
+  y += 10;
   tft.setTextSize(1);
   tft.setTextColor(COLOR_DARK_GREEN);
-  tft.setCursor(SIDE_MARGIN, y + 10);
+  tft.setCursor(SIDE_MARGIN, y);
   tft.println("nRF24 = Real disconnect");
-  tft.setCursor(SIDE_MARGIN, y + 22);
+  tft.setCursor(SIDE_MARGIN, y + 12);
   tft.println("Spam = Popups only");
   
   // Back button
@@ -3290,11 +3341,12 @@ void drawMoreToolsMenu() {
     "Deauth Sniffer",
     "Skimmer Detect",
     "Rogue AP Detector",
-    "Wardriving"
+    "Wardriving",
+    "Airtag Sniffer"
   };
   
   int y = HEADER_HEIGHT + 10;
-  for (int i = 0; i < 4; i++) {  // Changed from 5 to 4
+  for (int i = 0; i < 5; i++) {  // Changed from 5 to 4
     drawMenuItem(menuItems[i], i, y, hoveredIndex == i, false);
     y += MENU_ITEM_HEIGHT + MENU_SPACING;
   }
@@ -3689,6 +3741,26 @@ void handleTouch() {
         handleMainMenuTouch(touchX, touchY);
         break;
         
+      case RF_MENU:
+        handleRFMenuTouch(touchX, touchY);
+        break;
+        
+      case RF_TYPE_MENU:
+        handleRFTypeMenuTouch(touchX, touchY);
+        break;
+        
+      case RF_MONITOR:
+        handleRFMonitorTouch(touchX, touchY);
+        break;
+        
+      case RF_CAPTURE:
+        handleRFCaptureTouch(touchX, touchY);
+        break;
+        
+      case RF_REPLAY:
+        handleRFReplayTouch(touchX, touchY);
+        break;
+        
       case WIFI_MENU:
         handleWiFiMenuTouch(touchX, touchY);
         break;
@@ -3846,10 +3918,21 @@ void handleTouch() {
             pBLEScan->stop();
             BLEDevice::deinit(false);
           }
-          currentState = BLE_MENU;  // Change state BEFORE drawing
+          currentState = MORE_TOOLS_MENU;
           hoveredIndex = -1;
-          delay(100);  // Ensure scan stops
-          drawBLEMenu();
+          delay(100);
+          drawMoreToolsMenu();
+        } else if (touchY >= HEADER_HEIGHT + 40 && touchY < 280 && airTagCount > 0) {
+          // Scroll through results
+          const int MAX_AIRTAG_DISPLAY = 9;
+          int totalPages = (airTagCount + MAX_AIRTAG_DISPLAY - 1) / MAX_AIRTAG_DISPLAY;
+          
+          if (totalPages > 1) {
+            int currentPage = airtagScrollOffset / MAX_AIRTAG_DISPLAY;
+            currentPage = (currentPage + 1) % totalPages;
+            airtagScrollOffset = currentPage * MAX_AIRTAG_DISPLAY;
+            displayAirTagResults();
+          }
         }
         break;
         
@@ -4124,7 +4207,7 @@ int getTouchedButtonIndex(int touchY, int startY) {
 void handleMainMenuTouch(int x, int y) {
   int startY = HEADER_HEIGHT + 10;
   
-  if (y >= startY && y < startY + (5 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {  // Changed from 4 to 5
+  if (y >= startY && y < startY + (6 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {
     int relativeY = y - startY;
     int buttonIndex = relativeY / (MENU_ITEM_HEIGHT + MENU_SPACING);
     
@@ -4136,22 +4219,27 @@ void handleMainMenuTouch(int x, int y) {
           hoveredIndex = -1;
           drawWiFiMenu();
           break;
-        case 1: // Bluetooth
+        case 1: // Bluetooth Tools
           currentState = BLE_MENU;
           hoveredIndex = -1;
           drawBLEMenu();
           break;
-        case 2: // Packet Sniffer
-          snifferScrollOffset = 0;
-          packetHistoryIndex = 0;
-          startSniffer();
+        case 2: // Radio Frequency Tools
+          currentState = RF_MENU;
+          hoveredIndex = -1;
+          drawRFMenu();
           break;
         case 3: // Defensive Tools
           currentState = MORE_TOOLS_MENU;
           hoveredIndex = -1;
           drawMoreToolsMenu();
           break;
-        case 4: // Settings (NEW)
+        case 4: // Sniffer Tools
+          snifferScrollOffset = 0;
+          packetHistoryIndex = 0;
+          startSniffer();
+          break;
+        case 5: // Settings
           currentState = SETTINGS_MENU;
           hoveredIndex = -1;
           drawSettingsMenu();
@@ -4383,31 +4471,25 @@ void handleBLEMenuTouch(int x, int y) {
   
   int startY = HEADER_HEIGHT + 10;
   
-  if (y >= startY && y < startY + (5 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {
+  if (y >= startY && y < startY + (3 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {
     int relativeY = y - startY;
     int buttonIndex = relativeY / (MENU_ITEM_HEIGHT + MENU_SPACING);
     
     int buttonY = startY + (buttonIndex * (MENU_ITEM_HEIGHT + MENU_SPACING));
     if (y >= buttonY && y <= buttonY + MENU_ITEM_HEIGHT) {
       switch (buttonIndex) {
-        case 0:  // nRF24 Jammer - Real disconnect
-          currentState = NRF_JAM_MENU;
-          hoveredIndex = -1;
-          drawNRFJammerMenu();
+        case 0:  // BT Scan
+          scanBLEDevices();
           break;
-        case 1:  // Apple/Android Spam
+        case 1:  // BLE Beacon Spam
           currentState = SPAM_MENU;
           hoveredIndex = -1;
           drawSpamMenu();
           break;
-        case 2:  // Scan BLE
-          scanBLEDevices();
-          break;
-        case 3:  // AirTag Scan
-          startAirTagScanner();
-          break;
-        case 4:  // Skimmer Detect
-          startSkimmerDetector();
+        case 2:  // nRF24 Jammer
+          currentState = NRF_JAM_MENU;
+          hoveredIndex = -1;
+          drawNRFJammerMenu();
           break;
       }
     }
@@ -4570,7 +4652,7 @@ void handleMoreToolsTouch(int x, int y) {
   
   int startY = HEADER_HEIGHT + 10;
   
-  if (y >= startY && y < startY + (4 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {  // Changed from 5 to 4
+  if (y >= startY && y < startY + (5 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {  // Changed from 5 to 4
     int relativeY = y - startY;
     int buttonIndex = relativeY / (MENU_ITEM_HEIGHT + MENU_SPACING);
     
@@ -4588,6 +4670,9 @@ void handleMoreToolsTouch(int x, int y) {
           break;
         case 3:  // Wardriving
           startWardriving();
+          break;
+        case 4:  // Skimmer Detect
+          startAirTagScanner();
           break;
       }
     }
@@ -4743,6 +4828,16 @@ void loop() {
       }
     }
 
+  if (currentState == RF_CAPTURE && rfCaptureActive) {
+    performRFCapture();
+    
+    static unsigned long lastCaptureUpdate = 0;
+    if (millis() - lastCaptureUpdate > 500) {
+      drawRFCapture();
+      lastCaptureUpdate = millis();
+    }
+  }
+
     if (deauthSnifferActive && currentState == DEAUTH_SNIFFER_ACTIVE) {
     static unsigned long lastChannelHop = 0;
     static unsigned long lastSnifferUpdate = 0;
@@ -4849,6 +4944,15 @@ void loop() {
   
   // ==================== NORMAL MODE: Full UI + Features ====================
   checkHeapHealth();
+  // RF MONITOR ANIMATION
+  if (currentState == RF_MONITOR && selectedRFType == RF_NRF24) {
+  static unsigned long lastRFUpdate = 0;
+  
+  if (millis() - lastRFUpdate > 33) {
+    drawRFMonitor();  // ✅ KEEP THIS
+    lastRFUpdate = millis();
+  }
+}
   
   // Real-time attack updates
   if (currentState == WIFI_ATTACK_MENU) {
@@ -7828,6 +7932,7 @@ void performAndroidSpam() {
 void startAirTagScanner() {
   currentState = AIRTAG_SCANNER;
   airTagCount = 0;
+  airtagScrollOffset = 0;
   
   addToConsole("AirTag scan started");
   
@@ -8345,6 +8450,1112 @@ void processRogueAPScan() {
     }
   }
 }
+
+// ==================== DRAW RF MENU ====================
+void drawRFMenu() {
+  tft.fillScreen(COLOR_BG);
+  drawTerminalHeader("rf tools");
+  
+  const char* menuItems[] = {
+    "NRF24L01",
+    "SubGHz (433/868/915)"
+  };
+  
+  int y = HEADER_HEIGHT + 10;
+  for (int i = 0; i < 2; i++) {
+    drawMenuItem(menuItems[i], i, y, hoveredIndex == i, false);
+    y += MENU_ITEM_HEIGHT + MENU_SPACING;
+  }
+  
+  // Info
+  y += 20;
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.println("Select RF module type");
+  
+  // Back button
+  int backY = 305;
+  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
+  tft.setTextColor(COLOR_RED);
+  tft.setCursor(85, backY + 3);
+  tft.print("[ESC] Back");
+}
+
+// ==================== DRAW RF TYPE MENU ====================
+void drawRFTypeMenu() {
+  tft.fillScreen(COLOR_BG);
+  
+  String title = "rf - ";
+  if (selectedRFType == RF_NRF24) title += "nrf24";
+  else if (selectedRFType == RF_SUBGHZ) title += "subghz";
+  
+  drawTerminalHeader(title.c_str());
+  
+  const char* menuItems[] = {
+    "RF Monitor",
+    "RF Capture",
+    "RF Replay"
+  };
+  
+  int y = HEADER_HEIGHT + 10;
+  for (int i = 0; i < 3; i++) {
+    drawMenuItem(menuItems[i], i, y, hoveredIndex == i, false);
+    y += MENU_ITEM_HEIGHT + MENU_SPACING;
+  }
+  
+  // Status
+  y += 20;
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.print("Module: ");
+  tft.setTextColor(COLOR_CYAN);
+  
+  if (selectedRFType == RF_NRF24) {
+    tft.println("NRF24L01 (2.4GHz)");
+    y += 15;
+    tft.setTextColor(COLOR_TEXT);
+    tft.setCursor(SIDE_MARGIN, y);
+    tft.println("Status: Ready");
+  } else if (selectedRFType == RF_SUBGHZ) {
+    tft.println("SubGHz (Under Dev)");
+    y += 15;
+    tft.setTextColor(COLOR_ORANGE);
+    tft.setCursor(SIDE_MARGIN, y);
+    tft.println("Status: Development");
+  }
+  
+  // Back button
+  int backY = 305;
+  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
+  tft.setTextColor(COLOR_RED);
+  tft.setCursor(85, backY + 3);
+  tft.print("[ESC] Back");
+}
+
+// ==================== RF MONITOR WITH WAVE ANIMATION ====================
+void drawRFMonitor() {
+  // Only handle animation updates - static UI drawn by drawRFMonitorFresh()
+  
+  // Update live indicator
+  static bool blink = false;
+  static unsigned long lastBlink = 0;
+  if (millis() - lastBlink > 500) {
+    blink = !blink;
+    tft.fillCircle(220, 12, 3, blink ? COLOR_GREEN : COLOR_DARK_GREEN);
+    lastBlink = millis();
+  }
+  
+  // Animate waves ONLY for NRF24
+  if (selectedRFType == RF_NRF24) {
+    int waveStartY = HEADER_HEIGHT + 20 + 5;
+    int waveHeight = 120;
+    drawRFWavesAnimatedOptimized(waveStartY, waveHeight);
+  }
+}
+
+void resetRFMonitorInit() {
+  // Forces full redraw on next entry
+}
+
+void drawRFWavesAnimatedOptimized(int startY, int waveHeight) {
+  int centerY = startY + waveHeight / 2;
+  
+  // Update wave phase for scrolling effect
+  wavePhase += 0.2;
+  if (wavePhase > TWO_PI) wavePhase -= TWO_PI;
+  
+  // Clear ONLY the wave drawing area (avoid grid and labels)
+  // Leave 10px margin top/bottom to preserve grid
+  tft.fillRect(0, startY + 10, 240, waveHeight - 20, COLOR_BG);
+  
+  // Draw 2 optimized waves
+  
+  // Wave 1: Main carrier (bright green)
+  drawSingleWaveOptimized(centerY, 0.12, waveHeight * 0.28, wavePhase, COLOR_GREEN);
+  
+  // Wave 2: Modulation (cyan, phase offset)
+  drawSingleWaveOptimized(centerY, 0.07, waveHeight * 0.18, wavePhase + 1.5, COLOR_CYAN);
+  
+  // Random noise spikes (10% chance)
+  if (random(0, 100) < 10) {
+    int spikeX = random(20, 220);
+    int spikeHeight = random(5, 12);
+    tft.drawFastVLine(spikeX, centerY - spikeHeight, spikeHeight * 2, COLOR_YELLOW);
+  }
+  
+  // Frequency labels overlay (with background to prevent flicker)
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_GREEN, COLOR_BG);
+  tft.setCursor(SIDE_MARGIN, startY + 5);
+  tft.print("2.4GHz");
+  
+  tft.setTextColor(COLOR_YELLOW, COLOR_BG);
+  tft.setCursor(200, startY + 5);
+  tft.print("LIVE");
+}
+
+void drawSingleWaveOptimized(int centerY, float freq, float amplitude, float phase, uint16_t color) {
+  int prevY = centerY;
+  
+  // Draw every 2 pixels for performance
+  for (int x = 0; x < 240; x += 2) {
+    float angle = (x * freq) + phase;
+    int y = centerY + (sin(angle) * amplitude);
+    
+    // Only draw if reasonable distance from previous point
+    if (x > 0 && abs(y - prevY) < 15) {
+      tft.drawLine(x - 2, prevY, x, y, color);
+    }
+    prevY = y;
+  }
+}
+
+// Helper function for drawing a single wave (optimized)
+void drawSingleWave(int startY, int waveHeight, int centerY, float freq, float ampMultiplier, float phase, uint16_t color) {
+  int prevY = centerY;
+  float amplitude = waveHeight * ampMultiplier;
+  
+  // Draw every 2 pixels instead of every pixel (50% less drawing)
+  for (int x = 0; x < 240; x += 2) {
+    float angle = (x * freq) + phase;
+    int y = centerY + (sin(angle) * amplitude);
+    
+    if (x > 0 && abs(y - prevY) < 15) {
+      tft.drawLine(x - 2, prevY, x, y, color);
+    }
+    prevY = y;
+  }
+}
+
+// ==================== DRAW RF WAVES (ESP32-DIV STYLE) ====================
+void drawRFWavesAnimated(int startY, int waveHeight) {
+  int centerY = startY + waveHeight / 2;
+  
+  // Update wave phase for smooth scrolling
+  wavePhase += 0.2;  // Speed of wave movement
+  if (wavePhase > TWO_PI) wavePhase -= TWO_PI;
+  
+  // Clear wave area
+  tft.fillRect(0, startY, 240, waveHeight, COLOR_BG);
+  
+  // Draw grid lines (like oscilloscope) - STATIC
+  for (int i = 1; i < 4; i++) {
+    int gridY = startY + (i * waveHeight / 4);
+    for (int x = 0; x < 240; x += 5) {
+      tft.drawPixel(x, gridY, COLOR_DARK_GREEN);
+    }
+  }
+  
+  // Center line (brighter) - STATIC
+  for (int x = 0; x < 240; x += 3) {
+    tft.drawPixel(x, centerY, 0x2945);  // Slightly brighter green
+  }
+  
+  // Draw multiple sine waves with different frequencies (ANIMATED)
+  // Wave 1: Fast carrier signal (like ESP32-DIV)
+  uint16_t wave1Color = COLOR_GREEN;
+  float wave1Freq = 0.15;
+  float wave1Amp = waveHeight * 0.3;
+  
+  int prevY1 = centerY;
+  for (int x = 0; x < 240; x++) {
+    float angle = (x * wave1Freq) + wavePhase;
+    int y = centerY + (sin(angle) * wave1Amp);
+    
+    if (x > 0 && abs(y - prevY1) < 10) {
+      tft.drawLine(x - 1, prevY1, x, y, wave1Color);
+    }
+    prevY1 = y;
+  }
+  
+  // Wave 2: Medium modulation (slightly offset phase)
+  uint16_t wave2Color = COLOR_CYAN;
+  float wave2Freq = 0.08;
+  float wave2Amp = waveHeight * 0.2;
+  float wave2Phase = wavePhase + 1.5;
+  
+  int prevY2 = centerY;
+  for (int x = 0; x < 240; x++) {
+    float angle = (x * wave2Freq) + wave2Phase;
+    int y = centerY + (sin(angle) * wave2Amp);
+    
+    if (x > 0 && abs(y - prevY2) < 10) {
+      tft.drawLine(x - 1, prevY2, x, y, wave2Color);
+    }
+    prevY2 = y;
+  }
+  
+  // Wave 3: Slow envelope (background)
+  uint16_t wave3Color = tft.color565(0, 200, 100);  // Lighter green
+  float wave3Freq = 0.04;
+  float wave3Amp = waveHeight * 0.15;
+  float wave3Phase = wavePhase + 0.5;
+  
+  int prevY3 = centerY;
+  for (int x = 0; x < 240; x++) {
+    float angle = (x * wave3Freq) + wave3Phase;
+    int y = centerY + (sin(angle) * wave3Amp);
+    
+    if (x > 0 && abs(y - prevY3) < 10) {
+      tft.drawLine(x - 1, prevY3, x, y, wave3Color);
+    }
+    prevY3 = y;
+  }
+  
+  // Add random "noise" spikes (simulating real RF activity)
+  if (random(0, 100) < 20) {  // 20% chance each frame
+    int spikeX = random(0, 240);
+    int spikeHeight = random(5, 15);
+    uint16_t spikeColor = random(0, 2) == 0 ? COLOR_YELLOW : COLOR_ORANGE;
+    tft.drawFastVLine(spikeX, centerY - spikeHeight, spikeHeight * 2, spikeColor);
+  }
+  
+  // Frequency label overlay (STATIC)
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_GREEN);
+  tft.setCursor(SIDE_MARGIN, startY + 5);
+  tft.print("2.4 GHz");
+  
+  tft.setTextColor(COLOR_CYAN);
+  tft.setCursor(200, startY + 5);
+  tft.print("LIVE");
+  
+  // Signal strength indicator (dynamic)
+  static int signalStrength = 0;
+  signalStrength = (signalStrength + random(-10, 15)) % 100;
+  if (signalStrength < 0) signalStrength = 0;
+  
+  tft.setTextColor(COLOR_YELLOW);
+  tft.setCursor(SIDE_MARGIN, startY + waveHeight - 15);
+  tft.printf("PWR:%d%%", signalStrength);
+}
+
+// ==================== RF CAPTURE (LIKE WIFI SCAN - LIST VIEW) ====================
+void startRFCapture() {
+  if (selectedRFType == RF_SUBGHZ) {
+    // SubGHz not implemented
+    return;
+  }
+  
+  rfCaptureActive = true;
+  rfCaptureScrollOffset = 0;
+  
+  // Initialize nRF24 for scanning
+  if (nrf1Available) {
+    radio1.stopListening();
+    radio1.startListening();
+  }
+  
+  addToConsole("RF capture started");
+  Serial.println("[+] RF Capture started - scanning 2.4GHz");
+  
+  drawRFCapture();
+}
+
+void stopRFCapture() {
+  rfCaptureActive = false;
+  
+  if (nrf1Available) {
+    radio1.stopListening();
+  }
+  
+  Serial.printf("[+] RF Capture stopped - %d signals captured\n", capturedSignalCount);
+  addToConsole("RF capture stopped");
+}
+
+void performRFCapture() {
+  if (!rfCaptureActive || !nrf1Available) return;
+  
+  static uint8_t scanChannel = 0;
+  static unsigned long lastScan = 0;
+  static unsigned long captureStartTime = millis();
+  
+  // Fast channel scan - 5ms per channel (like MouseJack sniffer)
+  if (millis() - lastScan > 5) {
+    
+    // Set channel and check for packets
+    radio1.setChannel(scanChannel);
+    radio1.startListening();
+    delay(1);  // Small delay to settle
+    
+    // Check if data available
+    if (radio1.available()) {
+      if (capturedSignalCount < 50) {
+        RFSignal* signal = &capturedSignals[capturedSignalCount];
+        
+        // Capture packet data
+        signal->channel = scanChannel;
+        signal->dataLen = radio1.getPayloadSize();
+        if (signal->dataLen > 32) signal->dataLen = 32;
+        
+        // Read actual data
+        radio1.read(signal->data, signal->dataLen);
+        
+        signal->timestamp = millis();
+        signal->frequency = 2400 + scanChannel;
+        
+        // Calculate RSSI (nRF24 doesn't have true RSSI, simulate based on channel activity)
+        signal->rssi = -40 - random(0, 50);
+        
+        // Generate descriptive name based on channel and data pattern
+        signal->description = generatePacketName(signal);
+        
+        capturedSignalCount++;
+        
+        Serial.printf("[+] Captured Ch%d (%dMHz) %dB: ", 
+                      scanChannel, signal->frequency, signal->dataLen);
+        
+        // Print first 8 bytes as hex
+        for (int i = 0; i < min(8, (int)signal->dataLen); i++) {
+          Serial.printf("%02X ", signal->data[i]);
+        }
+        Serial.println();
+      }
+    }
+    
+    // Update channel activity for visualization
+    if (radio1.testCarrier()) {
+      channelActivity[scanChannel] = min(255, channelActivity[scanChannel] + 40);
+    } else {
+      channelActivity[scanChannel] = max(0, channelActivity[scanChannel] - 15);
+    }
+    
+    radio1.stopListening();
+    
+    // Next channel (full spectrum scan)
+    scanChannel = (scanChannel + 1) % 126;
+    lastScan = millis();
+    
+    // Print status every 5 seconds
+    if (millis() - captureStartTime > 5000) {
+      Serial.printf("[*] Captured %d packets so far...\n", capturedSignalCount);
+      captureStartTime = millis();
+    }
+  }
+}
+
+String generatePacketName(RFSignal* signal) {
+  // Check for common protocol patterns
+  
+  // Logitech Unifying (0x00 prefix)
+  if (signal->dataLen > 0 && signal->data[0] == 0x00) {
+    return "Logitech_" + String(signal->channel);
+  }
+  
+  // Microsoft Wireless (0x0A prefix)
+  if (signal->dataLen > 0 && signal->data[0] == 0x0A) {
+    return "Microsoft_" + String(signal->channel);
+  }
+  
+  // Nordic ESB (0x01, 0x02 common)
+  if (signal->dataLen > 0 && (signal->data[0] == 0x01 || signal->data[0] == 0x02)) {
+    return "Nordic_" + String(signal->channel);
+  }
+  
+  // Generic packet with channel
+  return "Pkt_Ch" + String(signal->channel) + "_" + String(capturedSignalCount + 1);
+}
+
+// ==================== RF CAPTURE ====================
+void drawRFCapture() {
+  tft.fillScreen(COLOR_BG);
+  
+  String title = "rf capture - ";
+  if (selectedRFType == RF_NRF24) title += "nrf24";
+  else if (selectedRFType == RF_SUBGHZ) title += "subghz";
+  
+  drawTerminalHeader(title.c_str());
+  
+  int y = HEADER_HEIGHT + 5;
+
+  if (rfCaptureActive && capturedSignalCount > 0) {
+  // Show live capture indicator
+  static bool captureBlink = false;
+  static unsigned long lastCaptureBlink = 0;
+  if (millis() - lastCaptureBlink > 200) {
+    captureBlink = !captureBlink;
+    lastCaptureBlink = millis();
+  }
+  
+  if (captureBlink) {
+    tft.setTextColor(COLOR_ORANGE);
+    tft.setCursor(190, HEADER_HEIGHT + 5);
+    tft.print("[RX]");
+  }
+}
+  
+  if (selectedRFType == RF_SUBGHZ) {
+    // SubGHz - Under Development
+    tft.setTextSize(2);
+    tft.setTextColor(COLOR_ORANGE);
+    tft.setCursor(SIDE_MARGIN, y + 60);
+    tft.println("UNDER");
+    tft.setCursor(SIDE_MARGIN, y + 85);
+    tft.println("DEVELOPMENT");
+    
+  } else if (selectedRFType == RF_NRF24) {
+    // NRF24 - Working Capture (WiFi scan style)
+    
+    // Live indicator when capturing
+    if (rfCaptureActive) {
+      static bool blink = false;
+      blink = !blink;
+      tft.fillCircle(220, 12, 3, blink ? COLOR_GREEN : COLOR_DARK_GREEN);
+    }
+    
+    // Stats bar
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_CYAN);
+    tft.setCursor(SIDE_MARGIN, y);
+    tft.print(rfCaptureActive ? "Capturing..." : "Stopped");
+    
+    tft.setTextColor(COLOR_TEXT);
+    tft.setCursor(120, y);
+    tft.printf("Found: ");
+    tft.setTextColor(COLOR_GREEN);
+    tft.printf("%d", capturedSignalCount);
+    
+    y += 18;
+    tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
+    y += 3;
+    
+    // Column headers
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_DARK_GREEN);
+    tft.setCursor(SIDE_MARGIN, y);
+    tft.print("NAME");
+    tft.setCursor(90, y);
+    tft.print("CH");
+    tft.setCursor(120, y);
+    tft.print("FREQ");
+    tft.setCursor(170, y);
+    tft.print("SIZE");
+    tft.setCursor(205, y);
+    tft.print("PWR");
+    
+    y += 12;
+    tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
+    y += 3;
+    
+    // Display captured signals (scrollable list)
+    const int BACK_BUTTON_Y = 305;
+    const int SAFE_BOTTOM = BACK_BUTTON_Y - 25;
+    const int ITEM_HEIGHT = 20;
+    const int MAX_ITEMS = (SAFE_BOTTOM - y) / ITEM_HEIGHT;
+    
+    if (capturedSignalCount == 0) {
+      tft.setTextColor(COLOR_TEXT);
+      tft.setCursor(SIDE_MARGIN, y + 40);
+      if (rfCaptureActive) {
+        tft.print("Scanning for signals...");
+      } else {
+        tft.print("No signals captured yet");
+        tft.setCursor(SIDE_MARGIN, y + 55);
+        tft.print("Tap RF Capture to begin");
+      }
+    } else {
+      // Ensure scroll offset is valid
+      if (rfCaptureScrollOffset >= capturedSignalCount) {
+        rfCaptureScrollOffset = max(0, capturedSignalCount - MAX_ITEMS);
+      }
+      if (rfCaptureScrollOffset < 0) {
+        rfCaptureScrollOffset = 0;
+      }
+      
+      int displayCount = min(capturedSignalCount - rfCaptureScrollOffset, MAX_ITEMS);
+      
+      for (int i = 0; i < displayCount; i++) {
+        int idx = rfCaptureScrollOffset + i;
+        int itemY = y + (i * ITEM_HEIGHT);
+        
+        // Stop if too close to back button
+        if (itemY + ITEM_HEIGHT > SAFE_BOTTOM) break;
+        
+        RFSignal* signal = &capturedSignals[idx];
+        
+        // Highlight if hovered
+        if (hoveredIndex == i) {
+          tft.fillRect(0, itemY - 2, 240, ITEM_HEIGHT, COLOR_HOVER_BG);
+        }
+        
+        // Name
+        tft.setTextColor(COLOR_TEXT);
+        tft.setTextSize(1);
+        tft.setCursor(SIDE_MARGIN, itemY);
+        String displayName = signal->description;
+        if (displayName.length() > 10) displayName = displayName.substring(0, 9) + "~";
+        tft.print(displayName);
+        
+        // Channel
+        tft.setTextColor(COLOR_CYAN);
+        tft.setCursor(90, itemY);
+        tft.printf("%3d", signal->channel);
+        
+        // Frequency
+        tft.setTextColor(COLOR_YELLOW);
+        tft.setCursor(120, itemY);
+        tft.printf("%4d", signal->frequency);
+        
+        // Data size
+        tft.setTextColor(COLOR_GREEN);
+        tft.setCursor(170, itemY);
+        tft.printf("%2dB", signal->dataLen);
+        
+        // RSSI
+        int rssi = signal->rssi;
+        uint16_t rssiColor = (rssi > -50) ? COLOR_GREEN : (rssi > -70) ? COLOR_YELLOW : COLOR_RED;
+        tft.setTextColor(rssiColor);
+        tft.setCursor(205, itemY);
+        tft.printf("%3d", rssi);
+      }
+      
+      // Scroll indicator
+      if (capturedSignalCount > MAX_ITEMS) {
+        int scrollY = SAFE_BOTTOM + 2;
+        tft.setTextColor(COLOR_DARK_GREEN);
+        tft.setTextSize(1);
+        tft.setCursor(65, scrollY);
+        tft.printf("Page %d/%d [Tap scroll]", 
+                   (rfCaptureScrollOffset / MAX_ITEMS) + 1,
+                   (capturedSignalCount + MAX_ITEMS - 1) / MAX_ITEMS);
+      }
+    }
+  }
+  
+  // Back/Stop button
+  int backY = 305;
+  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
+  tft.setTextColor(COLOR_RED);
+  tft.setCursor(75, backY + 3);
+  if (rfCaptureActive) {
+    tft.print("[TAP] Stop");
+  } else {
+    tft.print("[ESC] Back");
+  }
+}
+
+// ==================== RF REPLAY ====================
+void drawRFReplay() {
+  tft.fillScreen(COLOR_BG);
+  
+  String title = "rf replay - ";
+  if (selectedRFType == RF_NRF24) title += "nrf24";
+  else if (selectedRFType == RF_SUBGHZ) title += "subghz";
+  
+  drawTerminalHeader(title.c_str());
+  
+  int y = HEADER_HEIGHT + 5;
+  
+  if (selectedRFType == RF_SUBGHZ) {
+    // SubGHz - Under Development
+    tft.setTextSize(2);
+    tft.setTextColor(COLOR_ORANGE);
+    tft.setCursor(SIDE_MARGIN, y + 60);
+    tft.println("UNDER");
+    tft.setCursor(SIDE_MARGIN, y + 85);
+    tft.println("DEVELOPMENT");
+    
+  } else if (selectedRFType == RF_NRF24) {
+    // NRF24 - Working Replay
+    
+    // Stats bar
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_DARK_GREEN);
+    tft.setCursor(SIDE_MARGIN, y);
+    tft.print("Captured: ");
+    tft.setTextColor(COLOR_CYAN);
+    tft.printf("%d", capturedSignalCount);
+    
+    tft.setTextColor(COLOR_DARK_GREEN);
+    tft.setCursor(120, y);
+    tft.print("Selected: ");
+    tft.setTextColor(selectedSignalIndex >= 0 ? COLOR_GREEN : COLOR_TEXT);
+    tft.print(selectedSignalIndex >= 0 ? "YES" : "NO");
+    
+    y += 18;
+    tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
+    y += 3;
+    
+    if (capturedSignalCount == 0) {
+      // No signals captured
+      tft.setTextSize(1);
+      tft.setTextColor(COLOR_YELLOW);
+      tft.setCursor(SIDE_MARGIN, y + 40);
+      tft.println("No captured signals");
+      
+      y += 60;
+      tft.setTextColor(COLOR_TEXT);
+      tft.setCursor(SIDE_MARGIN, y);
+      tft.println("Use RF Capture to record");
+      y += 12;
+      tft.setCursor(SIDE_MARGIN, y);
+      tft.println("signals before replaying");
+      
+    } else {
+      // Show captured signals list (selectable)
+      
+      // Column headers
+      tft.setTextSize(1);
+      tft.setTextColor(COLOR_DARK_GREEN);
+      tft.setCursor(SIDE_MARGIN, y);
+      tft.print("NAME");
+      tft.setCursor(90, y);
+      tft.print("CH");
+      tft.setCursor(120, y);
+      tft.print("FREQ");
+      tft.setCursor(170, y);
+      tft.print("SIZE");
+      tft.setCursor(205, y);
+      tft.print("PWR");
+      
+      y += 12;
+      tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
+      y += 3;
+      
+      // Display list (scrollable)
+      const int BACK_BUTTON_Y = 250;  // Higher to make room for replay button
+      const int SAFE_BOTTOM = BACK_BUTTON_Y - 10;
+      const int ITEM_HEIGHT = 20;
+      const int MAX_ITEMS = (SAFE_BOTTOM - y) / ITEM_HEIGHT;
+      
+      // Ensure scroll offset is valid
+      if (rfCaptureScrollOffset >= capturedSignalCount) {
+        rfCaptureScrollOffset = max(0, capturedSignalCount - MAX_ITEMS);
+      }
+      if (rfCaptureScrollOffset < 0) {
+        rfCaptureScrollOffset = 0;
+      }
+      
+      int displayCount = min(capturedSignalCount - rfCaptureScrollOffset, MAX_ITEMS);
+      
+      for (int i = 0; i < displayCount; i++) {
+        int idx = rfCaptureScrollOffset + i;
+        int itemY = y + (i * ITEM_HEIGHT);
+        
+        // Stop if too close to buttons
+        if (itemY + ITEM_HEIGHT > SAFE_BOTTOM) break;
+        
+        RFSignal* signal = &capturedSignals[idx];
+        
+        // Highlight selected or hovered
+        bool isSelected = (selectedSignalIndex == idx);
+        if (isSelected) {
+          tft.fillRect(0, itemY - 2, 240, ITEM_HEIGHT, COLOR_SELECTED_BG);
+        } else if (hoveredIndex == i) {
+          tft.fillRect(0, itemY - 2, 240, ITEM_HEIGHT, COLOR_HOVER_BG);
+        }
+        
+        uint16_t textColor = isSelected ? COLOR_GREEN : COLOR_TEXT;
+        
+        // Selection indicator
+        if (isSelected) {
+          tft.setTextColor(COLOR_GREEN);
+          tft.setCursor(2, itemY);
+          tft.print(">");
+        }
+        
+        // Name
+        tft.setTextColor(textColor);
+        tft.setTextSize(1);
+        tft.setCursor(SIDE_MARGIN + 8, itemY);
+        String displayName = signal->description;
+        if (displayName.length() > 8) displayName = displayName.substring(0, 7) + "~";
+        tft.print(displayName);
+        
+        // Channel
+        tft.setTextColor(COLOR_CYAN);
+        tft.setCursor(90, itemY);
+        tft.printf("%3d", signal->channel);
+        
+        // Frequency
+        tft.setTextColor(COLOR_YELLOW);
+        tft.setCursor(120, itemY);
+        tft.printf("%4d", signal->frequency);
+        
+        // Data size
+        tft.setTextColor(COLOR_GREEN);
+        tft.setCursor(170, itemY);
+        tft.printf("%2dB", signal->dataLen);
+        
+        // RSSI
+        int rssi = signal->rssi;
+        uint16_t rssiColor = (rssi > -50) ? COLOR_GREEN : (rssi > -70) ? COLOR_YELLOW : COLOR_RED;
+        tft.setTextColor(rssiColor);
+        tft.setCursor(205, itemY);
+        tft.printf("%3d", rssi);
+      }
+      
+      // Scroll indicator
+      if (capturedSignalCount > MAX_ITEMS) {
+        int scrollY = SAFE_BOTTOM + 2;
+        tft.setTextColor(COLOR_DARK_GREEN);
+        tft.setTextSize(1);
+        tft.setCursor(65, scrollY);
+        tft.printf("[%d-%d/%d]", 
+                   rfCaptureScrollOffset + 1,
+                   rfCaptureScrollOffset + displayCount,
+                   capturedSignalCount);
+      }
+      
+      // Replay button (only if signal selected)
+      if (selectedSignalIndex >= 0) {
+        int replayY = 255;
+        tft.fillRect(60, replayY, 120, 30, COLOR_GREEN);
+        tft.drawRect(60, replayY, 120, 30, COLOR_DARK_GREEN);
+        
+        tft.setTextSize(1);
+        tft.setTextColor(COLOR_BG);
+        tft.setCursor(80, replayY + 11);
+        tft.print("REPLAY SIGNAL");
+      }
+    }
+  }
+  
+  // Back button
+  int backY = 305;
+  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
+  tft.setTextColor(COLOR_RED);
+  tft.setCursor(85, backY + 3);
+  tft.print("[ESC] Back");
+}
+
+void replayRFSignal() {
+  if (selectedSignalIndex < 0 || selectedSignalIndex >= capturedSignalCount) {
+    Serial.println("[!] No signal selected");
+    addToConsole("ERROR: No signal");
+    return;
+  }
+  
+  if (!nrf1Available) {
+    Serial.println("[!] nRF24 not available");
+    addToConsole("ERROR: nRF24 offline");
+    return;
+  }
+  
+  RFSignal* signal = &capturedSignals[selectedSignalIndex];
+  
+  Serial.println("\n[+] ===== REPLAYING SIGNAL =====");
+  Serial.printf("    Name: %s\n", signal->description.c_str());
+  Serial.printf("    Channel: %d (%d MHz)\n", signal->channel, signal->frequency);
+  Serial.printf("    Data length: %d bytes\n", signal->dataLen);
+  Serial.print("    Data: ");
+  for (int i = 0; i < signal->dataLen; i++) {
+    Serial.printf("%02X ", signal->data[i]);
+  }
+  Serial.println();
+  
+  // Configure nRF24 for transmission
+  radio1.stopListening();
+  radio1.setChannel(signal->channel);
+  radio1.setRetries(0, 0);  // No retries for replay
+  radio1.setAutoAck(false);  // No auto-ack
+  radio1.setPALevel(RF24_PA_MAX);  // Max power
+  
+  // Use generic pipe address (common for sniffing/replay)
+  uint64_t txAddress = 0xE7E7E7E7E7LL;
+  radio1.openWritingPipe(txAddress);
+  
+  delay(10);
+  
+  // Transmit the signal multiple times (like other firmwares)
+  int successCount = 0;
+  const int REPLAY_COUNT = 10;  // Replay 10 times for better chance
+  
+  Serial.println("[*] Transmitting...");
+  
+  for (int i = 0; i < REPLAY_COUNT; i++) {
+    bool success = radio1.write(signal->data, signal->dataLen);
+    
+    if (success) {
+      successCount++;
+      Serial.print(".");
+    } else {
+      Serial.print("x");
+    }
+    
+    delayMicroseconds(500);  // Small delay between transmissions
+  }
+  
+  Serial.println();
+  Serial.printf("[+] Transmitted %d/%d packets successfully\n", successCount, REPLAY_COUNT);
+  
+  addToConsole("Replayed: " + signal->description);
+  
+  // Show feedback on screen
+  tft.fillRect(50, 255, 140, 25, successCount > 0 ? COLOR_GREEN : COLOR_RED);
+  tft.drawRect(50, 255, 140, 25, COLOR_DARK_GREEN);
+  tft.setTextColor(COLOR_BG);
+  tft.setTextSize(1);
+  
+  int msgX = successCount > 0 ? 70 : 75;
+  tft.setCursor(msgX, 264);
+  if (successCount > 0) {
+    tft.printf("TX: %d/%d OK!", successCount, REPLAY_COUNT);
+  } else {
+    tft.print("TX FAILED!");
+  }
+  
+  delay(2000);
+  drawRFReplay();
+}
+
+// ==================== HANDLE RF MENU TOUCH ====================
+void handleRFMenuTouch(int x, int y) {
+  if (y > 300) {
+    currentState = MAIN_MENU;
+    hoveredIndex = -1;
+    drawMainMenu();
+    return;
+  }
+  
+  int startY = HEADER_HEIGHT + 10;
+  
+  if (y >= startY && y < startY + (2 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {
+    int relativeY = y - startY;
+    int buttonIndex = relativeY / (MENU_ITEM_HEIGHT + MENU_SPACING);
+    
+    int buttonY = startY + (buttonIndex * (MENU_ITEM_HEIGHT + MENU_SPACING));
+    if (y >= buttonY && y <= buttonY + MENU_ITEM_HEIGHT) {
+      switch (buttonIndex) {
+        case 0: // NRF24L01
+          selectedRFType = RF_NRF24;
+          currentState = RF_TYPE_MENU;
+          hoveredIndex = -1;
+          drawRFTypeMenu();
+          break;
+        case 1: // SubGHz
+          selectedRFType = RF_SUBGHZ;
+          currentState = RF_TYPE_MENU;
+          hoveredIndex = -1;
+          drawRFTypeMenu();
+          break;
+      }
+    }
+  }
+}
+
+// ==================== HANDLE RF TYPE MENU TOUCH ====================
+void handleRFTypeMenuTouch(int x, int y) {
+  if (y > 300) {
+    currentState = RF_MENU;
+    hoveredIndex = -1;
+    drawRFMenu();
+    return;
+  }
+  
+  int startY = HEADER_HEIGHT + 10;
+  
+  if (y >= startY && y < startY + (3 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {
+    int relativeY = y - startY;
+    int buttonIndex = relativeY / (MENU_ITEM_HEIGHT + MENU_SPACING);
+    
+    int buttonY = startY + (buttonIndex * (MENU_ITEM_HEIGHT + MENU_SPACING));
+    if (y >= buttonY && y <= buttonY + MENU_ITEM_HEIGHT) {
+      switch (buttonIndex) {
+        case 0: // RF Monitor
+          currentState = RF_MONITOR;
+          hoveredIndex = -1;
+          wavePhase = 0;  // Reset animation
+          memset(channelActivity, 0, sizeof(channelActivity));  // Clear activity
+          
+          // FORCE FULL REDRAW - Clear the screen first
+          tft.fillScreen(COLOR_BG);
+          
+          // Call draw with a fresh state
+          drawRFMonitorFresh();
+          break;
+        case 1: // RF Capture
+          currentState = RF_CAPTURE;
+          hoveredIndex = -1;
+          rfCaptureScrollOffset = 0;
+          startRFCapture();
+          break;
+        case 2: // RF Replay
+          currentState = RF_REPLAY;
+          hoveredIndex = -1;
+          rfCaptureScrollOffset = 0;
+          selectedSignalIndex = -1;
+          drawRFReplay();
+          break;
+      }
+    }
+  }
+}
+
+void drawRFMonitorFresh() {
+  tft.fillScreen(COLOR_BG);
+  
+  String title = "rf monitor - ";
+  if (selectedRFType == RF_NRF24) title += "nrf24";
+  else if (selectedRFType == RF_SUBGHZ) title += "subghz";
+  
+  drawTerminalHeader(title.c_str());
+  
+  int y = HEADER_HEIGHT + 5;
+  
+  if (selectedRFType == RF_SUBGHZ) {
+    // SubGHz - Under Development
+    tft.setTextSize(2);
+    tft.setTextColor(COLOR_ORANGE);
+    tft.setCursor((240 - 84) / 2, y + 60);
+    tft.println("UNDER");
+    tft.setCursor((240 - 168) / 2, y + 85);
+    tft.println("DEVELOPMENT");
+    
+    y += 140;
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_TEXT);
+    tft.setCursor((240 - 174) / 2, y);
+    tft.println("SubGHz monitoring will be");
+    y += 12;
+    tft.setCursor((240 - 180) / 2, y);
+    tft.println("available in future update");
+    
+  } else if (selectedRFType == RF_NRF24) {
+    // NRF24 - Working Monitor
+    
+    // Compact stats line
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_DARK_GREEN);
+    tft.setCursor(SIDE_MARGIN, y);
+    tft.print("Frequency:");
+    
+    tft.setTextColor(COLOR_CYAN);
+    tft.setCursor(75, y);
+    tft.print("2.4GHz");
+    
+    tft.setTextColor(COLOR_DARK_GREEN);
+    tft.setCursor(130, y);
+    tft.print("Range:");
+    
+    tft.setTextColor(COLOR_YELLOW);
+    tft.setCursor(175, y);
+    tft.print("0-125");
+    
+    y += 15;
+    tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
+    
+    // Draw wave area grid
+    int waveStartY = y + 5;
+    int waveHeight = 120;
+    int centerY = waveStartY + waveHeight / 2;
+    
+    // Horizontal grid lines
+    for (int i = 1; i < 4; i++) {
+      int gridY = waveStartY + (i * waveHeight / 4);
+      for (int x = 0; x < 240; x += 5) {
+        tft.drawPixel(x, gridY, COLOR_DARK_GREEN);
+      }
+    }
+    
+    // Center line (brighter)
+    for (int x = 0; x < 240; x += 3) {
+      tft.drawPixel(x, centerY, 0x2945);
+    }
+    
+    // Bottom separator after wave area
+    y = waveStartY + waveHeight + 5;
+    tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
+    y += 8;
+    
+    // Status message (centered, below waves)
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_CYAN);
+    int msgWidth = 156;
+    tft.setCursor((255 - msgWidth) / 2, y);
+    tft.print("Monitoring RF spectrum");
+    
+    y += 15;
+    
+    // Channel info (centered)
+    tft.setTextColor(COLOR_DARK_GREEN);
+    msgWidth = 168;
+    tft.setCursor((260 - msgWidth) / 2, y);
+    tft.print("Channels: 2400-2525 MHz");
+  }
+  
+  // Back button (always at bottom)
+  int backY = 305;
+  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
+  tft.setTextColor(COLOR_RED);
+  tft.setTextSize(1);
+  tft.setCursor(75, backY + 3);
+  tft.print("[TAP] Stop");
+}
+
+// ==================== HANDLE RF CAPTURE TOUCH ====================
+void handleRFCaptureTouch(int x, int y) {
+  // Back/Stop button
+  if (y > 300) {
+    if (rfCaptureActive) {
+      stopRFCapture();
+      drawRFCapture();
+    } else {
+      currentState = RF_TYPE_MENU;
+      hoveredIndex = -1;
+      drawRFTypeMenu();
+    }
+    return;
+  }
+  
+  // Scroll through captured signals
+  if (capturedSignalCount > 0 && y > HEADER_HEIGHT + 40 && y < 280) {
+    const int MAX_ITEMS = 11;
+    int totalPages = (capturedSignalCount + MAX_ITEMS - 1) / MAX_ITEMS;
+    
+    if (totalPages > 1) {
+      int currentPage = rfCaptureScrollOffset / MAX_ITEMS;
+      currentPage = (currentPage + 1) % totalPages;
+      rfCaptureScrollOffset = currentPage * MAX_ITEMS;
+      drawRFCapture();
+    }
+  }
+}
+
+void handleRFReplayTouch(int x, int y) {
+  // Back button
+  if (y > 300) {
+    currentState = RF_TYPE_MENU;
+    hoveredIndex = -1;
+    selectedSignalIndex = -1;
+    drawRFTypeMenu();
+    return;
+  }
+  
+  // Replay button (if signal selected)
+  if (selectedSignalIndex >= 0 && y >= 255 && y <= 285 && x >= 60 && x <= 180) {
+    replayRFSignal();
+    return;
+  }
+  
+  // Signal selection from list
+  if (capturedSignalCount > 0 && y > HEADER_HEIGHT + 40 && y < 250) {
+    int listY = HEADER_HEIGHT + 40;
+    const int ITEM_HEIGHT = 20;
+    int clickedIndex = (y - listY) / ITEM_HEIGHT;
+    int actualIndex = rfCaptureScrollOffset + clickedIndex;
+    
+    if (actualIndex >= 0 && actualIndex < capturedSignalCount) {
+      selectedSignalIndex = actualIndex;
+      Serial.printf("[*] Selected signal %d: %s\n", 
+                    actualIndex, 
+                    capturedSignals[actualIndex].description.c_str());
+      drawRFReplay();
+    }
+  }
+}
+
+// ==================== HANDLE RF MONITOR TOUCH ====================
+void handleRFMonitorTouch(int x, int y) {
+  static bool* initFlag = nullptr;
+  
+  currentState = RF_TYPE_MENU;
+  hoveredIndex = -1;
+  drawRFTypeMenu();
+}
+
 
 void updateAPHistory(String ssid, uint8_t* bssid, int32_t rssi, uint8_t channel) {
   // Find existing entry
@@ -8890,6 +10101,8 @@ void toggleNRFJammer() {
     stopNRFJammer();
   }
 }
+
+
 
 void printStatus() {
   Serial.println("\n=== System Status ===");
