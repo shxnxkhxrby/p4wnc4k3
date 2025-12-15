@@ -89,6 +89,13 @@ WebServer webServer(80);
 #define HSPI_MISO 12      // Kept same
 #define HSPI_MOSI 13      // Kept same
 #define HSPI_SCLK 14      // Kept same
+//#define CC1101_CS    22
+//#define CC1101_GDO0  4
+//#define CC1101_GDO2  15
+// CC1101 shares VSPI pins:
+// MOSI: 23 (shared with TFT)
+// MISO: 19 (shared with TFT)
+// SCLK: 18 (shared with TFT)
 
 const uint8_t ble_channels[] = {37, 38, 39};
 uint8_t current_ble_channel = 0;
@@ -684,6 +691,19 @@ void drawTerminalHeader(const char* title) {
   tft.drawFastHLine(0, HEADER_HEIGHT - 1, 240, COLOR_GREEN);
 }
 
+void drawCenteredButton(const char* text, uint16_t color = COLOR_RED, int y = 305) {
+  tft.drawFastHLine(0, y - 2, 240, COLOR_GREEN);
+  tft.setTextSize(1);
+  tft.setTextColor(color);
+  
+  // Calculate center position
+  int textWidth = strlen(text) * 6; // 6 pixels per character in size 1
+  int x = (240 - textWidth) / 2;
+  
+  tft.setCursor(x, y + 3);
+  tft.print(text);
+}
+
 // ==================== CAPTURE HANDSHAKE FROM SNIFFER ====================
 void IRAM_ATTR wifiSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
   wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t*)buf;
@@ -1040,12 +1060,7 @@ void displayCapturedPasswords() {
     }
   }
   
-  // Back button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(85, backY + 3);
-  tft.print("[ESC] Back");
+  drawCenteredButton("[ESC]", COLOR_RED);
 }
 
 String password = webServer.arg("password");
@@ -1332,12 +1347,7 @@ void displayWiFiScanResults() {
     tft.print(networks[idx].isEncrypted ? "WPA" : "OPEN");
   }
   
-  // Back button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(85, backY + 3);
-  tft.print("[ESC] Back");
+  drawCenteredButton("[STOP]", COLOR_RED);
 }
 
 void displayContinuousWiFiScan() {
@@ -1449,21 +1459,23 @@ void displayContinuousWiFiScan() {
   
   // Scroll indicator (if needed)
   if (networkCount > MAX_ITEMS) {
-    int scrollY = SAFE_BOTTOM + 2;
-    tft.setTextColor(COLOR_DARK_GREEN);
-    tft.setTextSize(1);
-    tft.setCursor(70, scrollY);
-    tft.printf("Page %d/%d [Tap scroll]", 
-               (wifiScrollOffset / MAX_ITEMS) + 1,
-               (networkCount + MAX_ITEMS - 1) / MAX_ITEMS);
+  int scrollY = SAFE_BOTTOM + 2;
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setTextSize(1);
+  
+  // Calculate text width: each char = 6px in size 1
+  int currentPage = (wifiScrollOffset / MAX_ITEMS) + 1;
+  int totalPages = (networkCount + MAX_ITEMS - 1) / MAX_ITEMS;
+  char scrollText[30];
+  sprintf(scrollText, "Page %d/%d [Tap scroll]", currentPage, totalPages);
+  int textWidth = strlen(scrollText) * 6;
+  int centerX = (240 - textWidth) / 2;
+  
+  tft.setCursor(centerX, scrollY);
+  tft.print(scrollText);
   }
   
-  // Back button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(85, backY + 3);
-  tft.print("[ESC] Back");
+  drawCenteredButton("[ESC]", COLOR_RED);
 }
 
 // ==================== PROCESS WIFI SCAN RESULTS ====================
@@ -1641,21 +1653,22 @@ void drawSelectTargetMenu() {
   
   // Scroll indicator (only if needed)
   if (networkCount > MAX_ITEMS) {
-    int scrollY = SAFE_BOTTOM + 2;
-    tft.setTextColor(COLOR_DARK_GREEN);
-    tft.setTextSize(1);
-    tft.setCursor(70, scrollY);
-    tft.printf("Page %d/%d [Tap scroll]", 
-               (wifiScrollOffset / MAX_ITEMS) + 1,
-               (networkCount + MAX_ITEMS - 1) / MAX_ITEMS);
+  int scrollY = SAFE_BOTTOM + 2;
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setTextSize(1);
+  
+  int currentPage = (wifiScrollOffset / MAX_ITEMS) + 1;
+  int totalPages = (networkCount + MAX_ITEMS - 1) / MAX_ITEMS;
+  char scrollText[30];
+  sprintf(scrollText, "Page %d/%d [Tap scroll]", currentPage, totalPages);
+  int textWidth = strlen(scrollText) * 6;
+  int centerX = (240 - textWidth) / 2;
+  
+  tft.setCursor(centerX, scrollY);
+  tft.print(scrollText);
   }
   
-  // Back button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(85, backY + 3);
-  tft.print("[ESC] Back");
+  drawCenteredButton("[ESC]", COLOR_RED);
 }
 
 // BLE callback for AirTag and Skimmer detection
@@ -1938,18 +1951,18 @@ void displayDeauthSnifferActive() {
       tft.drawFastHLine(0, scrollY, 240, COLOR_DARK_GREEN);
       tft.setTextSize(1);
       tft.setTextColor(COLOR_CYAN);
-      tft.setCursor(70, scrollY + 5);
-      tft.printf("Page %d/%d [Tap scroll]", currentPage + 1, totalPages);
+      
+      char scrollText[30];
+      sprintf(scrollText, "Page %d/%d [Tap scroll]", currentPage + 1, totalPages);
+      int textWidth = strlen(scrollText) * 6;
+      int centerX = (240 - textWidth) / 2;
+      
+      tft.setCursor(centerX, scrollY + 5);
+      tft.print(scrollText);
     }
   }
   
-  // Footer with controls
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setTextSize(1);
-  tft.setCursor(75, backY + 3);
-  tft.print("[TAP] Stop");
+  drawCenteredButton("[STOP]", COLOR_RED);
 }
 
 void handleDeauthSnifferMenuTouch(int x, int y) {
@@ -2186,21 +2199,36 @@ const char maskASCII[] PROGMEM =
 void displayIntegratedBoot() {
   tft.fillScreen(COLOR_BG);
   
-  // ===== TALLER & SLIMMER SKULL - Adjusted rendering =====
+  // ===== TOP: root@p4wnc4k3:~# init =====
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_RED);
+  tft.setCursor(5, 8);
+  tft.print("root@p4wnc4k3:~# ");
+  tft.setTextColor(COLOR_TEXT);
+  tft.print("init");
+  
+  // Separator line
+  int separatorY = 22;
+  for (int x = 0; x < 240; x += 2) {
+    tft.drawPixel(x, separatorY, COLOR_DARK_GREEN);
+  }
+  
+  // ===== CENTERED ASCII MASK =====
   int lineCount = 27;
   int pixelsPerChar = 3;
   
   int maxLineWidth = 41;
   int totalMaskWidth = maxLineWidth * pixelsPerChar;
-  int totalMaskHeight = lineCount * pixelsPerChar;
+  int totalMaskHeight = lineCount * pixelsPerChar * 2; // Double height
   
+  // Center horizontally AND vertically in the middle space
   int maskStartX = (240 - totalMaskWidth) / 2;
-  int maskStartY = 15;
+  int availableHeight = 320 - separatorY - 90; // Space between separator and modules
+  int maskStartY = separatorY + ((availableHeight - totalMaskHeight) / 2);
   
-  // ✅ FIX: Move to heap to avoid stack overflow
+  // Parse ASCII art
   char (*lines)[42] = new char[27][42];
   
-  // Clear array first
   for (int i = 0; i < 27; i++) {
     for (int j = 0; j < 42; j++) {
       lines[i][j] = '\0';
@@ -2230,40 +2258,6 @@ void displayIntegratedBoot() {
     lines[lineIndex][linePos] = '\0';
   }
   
-  // ===== MESSAGES AT BOTTOM =====
-  int msgStartY = 190;
-  
-  tft.setTextSize(1);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(5, msgStartY);
-  tft.print("root@p4wnc4k3:~# ");
-  tft.setTextColor(COLOR_TEXT);
-  tft.println("init");
-  msgStartY += 12;
-  
-  tft.drawLine(0, msgStartY, 240, msgStartY, COLOR_DARK_GREEN);
-  msgStartY += 8;
-  
-  const char* modules[] = {"WiFi", "BLE", "nRF#1", "nRF#2", "SPIFFS", "TFT"};
-  int moduleY[6];
-  int col1X = 8;
-  int col2X = 128;
-  
-  for (int i = 0; i < 6; i++) {
-    int x = (i < 3) ? col1X : col2X;
-    int row = (i < 3) ? i : (i - 3);
-    moduleY[i] = msgStartY + (row * 11);
-    
-    tft.setTextColor(COLOR_TEXT);
-    tft.setCursor(x, moduleY[i]);
-    tft.print("[");
-    tft.setTextColor(COLOR_GREEN);
-    tft.print("*");
-    tft.setTextColor(COLOR_TEXT);
-    tft.print("] ");
-    tft.print(modules[i]);
-  }
-  
   // ===== ANIMATE SKULL =====
   bool revealed[27][41];
   for (int y = 0; y < 27; y++) {
@@ -2283,21 +2277,16 @@ void displayIntegratedBoot() {
   }
   
   int pixelsRevealed = 0;
-  int moduleIndex = 0;
-  int pixelsPerModule = (totalPixels > 0) ? (totalPixels / 6) : 1;
   int animationSteps = 15;
   
   while (pixelsRevealed < totalPixels) {
-    // Feed watchdog every iteration
     esp_task_wdt_reset();
     
     for (int step = 0; step < animationSteps && pixelsRevealed < totalPixels; step++) {
       int randY = random(0, 27);
       int randX = random(0, 41);
       
-      if (revealed[randY][randX]) {
-        continue;
-      }
+      if (revealed[randY][randX]) continue;
       
       char pixel = lines[randY][randX];
       
@@ -2310,7 +2299,7 @@ void displayIntegratedBoot() {
       pixelsRevealed++;
       
       int xPos = maskStartX + (randX * pixelsPerChar);
-      int yPos = maskStartY + (randY * pixelsPerChar) + (randY * pixelsPerChar);
+      int yPos = maskStartY + (randY * pixelsPerChar * 2);
       
       uint16_t color;
       if (pixel == 'h') color = COLOR_GREEN;
@@ -2321,73 +2310,56 @@ void displayIntegratedBoot() {
       tft.fillRect(xPos, yPos, pixelsPerChar - 1, (pixelsPerChar * 2) - 2, color);
     }
     
-    int currentModule = pixelsRevealed / pixelsPerModule;
-    if (currentModule > moduleIndex && currentModule <= 6) {
-      for (int m = moduleIndex; m < currentModule && m < 6; m++) {
-        bool moduleOK = true;
-        uint16_t statusColor = COLOR_SUCCESS;
-        String statusText = "OK";
-        
-        if (m == 2) {
-          moduleOK = nrf1Available;
-          if (!moduleOK) { statusColor = COLOR_ORANGE; statusText = "X"; }
-        } else if (m == 3) {
-          moduleOK = nrf2Available;
-          if (!moduleOK) { statusColor = COLOR_ORANGE; statusText = "X"; }
-        }
-        
-        int modX = (m < 3) ? col1X : col2X;
-        int row = (m < 3) ? m : (m - 3);
-        
-        tft.setTextColor(statusColor);
-        tft.setCursor(modX + 65, msgStartY + (row * 11));
-        tft.println(statusText);
-      }
-      moduleIndex = currentModule;
-    }
-    
     delay(5);
   }
   
-  for (int i = moduleIndex; i < 6; i++) {
-    uint16_t statusColor = COLOR_SUCCESS;
-    String statusText = "OK";
-    
-    if (i == 2 && !nrf1Available) { statusColor = COLOR_ORANGE; statusText = "X"; }
-    else if (i == 3 && !nrf2Available) { statusColor = COLOR_ORANGE; statusText = "X"; }
-    
-    int x = (i < 3) ? col1X : col2X;
-    int row = (i < 3) ? i : (i - 3);
-    
-    tft.setTextColor(statusColor);
-    tft.setCursor(x + 65, msgStartY + (row * 11));
-    tft.println(statusText);
-    delay(80);
-  }
-  
-  // ===== FINAL STATUS =====
-  int finalY = 270;
-  tft.drawLine(0, finalY, 240, finalY, COLOR_DARK_GREEN);
-  finalY += 6;
-  
-  tft.setTextSize(1);
-  tft.setTextColor(COLOR_LIME);
-  tft.setCursor(5, finalY);
-  tft.print("[");
-  tft.setTextColor(COLOR_SUCCESS);
-  tft.print("+");
-  tft.setTextColor(COLOR_LIME);
-  tft.print("] System initialized");
-  finalY += 11;
-  
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(5, finalY);
-  tft.print("root@p4wncak3:~# ");
-  tft.setTextColor(COLOR_TEXT);
-  tft.println("ready");
-  
   delete[] lines;
   
+  // ===== BOTTOM: MODULE LIST =====
+  int moduleStartY = 230;
+  
+  const char* modules[] = {"WiFi", "BLE", "nRF#1", "nRF#2", "CC1101", "SPIFFS", "TFT"};
+  bool moduleStatus[] = {true, true, nrf1Available, nrf2Available, true, true, true};
+  
+  for (int i = 0; i < 7; i++) {
+    int y = moduleStartY + (i * 11);
+    
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_TEXT);
+    tft.setCursor(8, y);
+    tft.print("[");
+    tft.setTextColor(COLOR_GREEN);
+    tft.print("*");
+    tft.setTextColor(COLOR_TEXT);
+    tft.print("] ");
+    tft.print(modules[i]);
+    
+    // Status
+    uint16_t statusColor = moduleStatus[i] ? COLOR_GREEN : COLOR_ORANGE;
+    String statusText = moduleStatus[i] ? "OK" : "X";
+    
+    tft.setTextColor(statusColor);
+    tft.setCursor(80, y);
+    tft.print(statusText);
+    
+    delay(80);
+    esp_task_wdt_reset();
+  }
+  
+  delay(300);
+  
+  // ===== FINAL MESSAGE =====
+  int finalY = moduleStartY + (7 * 11) + 2;
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(8, finalY);
+  tft.print("[");
+  tft.setTextColor(COLOR_GREEN);
+  tft.print("+");
+  tft.setTextColor(COLOR_TEXT);
+  tft.print("]");
+  tft.setTextColor(COLOR_RED);
+  tft.print(" Ready to p4wn");
   delay(1500);
 }
 
@@ -2525,12 +2497,7 @@ void drawWiFiMenu() {
     tft.println(truncSSID);
   }
   
-  // Back button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(85, backY + 3);
-  tft.print("[ESC] Back");
+  drawCenteredButton("[ESC]", COLOR_RED);
 }
 
 void drawSettingsMenu() {
@@ -2551,12 +2518,7 @@ void drawSettingsMenu() {
     y += MENU_ITEM_HEIGHT + MENU_SPACING;
   }
   
-  // Back button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(85, backY + 3);
-  tft.print("[ESC] Back");
+  drawCenteredButton("[ESC]", COLOR_RED);
 }
 
 void drawDeviceInfo() {
@@ -2689,12 +2651,7 @@ void drawDeviceInfo() {
   tft.setCursor(SIDE_MARGIN, y);
   tft.println("assessments only.");
   
-  // Back button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(85, backY + 3);
-  tft.print("[ESC] Back");
+  drawCenteredButton("[ESC]", COLOR_RED);
 }
 
 void drawASCIIArtViewer() {
@@ -2938,12 +2895,7 @@ void drawBeaconManager() {
     }
   }
   
-  // Back button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(85, backY + 3);
-  tft.print("[ESC] Back");
+  drawCenteredButton("[ESC]", COLOR_RED);
 }
 
 String beaconInputSSID = "";
@@ -3286,12 +3238,7 @@ void drawBLEMenu() {
   tft.setCursor(SIDE_MARGIN, y + 12);
   tft.println("Spam = Popups only");
   
-  // Back button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(85, backY + 3);
-  tft.print("[ESC] Back");
+  drawCenteredButton("[ESC]", COLOR_RED);
 }
 
 void drawBLEJammerMenu() {
@@ -3340,12 +3287,7 @@ void drawBLEJammerMenu() {
     tft.printf("%d sec", (millis() - lastBLEJamTime) / 1000);
   }
   
-  // Back button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(85, backY + 3);
-  tft.print("[ESC] Back");
+  drawCenteredButton("[ESC]", COLOR_RED);
 }
 
 void drawMoreToolsMenu() {
@@ -3365,13 +3307,7 @@ void drawMoreToolsMenu() {
     drawMenuItem(menuItems[i], i, y, hoveredIndex == i, false);
     y += MENU_ITEM_HEIGHT + MENU_SPACING;
   }
-  
-  // Back button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(85, backY + 3);
-  tft.print("[ESC] Back");
+    drawCenteredButton("[ESC]", COLOR_RED);
 }
 
 void drawAttackMenu() {
@@ -3411,12 +3347,7 @@ void drawAttackMenu() {
   // === STATUS SECTION REMOVED ===
   // updateAttackMenuLive() will handle all status drawing to prevent overlap
   
-  // Back button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(85, backY + 3);
-  tft.print("[ESC] Back");
+    drawCenteredButton("[ESC]", COLOR_RED);
 }
 
 void drawSpamMenu() {
@@ -3504,12 +3435,7 @@ void drawSpamMenu() {
   tft.setCursor(SIDE_MARGIN, y);
   tft.println("- Combined = 100 pkt/sec!");
   
-  // Back button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(85, backY + 3);
-  tft.print("[ESC] Back");
+    drawCenteredButton("[ESC]", COLOR_RED);
 }
 
 void drawNRFJammerMenu() {
@@ -3646,12 +3572,8 @@ void drawNRFJammerMenu() {
   tft.print(" = ");
   tft.println("WiFi Ch1,6,11 multi-sweep");
   
-  // Back button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(85, backY + 3);
-  tft.print("[ESC] Back");
+    drawCenteredButton("[ESC]", COLOR_RED);
+
 }
 
 void showConsole() {
@@ -3692,11 +3614,7 @@ void showConsole() {
     }
   }
   
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(85, backY + 3);
-  tft.print("[ESC] Back");
+    drawCenteredButton("[ESC]", COLOR_RED);
 }
 
 void handleSelectTargetTouch(int x, int y) {
@@ -4848,24 +4766,15 @@ void handleAttackMenuTouch(int x, int y) {
 void loop() {
   esp_task_wdt_reset();
   
-  // ==================== TURBO MODE: nRF24 JAMMER ONLY ====================
+  // ==================== TURBO MODE: nRF24 JAMMER ONLY - MAXIMUM SPEED ====================
   if (nrfJammerActive && nrfTurboMode) {
-    // ONLY jamming + minimal touch checking
-    
-    // ✅ IMPROVED: Check touch EVERY LOOP (not every 3000 hops)
-    static unsigned long lastTouchTime = 0;
-    static bool lastTouchState = false;
-    
-    // Check touch every 50ms (responsive but not too frequent)
-    if (millis() - lastTouchTime > 50) {
+    // ⚡ ULTRA-FAST MODE: Touch check only every 100K hops (not every loop!)
+    if ((nrfJamPackets % 100000) == 0) {
       uint16_t touchX, touchY;
-      bool touchNow = tft.getTouch(&touchX, &touchY);
-      
-      // Detect touch PRESS (rising edge)
-      if (touchNow && !lastTouchState) {
+      if (tft.getTouch(&touchX, &touchY)) {
+        // Stop requested
         Serial.println("\n[!] ===== STOP BUTTON PRESSED =====");
         
-        // Immediate stop
         nrfJammerActive = false;
         nrfTurboMode = false;
         
@@ -4885,7 +4794,7 @@ void loop() {
         
         Serial.println("[✓] Radios stopped");
         
-        // Print stats
+        // Print final stats
         unsigned long runtime = (millis() - lastNRFJamTime) / 1000;
         if (runtime > 0) {
           Serial.printf("[+] Runtime: %lu sec, Hops: %lu (%lu/sec)\n", 
@@ -4894,7 +4803,7 @@ void loop() {
         
         addToConsole("nRF24 stopped");
         
-        // Navigate back
+        // Navigate back to menu
         delay(200);
         currentState = NRF_JAM_MENU;
         hoveredIndex = -1;
@@ -4903,226 +4812,152 @@ void loop() {
         drawNRFJammerMenu();
         
         Serial.println("[✓] Returned to menu");
-        return; // Exit loop immediately
-      }
-      
-      lastTouchState = touchNow;
-      lastTouchTime = millis();
-    }
-
-    if (deauthFloodActive && currentState == WIFI_BLE_NRF_JAM) {
-      performDeauthFlood();
-      
-      static unsigned long lastFloodDisplay = 0;
-      if (millis() - lastFloodDisplay > 300) {
-        updateDeauthFloodDisplay();
-        lastFloodDisplay = millis();
+        return;
       }
     }
 
-  if (currentState == RF_CAPTURE && rfCaptureActive) {
-    performRFCapture();
-    
-    static unsigned long lastCaptureUpdate = 0;
-    if (millis() - lastCaptureUpdate > 500) {
-      drawRFCapture();
-      lastCaptureUpdate = millis();
-    }
-  }
-
-    if (deauthSnifferActive && currentState == DEAUTH_SNIFFER_ACTIVE) {
-    static unsigned long lastChannelHop = 0;
-    static unsigned long lastSnifferUpdate = 0;
-    
-      // Fast channel hopping - 150ms per channel (optimal for deauth detection)
-      if (millis() - lastChannelHop > 150) {
-        snifferChannel = (snifferChannel % 13) + 1;  // Cycle 1-13
-        esp_wifi_set_channel(snifferChannel, WIFI_SECOND_CHAN_NONE);
-        lastChannelHop = millis();
-      }
-      
-      // Update display every 300ms
-      if (millis() - lastSnifferUpdate > 300) {
-        displayDeauthSnifferActive();
-        lastSnifferUpdate = millis();
-      }
-    }
-
-    if (rogueAPScanActive && currentState == ROGUE_AP_DETECTOR) {
-      processRogueAPScan();
-      
-      static unsigned long lastRogueDisplay = 0;
-      if (millis() - lastRogueDisplay > 1000) {
-        displayRogueAPDetector();
-        lastRogueDisplay = millis();
-      }
-    }
-
-    // Regular Wardriving (only when Rogue AP detector is NOT active)
-    if (!rogueAPScanActive && currentState == WARDRIVING_MODE) {
-      static unsigned long lastWardrivingUpdate = 0;
-      if (millis() - lastWardrivingUpdate > 1000) {
-        displayWardrivingResults();
-        lastWardrivingUpdate = millis();
-      }
-    }
-    
-    // Route to selected jamming mode (INLINE for speed)
+    // ⚡⚡⚡ MAXIMUM SPEED JAMMING - Smoochiee's exact method ⚡⚡⚡
     switch (nrfJamMode) {
       case NRF_SWEEP:
-        // ⭐ SMOOCHIEE'S SWEEP PATTERN (INLINE)
-        if (flag_radio1 == 0) nrf_ch1 += 4; else nrf_ch1 -= 4;
-        if (flag_radio2 == 0) nrf_ch2 += 2; else nrf_ch2 -= 2;
+        // ⭐ SMOOCHIEE'S SWEEP PATTERN - MAXIMUM SPEED VERSION
+        // Radio 1: +4/-4 sweep (fast bouncing pattern)
+        nrf_ch1 += (flag_radio1 == 0) ? 4 : -4;
+        if (nrf_ch1 > 79) { 
+          flag_radio1 = 1; 
+          nrf_ch1 = 79; 
+        } else if (nrf_ch1 < 2) { 
+          flag_radio1 = 0; 
+          nrf_ch1 = 2; 
+        }
         
-        if ((nrf_ch1 > 79) && (flag_radio1 == 0)) flag_radio1 = 1;
-        else if ((nrf_ch1 < 2) && (flag_radio1 == 1)) flag_radio1 = 0;
+        // Radio 2: +2/-2 sweep (slower pattern for offset coverage)
+        nrf_ch2 += (flag_radio2 == 0) ? 2 : -2;
+        if (nrf_ch2 > 79) { 
+          flag_radio2 = 1; 
+          nrf_ch2 = 79; 
+        } else if (nrf_ch2 < 2) { 
+          flag_radio2 = 0; 
+          nrf_ch2 = 2; 
+        }
         
-        if ((nrf_ch2 > 79) && (flag_radio2 == 0)) flag_radio2 = 1;
-        else if ((nrf_ch2 < 2) && (flag_radio2 == 1)) flag_radio2 = 0;
+        // ⚡ CRITICAL: Just change channel - carrier stays ON!
+        if (nrf1Available) radio1.setChannel(nrf_ch1);
+        if (nrf2Available) radio2.setChannel(nrf_ch2);
         
-        if (nrf1Available) { radio1.setChannel(nrf_ch1); SAFE_INCREMENT(nrf1Packets); }
-        if (nrf2Available && dualNRFMode) { radio2.setChannel(nrf_ch2); SAFE_INCREMENT(nrf2Packets); }
+        // Fast increment (no mutex - speed over thread safety in turbo mode)
+        nrfJamPackets += (nrf1Available ? 1 : 0) + (nrf2Available ? 1 : 0);
         break;
         
       case NRF_RANDOM:
-        if (nrf1Available) { radio1.setChannel(random(80)); SAFE_INCREMENT(nrf1Packets); }
-        if (nrf2Available && dualNRFMode) { radio2.setChannel(random(80)); SAFE_INCREMENT(nrf2Packets); }
+        // Random channel hopping (chaotic jamming)
+        if (nrf1Available) radio1.setChannel(random(80));
+        if (nrf2Available) radio2.setChannel(random(80));
+        nrfJamPackets += (nrf1Available ? 1 : 0) + (nrf2Available ? 1 : 0);
         break;
         
       case NRF_FOCUSED:
+        // Focus on BLE advertising channels and critical frequencies
         if (nrf1Available) {
-          ptr_hop1 = (ptr_hop1 + 1) % 24;
           radio1.setChannel(hopping_channel[ptr_hop1]);
-          SAFE_INCREMENT(nrf1Packets);
+          ptr_hop1 = (ptr_hop1 + 1) % 24;
         }
-        if (nrf2Available && dualNRFMode) {
-          ptr_hop2 = (ptr_hop2 + 1) % 24;
+        if (nrf2Available) {
           radio2.setChannel(hopping_channel[ptr_hop2]);
-          SAFE_INCREMENT(nrf2Packets);
+          ptr_hop2 = (ptr_hop2 + 1) % 24;
         }
+        nrfJamPackets += (nrf1Available ? 1 : 0) + (nrf2Available ? 1 : 0);
         break;
         
       case NRF_WIFI_CLOWN:
-        // Check if time to change channels (20ms dwell per channel)
-        if (millis() - lastChannelChange >= DWELL_TIME_MS) {
-          lastChannelChange = millis();
+        // WiFi channel jamming - controlled timing for maximum effectiveness
+        static unsigned long lastWiFiHop = 0;
+        unsigned long currentMicros = micros();
+        
+        // Only change every 20ms (20000 microseconds) for optimal WiFi disruption
+        if (currentMicros - lastWiFiHop >= 20000) {
+          lastWiFiHop = currentMicros;
           
-          // Get current WiFi channel sweep array
-          const byte* current_sweep;
-          int sweep_length = 6;
-          
+          // Select current WiFi channel sweep array
+          const byte* sweep;
           switch (wifi_jam_mode) {
-            case 0:  // WiFi Channel 1 (2412 MHz)
-              current_sweep = wifi_ch1_sweep;
-              break;
-            case 1:  // WiFi Channel 6 (2437 MHz)
-              current_sweep = wifi_ch6_sweep;
-              break;
-            case 2:  // WiFi Channel 11 (2462 MHz)
-              current_sweep = wifi_ch11_sweep;
-              break;
-            default:
+            case 0: sweep = wifi_ch1_sweep; break;   // WiFi Ch 1 (2412 MHz)
+            case 1: sweep = wifi_ch6_sweep; break;   // WiFi Ch 6 (2437 MHz)
+            case 2: sweep = wifi_ch11_sweep; break;  // WiFi Ch 11 (2462 MHz)
+            default: 
               wifi_jam_mode = 0;
-              current_sweep = wifi_ch1_sweep;
+              sweep = wifi_ch1_sweep;
           }
           
-          // ===== RADIO 1: Primary sweep =====
+          // Radio 1: Primary sweep position
           if (nrf1Available) {
-            byte ch1 = current_sweep[sweep_index_radio1];
-            radio1.setChannel(ch1); // Change channel while carrier ON
-            radio1.setPALevel(RF24_PA_MAX);
-            SAFE_INCREMENT(nrf1Packets);
-            
-            sweep_index_radio1 = (sweep_index_radio1 + 1) % sweep_length;
+            radio1.setChannel(sweep[sweep_index_radio1]);
+            sweep_index_radio1 = (sweep_index_radio1 + 1) % 6;
           }
           
-          // ===== RADIO 2: Offset sweep (different channels simultaneously) =====
-          if (nrf2Available && dualNRFMode) {
-            byte ch2 = current_sweep[sweep_index_radio2];
-            radio2.setChannel(ch2); // Change channel while carrier ON
-            // ✅ CRITICAL: Ensure max power is maintained
-            radio2.setPALevel(RF24_PA_MAX);
-            SAFE_INCREMENT(nrf2Packets);
-            
-            sweep_index_radio2 = (sweep_index_radio2 + 1) % sweep_length;
+          // Radio 2: Offset sweep position (covers different frequencies)
+          if (nrf2Available) {
+            radio2.setChannel(sweep[sweep_index_radio2]);
+            sweep_index_radio2 = (sweep_index_radio2 + 1) % 6;
           }
           
-          // Rotate WiFi channels every ~2 seconds (100 changes × 20ms)
-          // This means each WiFi channel gets ~2 seconds of jamming
+          nrfJamPackets += (nrf1Available ? 1 : 0) + (nrf2Available ? 1 : 0);
+          
+          // Rotate to next WiFi channel every 100 hops (~2 seconds per channel)
           if ((nrfJamPackets % 100) == 0 && nrfJamPackets > 0) {
             wifi_jam_mode = (wifi_jam_mode + 1) % 3;
-            
-            // Reset sweep indices when changing WiFi channel
             sweep_index_radio1 = 0;
-            sweep_index_radio2 = 3;
+            sweep_index_radio2 = 3;  // Offset for dual coverage
             
             const char* channel_name = (wifi_jam_mode == 0) ? "WiFi Ch1 (2412MHz)" :
                                        (wifi_jam_mode == 1) ? "WiFi Ch6 (2437MHz)" :
                                                                "WiFi Ch11 (2462MHz)";
-            
             Serial.printf("[WiFi Clown] Now jamming: %s\n", channel_name);
           }
         }
         break;
     }
     
-    // Update total count (thread-safe)
-    uint32_t packets1, packets2;
-    SAFE_READ(nrf1Packets, packets1);
-    SAFE_READ(nrf2Packets, packets2);
-    nrfJamPackets = packets1 + packets2;
-    
-    // Watchdog every 5000 hops
-    if ((nrfJamPackets % 5000) == 0) {
-      esp_task_wdt_reset();
-    }
-    
-    // Stats every 100K hops
-    if ((nrfJamPackets % 100000) == 0 && millis() - nrfLastStats > 1000) {
-      nrfLastStats = millis();
+    // ⚡ Stats every 200K hops (less frequent = faster jamming)
+    if ((nrfJamPackets % 200000) == 0 && nrfJamPackets > 0) {
       unsigned long runtime = (millis() - lastNRFJamTime) / 1000;
       if (runtime > 0) {
         unsigned long hopsPerSec = nrfJamPackets / runtime;
         
-        // Mode-specific stats
-        if (nrfJamMode == NRF_WIFI_CLOWN) {
-          // WiFi Clown uses slower but more effective timing
-          Serial.printf("[WiFi Clown] %lu channel changes | %lu/sec | R1:%lu R2:%lu\n", 
-                        nrfJamPackets, hopsPerSec, packets1, packets2);
-          
-          if (hopsPerSec > 40) Serial.println("             ✅ EXCELLENT - Optimal disruption");
-          else if (hopsPerSec > 25) Serial.println("             ✅ VERY GOOD - Strong jamming");
-          else if (hopsPerSec > 15) Serial.println("             ✅ GOOD - Working well");
-          else Serial.println("             ⚠️  TOO SLOW - Check PA+LNA modules!");
-          
+        Serial.printf("[nRF24] %lu hops | %lu/sec\n", nrfJamPackets, hopsPerSec);
+        
+        // Performance indicator
+        if (hopsPerSec > 150000) {
+          Serial.println("        ✅ EXCELLENT - Peak performance!");
+        } else if (hopsPerSec > 80000) {
+          Serial.println("        ✅ VERY GOOD - Strong jamming");
+        } else if (hopsPerSec > 40000) {
+          Serial.println("        ✅ GOOD - Working well");
+        } else if (hopsPerSec > 20000) {
+          Serial.println("        ⚠️ FAIR - Could be better");
         } else {
-          // Other modes use fast hopping
-          Serial.printf("[nRF24] %lu hops | %lu/sec | R1:%lu R2:%lu\n", 
-                        nrfJamPackets, hopsPerSec, packets1, packets2);
-          
-          if (hopsPerSec > 50000) Serial.println("        ✅ EXCELLENT");
-          else if (hopsPerSec > 30000) Serial.println("        ✅ VERY GOOD");
-          else if (hopsPerSec > 15000) Serial.println("        ✅ GOOD");
-          else Serial.println("        ⚠️  Check hardware");
+          Serial.println("        ❌ WEAK - Check hardware!");
         }
       }
+      
+      esp_task_wdt_reset();  // Feed watchdog only during stats
     }
     
-    // ⚡ NO DELAYS! Return immediately
+    // ⚡ NO DELAYS, NO YIELDS - return immediately for max speed!
     return;
   }
   
   // ==================== NORMAL MODE: Full UI + Features ====================
   checkHeapHealth();
+  
   // RF MONITOR ANIMATION
   if (currentState == RF_MONITOR && selectedRFType == RF_NRF24) {
-  static unsigned long lastRFUpdate = 0;
-  
-  if (millis() - lastRFUpdate > 33) {
-    drawRFMonitor();  // ✅ KEEP THIS
-    lastRFUpdate = millis();
+    static unsigned long lastRFUpdate = 0;
+    
+    if (millis() - lastRFUpdate > 33) {
+      drawRFMonitor();
+      lastRFUpdate = millis();
+    }
   }
-}
   
   // Real-time attack updates
   if (currentState == WIFI_ATTACK_MENU) {
@@ -5243,6 +5078,58 @@ void loop() {
     }
     if (!capturedHandshake.captured) {
       lastCapturedState = false;
+    }
+  }
+  
+  // Deauth sniffer with channel hopping
+  if (deauthSnifferActive && currentState == DEAUTH_SNIFFER_ACTIVE) {
+    static unsigned long lastChannelHop = 0;
+    static unsigned long lastSnifferUpdate = 0;
+    
+    // Fast channel hopping - 150ms per channel (optimal for deauth detection)
+    if (millis() - lastChannelHop > 150) {
+      snifferChannel = (snifferChannel % 13) + 1;  // Cycle 1-13
+      esp_wifi_set_channel(snifferChannel, WIFI_SECOND_CHAN_NONE);
+      lastChannelHop = millis();
+    }
+    
+    // Update display every 300ms
+    if (millis() - lastSnifferUpdate > 300) {
+      displayDeauthSnifferActive();
+      lastSnifferUpdate = millis();
+    }
+  }
+
+  // Rogue AP detector
+  if (rogueAPScanActive && currentState == ROGUE_AP_DETECTOR) {
+    processRogueAPScan();
+    
+    static unsigned long lastRogueDisplay = 0;
+    if (millis() - lastRogueDisplay > 1000) {
+      displayRogueAPDetector();
+      lastRogueDisplay = millis();
+    }
+  }
+
+  // Deauth flood
+  if (deauthFloodActive && currentState == WIFI_BLE_NRF_JAM) {
+    performDeauthFlood();
+    
+    static unsigned long lastFloodDisplay = 0;
+    if (millis() - lastFloodDisplay > 300) {
+      updateDeauthFloodDisplay();
+      lastFloodDisplay = millis();
+    }
+  }
+
+  // RF Capture
+  if (currentState == RF_CAPTURE && rfCaptureActive) {
+    performRFCapture();
+    
+    static unsigned long lastCaptureUpdate = 0;
+    if (millis() - lastCaptureUpdate > 500) {
+      drawRFCapture();
+      lastCaptureUpdate = millis();
     }
   }
   
@@ -5953,12 +5840,7 @@ void displayDeauthFlood() {
     tft.print("MODERATE");
   }
   
-  // Stop button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(75, backY + 3);
-  tft.print("[TAP] Stop");
+  drawCenteredButton("[STOP]", COLOR_RED);
 }
 
 // ==================== NEW: updateDeauthFloodDisplay() ====================
@@ -6210,12 +6092,7 @@ void displayHandshakeCapture() {
   tft.setTextColor(COLOR_CYAN);
   tft.printf("%d sec", runtime);
   
-  // Stop button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(75, backY + 3);
-  tft.print("[TAP] Stop");
+  drawCenteredButton("[STOP]", COLOR_RED);
 }
 
 void performBeaconFlood() {
@@ -6910,21 +6787,22 @@ void displayBLEScanResults() {
   
   // Scroll indicator (if needed)
   if (bleDeviceCount > MAX_ITEMS) {
-    int scrollY = SAFE_BOTTOM + 2;
-    tft.setTextColor(COLOR_DARK_GREEN);
-    tft.setTextSize(1);
-    tft.setCursor(70, scrollY);
-    tft.printf("Page %d/%d [Tap scroll]", 
-               (bleScrollOffset / MAX_ITEMS) + 1,
-               (bleDeviceCount + MAX_ITEMS - 1) / MAX_ITEMS);
+  int scrollY = SAFE_BOTTOM + 2;
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setTextSize(1);
+  
+  int currentPage = (bleScrollOffset / MAX_ITEMS) + 1;
+  int totalPages = (bleDeviceCount + MAX_ITEMS - 1) / MAX_ITEMS;
+  char scrollText[30];
+  sprintf(scrollText, "Page %d/%d [Tap scroll]", currentPage, totalPages);
+  int textWidth = strlen(scrollText) * 6;
+  int centerX = (240 - textWidth) / 2;
+  
+  tft.setCursor(centerX, scrollY);
+  tft.print(scrollText);
   }
   
-  // Back button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(75, backY + 3);
-  tft.print("[TAP] Stop");
+  drawCenteredButton("[STOP]", COLOR_RED);
 }
 
 // ==================== BLE JAMMER Functions ====================
@@ -7267,12 +7145,7 @@ void displayBLEJammerActive() {
   tft.setCursor(30, y);
   tft.print("random advertisements...");
   
-  // Back/Stop button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_DARK_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(70, backY + 3);
-  tft.print("[ESC] Stop & Back");
+  drawCenteredButton("[ESC]", COLOR_RED);
 }
 
 void updateBLEJammerDisplay() {
@@ -7363,9 +7236,9 @@ void updateBLEJammerDisplay() {
 void startNRFJammer() {
   if (nrfJammerActive) return;
   
-  Serial.println("\n╔════════════════════════════════════════╗");
+  Serial.println("\n╔═══════════════════════════════════════╗");
   Serial.println("║   nRF24 JAMMER - SMOOCHIEE METHOD    ║");
-  Serial.println("╚════════════════════════════════════════╝");
+  Serial.println("╚═══════════════════════════════════════╝");
   
   // ✅ CRITICAL: Stop ALL BLE operations first (SPI conflict!)
   if (bleJammerActive) {
@@ -7396,22 +7269,6 @@ void startNRFJammer() {
     delay(200);
   }
   
-  // ✅ ADD THIS: Reset radios if they were previously active
-  if (nrf1Available) {
-    radio1.stopConstCarrier();
-    radio1.powerDown();
-    delay(50);
-    radio1.powerUp();
-    delay(50);
-  }
-  if (nrf2Available) {
-    radio2.stopConstCarrier();
-    radio2.powerDown();
-    delay(50);
-    radio2.powerUp();
-    delay(50);
-  }
-  
   if (!nrf1Available && !nrf2Available) {
     showMessage("No nRF24 modules!", COLOR_WARNING);
     Serial.println("[✗] No nRF24 radios available!");
@@ -7420,31 +7277,42 @@ void startNRFJammer() {
   
   Serial.println("\n[*] Starting constant carrier transmission...");
   
+  // ✅ CRITICAL FIX: Use Smoochiee's initialization method
   if (nrf1Available) {
-    radio1.stopConstCarrier();  // Stop if already running
+    radio1.stopConstCarrier();
     delay(50);
-    radio1.setPALevel(RF24_PA_MAX); // Ensure MAX power
+    radio1.setAutoAck(false);
+    radio1.stopListening();
+    radio1.setRetries(0, 0);
+    radio1.setPALevel(RF24_PA_MAX, true);  // ← Note: true parameter!
+    radio1.setDataRate(RF24_2MBPS);
+    radio1.setCRCLength(RF24_CRC_DISABLED);
+    delay(50);
     
-    // Set initial channel based on mode
-    byte initial_ch1 = (nrfJamMode == NRF_WIFI_CLOWN) ? wifi_ch1_sweep[0] : hopping_channel[0];
+    byte initial_ch1 = (nrfJamMode == NRF_WIFI_CLOWN) ? wifi_ch1_sweep[0] : 2;
     radio1.startConstCarrier(RF24_PA_MAX, initial_ch1);
     delay(50);
     Serial.printf("    Radio 1: Carrier ON (Ch %d)\n", initial_ch1);
   }
   
   if (nrf2Available) {
-    radio2.stopConstCarrier();  // Stop if already running
+    radio2.stopConstCarrier();
     delay(50);
-    radio2.setPALevel(RF24_PA_MAX); // Ensure MAX power
+    radio2.setAutoAck(false);
+    radio2.stopListening();
+    radio2.setRetries(0, 0);
+    radio2.setPALevel(RF24_PA_MAX, true);  // ← Note: true parameter!
+    radio2.setDataRate(RF24_2MBPS);
+    radio2.setCRCLength(RF24_CRC_DISABLED);
+    delay(50);
     
-    // Set initial channel based on mode
-    byte initial_ch2 = (nrfJamMode == NRF_WIFI_CLOWN) ? wifi_ch1_sweep[3] : hopping_channel[ptr_hop2];
+    byte initial_ch2 = (nrfJamMode == NRF_WIFI_CLOWN) ? wifi_ch1_sweep[3] : 45;
     radio2.startConstCarrier(RF24_PA_MAX, initial_ch2);
     delay(50);
     Serial.printf("    Radio 2: Carrier ON (Ch %d)\n", initial_ch2);
   }
   
-  // Reset counters
+  // Reset counters and state
   nrfJammerActive = true;
   nrfTurboMode = true;
   nrfJamPackets = 0;
@@ -7454,24 +7322,22 @@ void startNRFJammer() {
   nrfLastStats = 0;
   lastChannelChange = millis();
   
-  // Reset sweep pattern to start position
+  // ✅ CRITICAL: Reset to Smoochiee's starting positions
   flag_radio1 = 0;
   flag_radio2 = 0;
-  nrf_ch1 = 2;
-  nrf_ch2 = 45;
+  nrf_ch1 = 2;    // Radio 1 starts low
+  nrf_ch2 = 45;   // Radio 2 starts mid (offset pattern)
   sweep_index_radio1 = 0;
   sweep_index_radio2 = 3;
   wifi_jam_mode = 0;
   
   currentState = NRF_JAM_ACTIVE;
   
-  // Show mode-specific info
   Serial.println("\n╔═══════════════════════════════════════╗");
   Serial.println("║         JAMMING STARTED!              ║");
   Serial.println("╚═══════════════════════════════════════╝");
   Serial.printf("Mode: %s\n", dualNRFMode ? "DUAL (2 radios)" : "SINGLE");
   
-  // Show jamming mode
   const char* modeName = "";
   switch (nrfJamMode) {
     case NRF_SWEEP:   
@@ -7498,19 +7364,12 @@ void startNRFJammer() {
       Serial.println("⚡ METHOD: Multi-channel sweep + Constant Carrier");
       Serial.println("⚡ Dwell: 20ms per channel (optimal)");
       Serial.println("⚡ Expected: WiFi networks DISAPPEAR");
-      Serial.println("");
-      Serial.println("🔥 WIFI CLOWN V2 REQUIREMENTS:");
-      Serial.println("   - PA+LNA modules (NOT basic nRF24!)");
-      Serial.println("   - 100µF capacitors on EACH module");
-      Serial.println("   - Heatsinks (gets HOT at max power)");
-      Serial.println("   - External 8dBi antennas (recommended)");
-      Serial.println("   - Test at 1-5 meters first");
       break;
   }
   
   Serial.println("\n⚡ TFT FROZEN - Stats to serial!");
   Serial.println("💡 TO STOP: Tap screen or type 'nrfjam'");
-  Serial.println("══════════════════════════════════════════\n");
+  Serial.println("═══════════════════════════════════════\n");
   
   displayNRFJammerActive();
   addToConsole("nRF24: " + String(modeName));
@@ -7707,13 +7566,7 @@ void displayNRFJammerActive() {
   tft.setTextColor(nrf2Available ? COLOR_GREEN : COLOR_RED);
   tft.println(nrf2Available ? "OK" : "OFF");
   
-  // Back button - CONSISTENT WITH OTHER SCREENS (y=305)
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setTextSize(1);
-  tft.setCursor(75, backY + 3);
-  tft.print("[TAP] Stop");
+  drawCenteredButton("[HOLD]", COLOR_RED);
 }
 
 void drawBLEJammerActive() {
@@ -7769,12 +7622,7 @@ void drawBLEJammerActive() {
   tft.setCursor(30, y);
   tft.print("random advertisements...");
   
-  // Back/Stop button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_DARK_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(70, backY + 3);
-  tft.print("[ESC] Stop & Back");
+  drawCenteredButton("[ESC]", COLOR_RED);
 }
 
 void updateNRFJammerDisplay() {
@@ -7936,12 +7784,7 @@ void displayCombinedJammer() {
   tft.setCursor(SIDE_MARGIN + 10, y);
   tft.print("Jamming BLE + 2.4GHz RF");
   
-  // Instructions
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(85, backY + 3);
-  tft.print("[ESC] Back");
+    drawCenteredButton("[ESC]", COLOR_RED);
 }
 
 // ==================== BLE Spam Functions ====================
@@ -8453,19 +8296,20 @@ void displayAirTagResults() {
       int scrollY = listY + (MAX_AIRTAG_DISPLAY * 26) + 5;
       tft.setTextColor(COLOR_DARK_GREEN);
       tft.setTextSize(1);
-      tft.setCursor(85, scrollY);
-      tft.printf("[%d-%d/%d]", 
-                 airtagScrollOffset + 1, 
-                 airtagScrollOffset + displayCount, 
-                 airTagCount);
+      
+      char scrollText[20];
+      sprintf(scrollText, "[%d-%d/%d]", 
+              airtagScrollOffset + 1, 
+              airtagScrollOffset + displayCount, 
+              airTagCount);
+      int textWidth = strlen(scrollText) * 6;
+      int centerX = (240 - textWidth) / 2;
+      
+      tft.setCursor(centerX, scrollY);
+      tft.print(scrollText);
     }
   }
-  // Back button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(85, backY + 3);
-  tft.print("[ESC] Back");
+    drawCenteredButton("[STOP]", COLOR_RED);
 }
 
 // ==================== Skimmer Detector ====================
@@ -8584,12 +8428,7 @@ void displaySkimmerResults() {
     }
   }
   
-  // Back button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(85, backY + 3);
-  tft.print("[ESC] Back");
+    drawCenteredButton("[STOP]", COLOR_RED);
 }
 
 // ==================== Wardriving ====================
@@ -8730,12 +8569,7 @@ void displayWardrivingResults() {
     tft.printf("RSSI: %d dBm", wardrivingStats.strongestRSSI);
   }
   
-  // Back button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(85, backY + 3);
-  tft.print("[ESC] Back");
+    drawCenteredButton("[STOP]", COLOR_RED);
 }
 
 // ==================== ROGUE AP DETECTOR FUNCTIONS ====================
@@ -8823,12 +8657,7 @@ void drawRFMenu() {
   tft.setCursor(SIDE_MARGIN, y);
   tft.println("Select RF module type");
   
-  // Back button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(85, backY + 3);
-  tft.print("[ESC] Back");
+    drawCenteredButton("[ESC]", COLOR_RED);
 }
 
 // ==================== DRAW RF TYPE MENU ====================
@@ -8876,12 +8705,7 @@ void drawRFTypeMenu() {
     tft.println("Status: Development");
   }
   
-  // Back button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(85, backY + 3);
-  tft.print("[ESC] Back");
+    drawCenteredButton("[ESC]", COLOR_RED);
 }
 
 // ==================== RF MONITOR WITH WAVE ANIMATION ====================
@@ -9360,29 +9184,29 @@ void drawRFCapture() {
         tft.setCursor(205, itemY);
         tft.printf("%3d", rssi);
       }
-      
       // Scroll indicator
       if (capturedSignalCount > MAX_ITEMS) {
         int scrollY = SAFE_BOTTOM + 2;
         tft.setTextColor(COLOR_DARK_GREEN);
         tft.setTextSize(1);
-        tft.setCursor(65, scrollY);
-        tft.printf("Page %d/%d [Tap scroll]", 
-                   (rfCaptureScrollOffset / MAX_ITEMS) + 1,
-                   (capturedSignalCount + MAX_ITEMS - 1) / MAX_ITEMS);
+        
+        int currentPage = (rogueScrollOffset / MAX_ITEMS) + 1;
+        int totalPages = (capturedSignalCount + MAX_ITEMS - 1) / MAX_ITEMS;
+        char scrollText[30];
+        sprintf(scrollText, "Page %d/%d [Tap scroll]", currentPage, totalPages);
+        int textWidth = strlen(scrollText) * 6;
+        int centerX = (240 - textWidth) / 2;
+        
+        tft.setCursor(centerX, scrollY);
+        tft.print(scrollText);
       }
     }
   }
   
-  // Back/Stop button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(75, backY + 3);
   if (rfCaptureActive) {
-    tft.print("[TAP] Stop");
+    drawCenteredButton("[STOP]", COLOR_RED);
   } else {
-    tft.print("[ESC] Back");
+    drawCenteredButton("[ESC]", COLOR_RED);
   }
 }
 
@@ -9563,12 +9387,7 @@ void drawRFReplay() {
     }
   }
   
-  // Back button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(85, backY + 3);
-  tft.print("[ESC] Back");
+    drawCenteredButton("[ESC]", COLOR_RED);
 }
 
 void replayRFSignal() {
@@ -9827,13 +9646,7 @@ void drawRFMonitorFresh() {
     tft.print("Channels: 2400-2525 MHz");
   }
   
-  // Back button (always at bottom)
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setTextSize(1);
-  tft.setCursor(75, backY + 3);
-  tft.print("[TAP] Stop");
+  drawCenteredButton("[STOP]", COLOR_RED);
 }
 
 // ==================== HANDLE RF CAPTURE TOUCH ====================
@@ -10269,10 +10082,16 @@ void displayRogueAPDetector() {
       int scrollY = SAFE_BOTTOM + 2;
       tft.setTextColor(COLOR_DARK_GREEN);
       tft.setTextSize(1);
-      tft.setCursor(70, scrollY);
-      tft.printf("Page %d/%d [Tap scroll]", 
-                 (rogueScrollOffset / MAX_ITEMS) + 1,
-                 (rogueAPCount + MAX_ITEMS - 1) / MAX_ITEMS);
+      
+      int currentPage = (rogueScrollOffset / MAX_ITEMS) + 1;
+      int totalPages = (rogueAPCount + MAX_ITEMS - 1) / MAX_ITEMS;
+      char scrollText[30];
+      sprintf(scrollText, "Page %d/%d [Tap scroll]", currentPage, totalPages);
+      int textWidth = strlen(scrollText) * 6;
+      int centerX = (240 - textWidth) / 2;
+      
+      tft.setCursor(centerX, scrollY);
+      tft.print(scrollText);
     }
   }
   
@@ -10287,12 +10106,7 @@ void displayRogueAPDetector() {
   tft.setCursor(SIDE_MARGIN, legendY);
   tft.print("DETC=Times seen");
   
-  // Back button
-  int backY = 305;
-  tft.drawFastHLine(0, backY - 2, 240, COLOR_GREEN);
-  tft.setTextColor(COLOR_RED);
-  tft.setCursor(75, backY + 3);
-  tft.print("[TAP] Stop");
+  drawCenteredButton("[STOP]", COLOR_RED);
 }
 
 // ==================== Serial Commands ====================
