@@ -392,6 +392,72 @@ unsigned long lastChannelScan = 0;
 // RF Replay
 int selectedSignalIndex = -1;
 
+// ==================== PROBE REQUEST SNIFFER ====================
+bool probeSnifferActive = false;
+uint32_t totalProbeRequests = 0;
+int probeScrollOffset = 0;
+
+struct ProbeRequest {
+  uint8_t clientMAC[6];
+  String ssid;
+  int8_t rssi;
+  uint8_t channel;
+  unsigned long timestamp;
+  uint16_t count;
+};
+
+ProbeRequest probeRequests[50];
+int probeRequestCount = 0;
+
+// ==================== MANAGEMENT FRAME SNIFFER ====================
+bool mgmtSnifferActive = false;
+uint32_t totalMgmtFrames = 0;
+uint32_t authFrames = 0;
+uint32_t assocFrames = 0;
+uint32_t probeFrames = 0;
+uint32_t otherMgmtFrames = 0;
+int mgmtScrollOffset = 0;
+
+struct MgmtFrame {
+  uint8_t type;
+  uint8_t subtype;
+  uint8_t sourcMAC[6];
+  uint8_t destMAC[6];
+  int8_t rssi;
+  uint8_t channel;
+  unsigned long timestamp;
+  String description;
+};
+
+MgmtFrame mgmtFrames[50];
+int mgmtFrameCount = 0;
+
+// ==================== BEACON ANALYZER ====================
+bool beaconAnalyzerActive = false;
+uint32_t totalBeacons = 0;
+int beaconScrollOffset = 0;
+int selectedBeaconIndex = -1;
+
+struct BeaconInfo {
+  String ssid;
+  uint8_t bssid[6];
+  uint8_t channel;
+  int8_t rssi;
+  uint8_t encryptionType;
+  bool wpsEnabled;
+  bool wmmEnabled;
+  String vendor;
+  uint16_t beaconInterval;
+  uint32_t beaconCount;
+  unsigned long firstSeen;
+  unsigned long lastSeen;
+  uint8_t capabilities[2];
+  uint8_t supportedRates[8];
+  uint8_t numRates;
+};
+
+BeaconInfo beacons[30];
+
 // ==================== MENU STATES ====================
 enum MenuState {
   BOOT_ANIMATION,
@@ -415,6 +481,10 @@ enum MenuState {
   RF_CAPTURE,
   RF_REPLAY,
   // ⬆️ END OF NEW LINES
+  PROBE_SNIFFER_ACTIVE,
+  MGMT_SNIFFER_ACTIVE,
+  BEACON_ANALYZER_ACTIVE,
+  BLE_SNIFFER_ACTIVE,
   NRF_JAM_MENU,
   NRF_JAM_ACTIVE,
   WIFI_BLE_NRF_JAM,
@@ -612,6 +682,29 @@ int bleScrollOffset = 0;
 int airtagScrollOffset = 0;
 int skimmerScrollOffset = 0;
 
+// ==================== BLE FRAME SNIFFER WITH DEVICE DETECTION ====================
+bool bleSnifferActive = false;
+uint32_t bleFrameCount = 0;
+uint32_t bleAdvCount = 0;
+uint32_t bleConnCount = 0;
+uint32_t bleScanReqCount = 0;
+int bleSnifferScrollOffset = 0;
+
+struct BLEFrameInfo {
+  uint8_t type;        // 0=ADV, 1=SCAN_REQ, 2=CONN_REQ, 3=DATA
+  uint8_t addr[6];
+  int8_t rssi;
+  uint8_t dataLen;
+  uint8_t data[31];
+  unsigned long timestamp;
+  String description;
+  String deviceType;   // ← NEW: Device type identification
+};
+
+#define MAX_BLE_FRAMES 50
+BLEFrameInfo bleFrames[MAX_BLE_FRAMES];
+int bleFrameIndex = 0;
+
 // ==================== SCREEN SIZE ====================
 #define SCREEN_WIDTH 240
 #define SCREEN_HEIGHT 320
@@ -704,6 +797,1300 @@ void drawCenteredButton(const char* text, uint16_t color = COLOR_RED, int y = 30
   tft.print(text);
 }
 
+// ==================== PROBE REQUEST SNIFFER CALLBACK ====================
+void IRAM_ATTR probeSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+  wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t*)buf;
+  
+  if (type != WIFI_PKT_MGMT) return;
+  
+  uint8_t frameType = pkt->payload[0];
+  uint8_t frameSubtype = (frameType & 0xF0) >> 4;
+  
+  // Only process Probe Request frames (subtype 0x04)
+  if (frameSubtype != 0x04) return;
+  
+  SAFE_INCREMENT(totalProbeRequests);
+  
+  // Extract client MAC (source address)
+  uint8_t clientMAC[6];
+  memcpy(clientMAC, &pkt->payload[10], 6);
+  
+  // Extract SSID from frame body
+  int ssidLen = 0;
+  String ssid = "";
+  
+  if (pkt->rx_ctrl.sig_len > 26) {
+    // SSID starts at offset 26 (after management frame header)
+    // Format: [Tag Number (0x00)][Length][SSID bytes...]
+    if (pkt->payload[24] == 0x00) {
+      ssidLen = pkt->payload[25];
+      if (ssidLen > 0 && ssidLen <= 32 && (26 + ssidLen) < pkt->rx_ctrl.sig_len) {
+        char ssidBuf[33] = {0};
+        memcpy(ssidBuf, &pkt->payload[26], ssidLen);
+        ssid = String(ssidBuf);
+      }
+    }
+  }
+  
+  if (ssid.length() == 0) return; // Skip broadcast probes
+  
+  // Check if this client already exists
+  bool found = false;
+  for (int i = 0; i < probeRequestCount; i++) {
+    if (memcmp(probeRequests[i].clientMAC, clientMAC, 6) == 0 && 
+        probeRequests[i].ssid == ssid) {
+      probeRequests[i].count++;
+      probeRequests[i].timestamp = millis();
+      probeRequests[i].rssi = pkt->rx_ctrl.rssi;
+      found = true;
+      break;
+    }
+  }
+  
+  // Add new probe request
+  if (!found && probeRequestCount < 50) {
+    ProbeRequest* pr = &probeRequests[probeRequestCount];
+    memcpy(pr->clientMAC, clientMAC, 6);
+    pr->ssid = ssid;
+    pr->rssi = pkt->rx_ctrl.rssi;
+    pr->channel = pkt->rx_ctrl.channel;
+    pr->timestamp = millis();
+    pr->count = 1;
+    probeRequestCount++;
+  }
+}
+
+// ==================== MANAGEMENT FRAME SNIFFER CALLBACK ====================
+void IRAM_ATTR mgmtSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+  wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t*)buf;
+  
+  if (type != WIFI_PKT_MGMT) return;
+  
+  uint8_t frameType = pkt->payload[0];
+  uint8_t frameSubtype = (frameType & 0xF0) >> 4;
+  
+  SAFE_INCREMENT(totalMgmtFrames);
+  
+  // Count frame types
+  if (frameSubtype == 0x0B) {
+    SAFE_INCREMENT(authFrames);
+  } else if (frameSubtype == 0x00 || frameSubtype == 0x01) {
+    SAFE_INCREMENT(assocFrames);
+  } else if (frameSubtype == 0x04 || frameSubtype == 0x05) {
+    SAFE_INCREMENT(probeFrames);
+  } else {
+    SAFE_INCREMENT(otherMgmtFrames);
+  }
+  
+  // Store frame details
+  if (mgmtFrameCount < 50) {
+    MgmtFrame* frame = &mgmtFrames[mgmtFrameCount];
+    frame->type = frameType;
+    frame->subtype = frameSubtype;
+    memcpy(frame->sourcMAC, &pkt->payload[10], 6);
+    memcpy(frame->destMAC, &pkt->payload[4], 6);
+    frame->rssi = pkt->rx_ctrl.rssi;
+    frame->channel = pkt->rx_ctrl.channel;
+    frame->timestamp = millis();
+    
+    // Generate description
+    switch (frameSubtype) {
+      case 0x00: frame->description = "Assoc Req"; break;
+      case 0x01: frame->description = "Assoc Resp"; break;
+      case 0x02: frame->description = "Reassoc Req"; break;
+      case 0x03: frame->description = "Reassoc Resp"; break;
+      case 0x04: frame->description = "Probe Req"; break;
+      case 0x05: frame->description = "Probe Resp"; break;
+      case 0x08: frame->description = "Beacon"; break;
+      case 0x0A: frame->description = "Disassoc"; break;
+      case 0x0B: frame->description = "Auth"; break;
+      case 0x0C: frame->description = "Deauth"; break;
+      case 0x0D: frame->description = "Action"; break;
+      default: frame->description = "Unknown"; break;
+    }
+    
+    mgmtFrameCount++;
+  } else {
+    // Circular buffer
+    mgmtFrameCount = 0;
+  }
+}
+
+// ==================== BEACON ANALYZER CALLBACK ====================
+void IRAM_ATTR beaconAnalyzerCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+  wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t*)buf;
+  
+  if (type != WIFI_PKT_MGMT) return;
+  
+  uint8_t frameType = pkt->payload[0];
+  uint8_t frameSubtype = (frameType & 0xF0) >> 4;
+  
+  // Only process Beacon frames (subtype 0x08)
+  if (frameSubtype != 0x08) return;
+  
+  SAFE_INCREMENT(totalBeacons);
+  
+  // Extract BSSID
+  uint8_t bssid[6];
+  memcpy(bssid, &pkt->payload[16], 6);
+  
+  // Check if beacon already exists
+  int existingIndex = -1;
+  for (int i = 0; i < beaconCount; i++) {
+    if (memcmp(beacons[i].bssid, bssid, 6) == 0) {
+      existingIndex = i;
+      break;
+    }
+  }
+  
+  if (existingIndex >= 0) {
+    // Update existing beacon
+    beacons[existingIndex].beaconCount++;
+    beacons[existingIndex].lastSeen = millis();
+    beacons[existingIndex].rssi = pkt->rx_ctrl.rssi;
+    return;
+  }
+  
+  // Add new beacon
+  if (beaconCount >= 30) return;
+  
+  BeaconInfo* beacon = &beacons[beaconCount];
+  memcpy(beacon->bssid, bssid, 6);
+  beacon->channel = pkt->rx_ctrl.channel;
+  beacon->rssi = pkt->rx_ctrl.rssi;
+  beacon->beaconCount = 1;
+  beacon->firstSeen = millis();
+  beacon->lastSeen = millis();
+  
+  // Parse beacon frame body (starts at offset 36)
+  int offset = 36;
+  
+  // Extract capability info
+  memcpy(beacon->capabilities, &pkt->payload[34], 2);
+  
+  // Parse Information Elements
+  beacon->wpsEnabled = false;
+  beacon->wmmEnabled = false;
+  beacon->encryptionType = 0;
+  beacon->numRates = 0;
+  
+  while (offset < pkt->rx_ctrl.sig_len - 2) {
+    uint8_t tagNum = pkt->payload[offset];
+    uint8_t tagLen = pkt->payload[offset + 1];
+    
+    if (tagLen == 0 || offset + 2 + tagLen > pkt->rx_ctrl.sig_len) break;
+    
+    switch (tagNum) {
+      case 0x00: // SSID
+        if (tagLen > 0 && tagLen <= 32) {
+          char ssidBuf[33] = {0};
+          memcpy(ssidBuf, &pkt->payload[offset + 2], tagLen);
+          beacon->ssid = String(ssidBuf);
+        }
+        break;
+        
+      case 0x01: // Supported Rates
+        beacon->numRates = min(8, (int)tagLen);
+        memcpy(beacon->supportedRates, &pkt->payload[offset + 2], beacon->numRates);
+        break;
+        
+      case 0x30: // RSN (WPA2)
+        beacon->encryptionType = 2;
+        break;
+        
+      case 0xDD: // Vendor Specific
+        if (tagLen >= 4) {
+          // Check for WPA (vendor OUI 00:50:F2:01)
+          if (pkt->payload[offset + 2] == 0x00 && 
+              pkt->payload[offset + 3] == 0x50 &&
+              pkt->payload[offset + 4] == 0xF2 &&
+              pkt->payload[offset + 5] == 0x01) {
+            if (beacon->encryptionType == 0) beacon->encryptionType = 1;
+          }
+          // Check for WPS (vendor OUI 00:50:F2:04)
+          if (pkt->payload[offset + 2] == 0x00 && 
+              pkt->payload[offset + 3] == 0x50 &&
+              pkt->payload[offset + 4] == 0xF2 &&
+              pkt->payload[offset + 5] == 0x04) {
+            beacon->wpsEnabled = true;
+          }
+          // Check for WMM (vendor OUI 00:50:F2:02)
+          if (pkt->payload[offset + 2] == 0x00 && 
+              pkt->payload[offset + 3] == 0x50 &&
+              pkt->payload[offset + 4] == 0xF2 &&
+              pkt->payload[offset + 5] == 0x02) {
+            beacon->wmmEnabled = true;
+          }
+        }
+        break;
+    }
+    
+    offset += 2 + tagLen;
+  }
+  
+  // Identify vendor from OUI
+  beacon->vendor = identifyVendor(bssid);
+  
+  // Extract beacon interval (in TUs, 1 TU = 1024 microseconds)
+  beacon->beaconInterval = pkt->payload[32] | (pkt->payload[33] << 8);
+  
+  beaconCount++;
+}
+
+// ==================== VENDOR IDENTIFICATION ====================
+String identifyVendor(uint8_t* mac) {
+  // Check first 3 bytes (OUI) against known vendors
+  uint32_t oui = (mac[0] << 16) | (mac[1] << 8) | mac[2];
+  
+  switch (oui) {
+    case 0x001B63: return "Apple";
+    case 0x7C5CF2: return "Apple";
+    case 0x00036D: return "Cisco";
+    case 0x001CF0: return "Cisco";
+    case 0x00259E: return "Netgear";
+    case 0x002275: return "Netgear";
+    case 0x0024D4: return "Linksys";
+    case 0x68EC5A: return "TP-Link";
+    case 0x00E04C: return "Broadcom";
+    case 0x001DD8: return "Microsoft";
+    case 0x00037A: return "Atheros";
+    case 0x00215D: return "Ubiquiti";
+    case 0xDC9FDB: return "Google";
+    case 0x74DA38: return "Amazon";
+    default: return "Unknown";
+  }
+}
+
+// ==================== PROBE REQUEST SNIFFER ====================
+void startProbeRequestSniffer() {
+  probeSnifferActive = true;
+  probeRequestCount = 0;
+  totalProbeRequests = 0;
+  probeScrollOffset = 0;
+  snifferChannel = 1;
+  
+  WiFi.disconnect();
+  WiFi.mode(WIFI_STA);
+  delay(100);
+  
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_promiscuous_rx_cb(&probeSnifferCallback);
+  esp_wifi_set_channel(snifferChannel, WIFI_SECOND_CHAN_NONE);
+  
+  addToConsole("Probe sniffer started");
+  Serial.println("[+] Probe Request Sniffer started - Fast channel hop");
+  
+  displayProbeRequestSniffer();
+}
+
+void stopProbeRequestSniffer() {
+  probeSnifferActive = false;
+  esp_wifi_set_promiscuous(false);
+  addToConsole("Probe sniffer stopped");
+  Serial.printf("[+] Probe sniffer stopped - %d requests captured\n", totalProbeRequests);
+}
+
+// ==================== MANAGEMENT FRAME SNIFFER ====================
+void startManagementFrameSniffer() {
+  mgmtSnifferActive = true;
+  mgmtFrameCount = 0;
+  totalMgmtFrames = 0;
+  authFrames = 0;
+  assocFrames = 0;
+  probeFrames = 0;
+  otherMgmtFrames = 0;
+  mgmtScrollOffset = 0;
+  snifferChannel = 1;
+  
+  WiFi.disconnect();
+  WiFi.mode(WIFI_STA);
+  delay(100);
+  
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_promiscuous_rx_cb(&mgmtSnifferCallback);
+  esp_wifi_set_channel(snifferChannel, WIFI_SECOND_CHAN_NONE);
+  
+  addToConsole("Mgmt sniffer started");
+  Serial.println("[+] Management Frame Sniffer started - Deep analysis mode");
+  
+  displayManagementFrameSniffer();
+}
+
+void stopManagementFrameSniffer() {
+  mgmtSnifferActive = false;
+  esp_wifi_set_promiscuous(false);
+  addToConsole("Mgmt sniffer stopped");
+  Serial.printf("[+] Mgmt sniffer stopped - %d frames captured\n", totalMgmtFrames);
+}
+
+// ==================== BEACON ANALYZER ====================
+void startBeaconAnalyzer() {
+  beaconAnalyzerActive = true;
+  beaconCount = 0;
+  totalBeacons = 0;
+  beaconScrollOffset = 0;
+  selectedBeaconIndex = -1;
+  snifferChannel = 1;
+  
+  WiFi.disconnect();
+  WiFi.mode(WIFI_STA);
+  delay(100);
+  
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_promiscuous_rx_cb(&beaconAnalyzerCallback);
+  esp_wifi_set_channel(snifferChannel, WIFI_SECOND_CHAN_NONE);
+  
+  addToConsole("Beacon analyzer started");
+  Serial.println("[+] Beacon Analyzer started - Comprehensive AP analysis");
+  
+  displayBeaconAnalyzer();
+}
+
+void stopBeaconAnalyzer() {
+  beaconAnalyzerActive = false;
+  esp_wifi_set_promiscuous(false);
+  addToConsole("Beacon analyzer stopped");
+  Serial.printf("[+] Beacon analyzer stopped - %d APs found\n", beaconCount);
+}
+
+// ==================== DISPLAY PROBE REQUEST SNIFFER ====================
+void displayProbeRequestSniffer() {
+  tft.fillScreen(COLOR_BG);
+  drawTerminalHeader("probe req sniffer");
+  
+  // Live indicator
+  static bool blink = false;
+  blink = !blink;
+  tft.fillCircle(220, 12, 3, blink ? COLOR_CYAN : COLOR_DARK_GREEN);
+  
+  // Stats bar
+  int statsY = HEADER_HEIGHT + 5;
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(SIDE_MARGIN, statsY);
+  tft.printf("Ch%d", snifferChannel);
+  
+  tft.setTextColor(COLOR_CYAN);
+  tft.setCursor(50, statsY);
+  tft.printf("Devices:%d", probeRequestCount);
+  
+  tft.setTextColor(COLOR_YELLOW);
+  tft.setCursor(140, statsY);
+  tft.printf("Total:%d", totalProbeRequests);
+  
+  // Column headers
+  int listY = HEADER_HEIGHT + 22;
+  tft.drawFastHLine(0, listY - 3, 240, COLOR_DARK_GREEN);
+  
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, listY);
+  tft.print("CLIENT");
+  tft.setCursor(100, listY);
+  tft.print("SSID");
+  tft.setCursor(195, listY);
+  tft.print("CNT");
+  
+  tft.drawFastHLine(0, listY + 12, 240, COLOR_DARK_GREEN);
+  listY += 15;
+  
+  // Calculate display area
+  const int FOOTER_Y = 270;
+  const int ITEM_HEIGHT = 26;
+  const int MAX_ITEMS = (FOOTER_Y - listY) / ITEM_HEIGHT;
+  
+  if (probeRequestCount == 0) {
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_TEXT);
+    tft.setCursor(SIDE_MARGIN, listY + 40);
+    tft.print("Waiting for probe requests...");
+  } else {
+    int displayCount = min(probeRequestCount - probeScrollOffset, MAX_ITEMS);
+    
+    for (int i = 0; i < displayCount; i++) {
+      int idx = probeScrollOffset + i;
+      int y = listY + (i * ITEM_HEIGHT);
+      
+      ProbeRequest* pr = &probeRequests[idx];
+      
+      // Client MAC (first 3 octets)
+      tft.setTextColor(COLOR_CYAN);
+      tft.setTextSize(1);
+      tft.setCursor(SIDE_MARGIN, y + 2);
+      tft.printf("%02X:%02X:%02X", pr->clientMAC[0], pr->clientMAC[1], pr->clientMAC[2]);
+      
+      // SSID
+      tft.setTextColor(COLOR_TEXT);
+      tft.setCursor(100, y + 2);
+      String displaySSID = pr->ssid;
+      if (displaySSID.length() > 12) displaySSID = displaySSID.substring(0, 11) + "~";
+      tft.print(displaySSID);
+      
+      // Count
+      tft.setTextColor(COLOR_YELLOW);
+      tft.setCursor(195, y + 2);
+      tft.printf("%3d", pr->count);
+      
+      // Full MAC on second line
+      tft.setTextColor(COLOR_DARK_GREEN);
+      tft.setCursor(SIDE_MARGIN, y + 12);
+      tft.printf("%02X:%02X:%02X:%02X:%02X:%02X", 
+                 pr->clientMAC[0], pr->clientMAC[1], pr->clientMAC[2],
+                 pr->clientMAC[3], pr->clientMAC[4], pr->clientMAC[5]);
+    }
+    
+    // Scroll indicator
+    if (probeRequestCount > MAX_ITEMS) {
+      tft.setTextColor(COLOR_DARK_GREEN);
+      tft.setCursor(80, FOOTER_Y);
+      int currentPage = (probeScrollOffset / MAX_ITEMS) + 1;
+      int totalPages = (probeRequestCount + MAX_ITEMS - 1) / MAX_ITEMS;
+      tft.printf("Page %d/%d", currentPage, totalPages);
+    }
+  }
+  
+  drawCenteredButton("[STOP]", COLOR_RED, 305);
+}
+
+// ==================== DISPLAY MANAGEMENT FRAME SNIFFER ====================
+void displayManagementFrameSniffer() {
+  tft.fillScreen(COLOR_BG);
+  drawTerminalHeader("mgmt frame sniffer");
+  
+  // Live indicator
+  static bool blink = false;
+  blink = !blink;
+  tft.fillCircle(220, 12, 3, blink ? COLOR_PURPLE : COLOR_DARK_GREEN);
+  
+  // Stats bar
+  int statsY = HEADER_HEIGHT + 5;
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(SIDE_MARGIN, statsY);
+  tft.printf("Ch%d", snifferChannel);
+  
+  tft.setTextColor(COLOR_CYAN);
+  tft.setCursor(50, statsY);
+  tft.printf("Auth:%d", authFrames);
+  
+  tft.setTextColor(COLOR_YELLOW);
+  tft.setCursor(110, statsY);
+  tft.printf("Assoc:%d", assocFrames);
+  
+  tft.setTextColor(COLOR_GREEN);
+  tft.setCursor(175, statsY);
+  tft.printf("Prb:%d", probeFrames);
+  
+  // Column headers
+  int listY = HEADER_HEIGHT + 22;
+  tft.drawFastHLine(0, listY - 3, 240, COLOR_DARK_GREEN);
+  
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, listY);
+  tft.print("TYPE");
+  tft.setCursor(70, listY);
+  tft.print("SOURCE");
+  tft.setCursor(145, listY);
+  tft.print("DEST");
+  tft.setCursor(205, listY);
+  tft.print("PWR");
+  
+  tft.drawFastHLine(0, listY + 12, 240, COLOR_DARK_GREEN);
+  listY += 15;
+  
+  // Calculate display area
+  const int FOOTER_Y = 270;
+  const int ITEM_HEIGHT = 24;
+  const int MAX_ITEMS = (FOOTER_Y - listY) / ITEM_HEIGHT;
+  
+  if (mgmtFrameCount == 0) {
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_TEXT);
+    tft.setCursor(SIDE_MARGIN, listY + 40);
+    tft.print("Waiting for mgmt frames...");
+  } else {
+    int displayCount = min(mgmtFrameCount - mgmtScrollOffset, MAX_ITEMS);
+    
+    for (int i = 0; i < displayCount; i++) {
+      int idx = mgmtFrameCount - 1 - mgmtScrollOffset - i; // Reverse order
+      if (idx < 0) continue;
+      
+      int y = listY + (i * ITEM_HEIGHT);
+      
+      MgmtFrame* frame = &mgmtFrames[idx];
+      
+      // Frame type
+      uint16_t typeColor = COLOR_TEXT;
+      if (frame->subtype == 0x0B) typeColor = COLOR_CYAN; // Auth
+      else if (frame->subtype == 0x00 || frame->subtype == 0x01) typeColor = COLOR_YELLOW; // Assoc
+      else if (frame->subtype == 0x04 || frame->subtype == 0x05) typeColor = COLOR_GREEN; // Probe
+      
+      tft.setTextColor(typeColor);
+      tft.setTextSize(1);
+      tft.setCursor(SIDE_MARGIN, y + 4);
+      String desc = frame->description;
+      if (desc.length() > 8) desc = desc.substring(0, 7) + "~";
+      tft.print(desc);
+      
+      // Source MAC (last 3 octets)
+      tft.setTextColor(COLOR_CYAN);
+      tft.setCursor(70, y + 4);
+      tft.printf("%02X:%02X:%02X", 
+                 frame->sourcMAC[3], frame->sourcMAC[4], frame->sourcMAC[5]);
+      
+      // Dest MAC (last 3 octets)
+      tft.setTextColor(COLOR_YELLOW);
+      tft.setCursor(145, y + 4);
+      tft.printf("%02X:%02X:%02X", 
+                 frame->destMAC[3], frame->destMAC[4], frame->destMAC[5]);
+      
+      // RSSI
+      tft.setTextColor(frame->rssi > -50 ? COLOR_GREEN : COLOR_RED);
+      tft.setCursor(205, y + 4);
+      tft.printf("%3d", frame->rssi);
+    }
+    
+    // Scroll indicator
+    if (mgmtFrameCount > MAX_ITEMS) {
+      tft.setTextColor(COLOR_DARK_GREEN);
+      tft.setCursor(80, FOOTER_Y);
+      int currentPage = (mgmtScrollOffset / MAX_ITEMS) + 1;
+      int totalPages = (mgmtFrameCount + MAX_ITEMS - 1) / MAX_ITEMS;
+      tft.printf("Page %d/%d", currentPage, totalPages);
+    }
+  }
+  
+  drawCenteredButton("[STOP]", COLOR_RED, 305);
+}
+
+// ==================== DEVICE TYPE IDENTIFICATION ====================
+String identifyBLEDevice(BLEAdvertisedDevice* device, uint8_t* payload, uint8_t payloadLen) {
+  // Check for Apple devices (Company ID 0x004C)
+  if (payloadLen > 4) {
+    for (int i = 0; i < payloadLen - 4; i++) {
+      if (payload[i] == 0xFF && payload[i+1] == 0x4C && payload[i+2] == 0x00) {
+        uint8_t appleType = payload[i+3];
+        
+        // Apple device type identification
+        if (appleType == 0x02) return "iPhone";
+        if (appleType == 0x09) return "AirPods";
+        if (appleType == 0x0A) return "AirPodsPro";
+        if (appleType == 0x0E) return "AirPodsMax";
+        if (appleType == 0x07) return "AirTag";
+        if (appleType == 0x10) return "AppleWatch";
+        if (appleType == 0x12) return "HomePod";
+        if (appleType == 0x01) return "iPad";
+        if (appleType == 0x03) return "MacBook";
+        
+        return "Apple";
+      }
+    }
+  }
+  
+  // Check for Microsoft devices (Company ID 0x0006)
+  if (payloadLen > 4) {
+    for (int i = 0; i < payloadLen - 4; i++) {
+      if (payload[i] == 0xFF && payload[i+1] == 0x06 && payload[i+2] == 0x00) {
+        return "Microsoft";
+      }
+    }
+  }
+  
+  // Check for Samsung devices (Company ID 0x0075)
+  if (payloadLen > 4) {
+    for (int i = 0; i < payloadLen - 4; i++) {
+      if (payload[i] == 0xFF && payload[i+1] == 0x75 && payload[i+2] == 0x00) {
+        return "Samsung";
+      }
+    }
+  }
+  
+  // Check for Google devices (Company ID 0x00E0)
+  if (payloadLen > 4) {
+    for (int i = 0; i < payloadLen - 4; i++) {
+      if (payload[i] == 0xFF && payload[i+1] == 0xE0 && payload[i+2] == 0x00) {
+        return "Google";
+      }
+    }
+  }
+  
+  // Check for Xiaomi devices (Company ID 0x0157)
+  if (payloadLen > 4) {
+    for (int i = 0; i < payloadLen - 4; i++) {
+      if (payload[i] == 0xFF && payload[i+1] == 0x57 && payload[i+2] == 0x01) {
+        return "Xiaomi";
+      }
+    }
+  }
+  
+  // Check device name for common patterns
+  if (device->haveName()) {
+    String name = device->getName().c_str();
+    name.toLowerCase();
+    
+    if (name.indexOf("airpods") >= 0) return "AirPods";
+    if (name.indexOf("airtag") >= 0) return "AirTag";
+    if (name.indexOf("watch") >= 0) return "Smartwatch";
+    if (name.indexOf("buds") >= 0) return "Earbuds";
+    if (name.indexOf("galaxy") >= 0) return "Samsung";
+    if (name.indexOf("pixel") >= 0) return "Google";
+    if (name.indexOf("mi ") >= 0 || name.indexOf("redmi") >= 0) return "Xiaomi";
+    if (name.indexOf("tile") >= 0) return "Tile";
+    if (name.indexOf("fitbit") >= 0) return "Fitbit";
+    if (name.indexOf("garmin") >= 0) return "Garmin";
+    if (name.indexOf("hc-") >= 0) return "HC-Module";
+    if (name.indexOf("esp") >= 0) return "ESP32";
+    if (name.indexOf("arduino") >= 0) return "Arduino";
+  }
+  
+  // Check for service UUIDs (common device types)
+  if (device->haveServiceUUID()) {
+    BLEUUID serviceUUID = device->getServiceUUID();
+    String uuidStr = serviceUUID.toString().c_str();
+    
+    // Heart Rate Service
+    if (uuidStr.indexOf("180d") >= 0) return "HR-Monitor";
+    
+    // Battery Service
+    if (uuidStr.indexOf("180f") >= 0) return "Battery";
+    
+    // Device Information
+    if (uuidStr.indexOf("180a") >= 0) return "BLE-Device";
+    
+    // Nordic UART (common in dev boards)
+    if (uuidStr.indexOf("6e40") >= 0) return "Nordic-UART";
+    
+    // HID (keyboards, mice)
+    if (uuidStr.indexOf("1812") >= 0) return "HID-Device";
+  }
+  
+  // Default based on RSSI (proximity guess)
+  if (device->getRSSI() > -40) {
+    return "Unknown*"; // Very close device
+  }
+  
+  return "Unknown";
+}
+
+class BLESnifferCallback : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice advertisedDevice) {
+    if (bleFrameIndex >= MAX_BLE_FRAMES) {
+      bleFrameIndex = 0; // Circular buffer
+    }
+    
+    BLEFrameInfo* frame = &bleFrames[bleFrameIndex];
+    
+    // Extract address
+    std::string addrStr = advertisedDevice.getAddress().toString();
+    sscanf(addrStr.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+           &frame->addr[0], &frame->addr[1], &frame->addr[2],
+           &frame->addr[3], &frame->addr[4], &frame->addr[5]);
+    
+    frame->rssi = advertisedDevice.getRSSI();
+    frame->timestamp = millis();
+    
+    // Get payload data
+    uint8_t* payload = advertisedDevice.getPayload();
+    frame->dataLen = advertisedDevice.getPayloadLength();
+    if (frame->dataLen > 31) frame->dataLen = 31;
+    memcpy(frame->data, payload, frame->dataLen);
+    
+    // Identify device type
+    frame->deviceType = identifyBLEDevice(&advertisedDevice, payload, frame->dataLen);
+    
+    // Determine frame type - ALWAYS 3 LETTERS
+    if (advertisedDevice.haveServiceUUID() || advertisedDevice.haveName()) {
+      frame->type = 0;
+      frame->description = "ADV";
+      bleAdvCount++;
+    } else {
+      frame->type = 1;
+      frame->description = "REQ";
+      bleScanReqCount++;
+    }
+    
+    bleFrameIndex++;
+    bleFrameCount++;
+  }
+};
+
+void startBLEFrameSniffer() {
+  bleSnifferActive = true;
+  bleFrameCount = 0;
+  bleAdvCount = 0;
+  bleConnCount = 0;
+  bleScanReqCount = 0;
+  bleSnifferScrollOffset = 0;
+  bleFrameIndex = 0;
+  
+  // Stop conflicting operations
+  if (nrfJammerActive) {
+    Serial.println("[*] Pausing nRF24 for BLE...");
+    nrfJammerActive = false;
+    delay(100);
+  }
+  
+  if (BLEDevice::getInitialized()) {
+    BLEDevice::deinit(true);
+    delay(200);
+  }
+  
+  BLEDevice::init("");
+  pBLEScan = BLEDevice::getScan();
+  pBLEScan->setAdvertisedDeviceCallbacks(new BLESnifferCallback());
+  pBLEScan->setActiveScan(true);
+  pBLEScan->setInterval(100);
+  pBLEScan->setWindow(99);
+  
+  addToConsole("BLE sniffer started");
+  Serial.println("[+] BLE Frame Sniffer started");
+  Serial.println("    Device identification enabled");
+  
+  displayBLEFrameSniffer();
+  
+  pBLEScan->start(0, nullptr, false);
+}
+
+void stopBLEFrameSniffer() {
+  bleSnifferActive = false;
+  
+  if (pBLEScan != nullptr) {
+    pBLEScan->stop();
+  }
+  
+  if (BLEDevice::getInitialized()) {
+    BLEDevice::deinit(false);
+    delay(200);
+  }
+  
+  Serial.printf("[+] BLE sniffer stopped - %d frames captured\n", bleFrameCount);
+  addToConsole("BLE sniffer stopped");
+}
+
+void displayBLEFrameSniffer() {
+  tft.fillScreen(COLOR_BG);
+  drawTerminalHeader("ble frame sniffer");
+  
+  // Live indicator
+  static bool blink = false;
+  blink = !blink;
+  tft.fillCircle(220, 12, 3, blink ? COLOR_CYAN : COLOR_DARK_GREEN);
+  
+  // Stats bar - COMPACT
+  int statsY = HEADER_HEIGHT + 5;
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(SIDE_MARGIN, statsY);
+  tft.printf("Total:%d", bleFrameCount);
+  
+  tft.setTextColor(COLOR_GREEN);
+  tft.setCursor(80, statsY);
+  tft.printf("ADV:%d", bleAdvCount);
+  
+  tft.setTextColor(COLOR_YELLOW);
+  tft.setCursor(140, statsY);
+  tft.printf("REQ:%d", bleScanReqCount);
+  
+  // Column headers - UPDATED POSITIONS WITH MORE SPACING
+  int listY = HEADER_HEIGHT + 22;
+  tft.drawFastHLine(0, listY - 3, 240, COLOR_DARK_GREEN);
+  
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, listY);
+  tft.print("TY");              // Type (3 chars max)
+  tft.setCursor(30, listY);     // ← Changed from 24 to 30 (+6px spacing)
+  tft.print("ADDRESS");         
+  tft.setCursor(100, listY);    
+  tft.print("DEVICE");          
+  tft.setCursor(165, listY);    
+  tft.print("RSSI");            
+  tft.setCursor(205, listY);    
+  tft.print("LEN");             
+  
+  tft.drawFastHLine(0, listY + 12, 240, COLOR_DARK_GREEN);
+  listY += 15;
+  
+  // Calculate safe display area
+  const int FOOTER_Y = 270;
+  const int ITEM_HEIGHT = 30;
+  const int MAX_ITEMS = (FOOTER_Y - listY) / ITEM_HEIGHT;
+  
+  if (bleFrameCount == 0) {
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_TEXT);
+    tft.setCursor(SIDE_MARGIN, listY + 40);
+    tft.print("Waiting for BLE frames...");
+    
+    tft.setCursor(SIDE_MARGIN, listY + 55);
+    tft.setTextColor(COLOR_DARK_GREEN);
+    tft.print("Auto device identification");
+  } else {
+    int totalFrames = min(bleFrameIndex, MAX_BLE_FRAMES);
+    
+    // Ensure scroll offset is valid
+    if (bleSnifferScrollOffset >= totalFrames) {
+      bleSnifferScrollOffset = max(0, totalFrames - MAX_ITEMS);
+    }
+    if (bleSnifferScrollOffset < 0) {
+      bleSnifferScrollOffset = 0;
+    }
+    
+    int displayCount = min(totalFrames - bleSnifferScrollOffset, MAX_ITEMS);
+    
+    for (int i = 0; i < displayCount; i++) {
+      int idx = (bleFrameIndex - totalFrames + bleSnifferScrollOffset + i + MAX_BLE_FRAMES) % MAX_BLE_FRAMES;
+      int y = listY + (i * ITEM_HEIGHT);
+      
+      // Safety check - stop if too close to footer
+      if (y + ITEM_HEIGHT > FOOTER_Y) break;
+      
+      BLEFrameInfo* frame = &bleFrames[idx];
+      
+      // Line 1: Type, Address (last 3 octets), Device, RSSI, Length
+      
+      // Type (always 3 chars: ADV or REQ)
+      uint16_t typeColor = (frame->type == 0) ? COLOR_GREEN : COLOR_YELLOW;
+      tft.setTextColor(typeColor);
+      tft.setTextSize(1);
+      tft.setCursor(SIDE_MARGIN, y + 2);
+      tft.print(frame->description);  // Always 3 letters
+      
+      // Address (last 3 octets) - with more spacing
+      tft.setTextColor(COLOR_CYAN);
+      tft.setCursor(30, y + 2);  // ← Changed from 24 to 30 (+6px spacing)
+      tft.printf("%02X:%02X:%02X", frame->addr[3], frame->addr[4], frame->addr[5]);
+      
+      // Device Type - truncated to fit (9 chars max)
+      tft.setTextColor(COLOR_PURPLE);
+      tft.setCursor(100, y + 2);
+      String devType = frame->deviceType;
+      if (devType.length() > 9) devType = devType.substring(0, 8) + "~";
+      tft.print(devType);
+      
+      // RSSI
+      tft.setTextColor(frame->rssi > -60 ? COLOR_GREEN : COLOR_YELLOW);
+      tft.setCursor(165, y + 2);
+      tft.printf("%3d", frame->rssi);
+      
+      // Data length
+      tft.setTextColor(COLOR_ORANGE);
+      tft.setCursor(205, y + 2);
+      tft.printf("%2dB", frame->dataLen);
+      
+      // Line 2: Full address
+      tft.setTextColor(COLOR_DARK_GREEN);
+      tft.setCursor(SIDE_MARGIN, y + 12);
+      tft.printf("%02X:%02X:%02X:%02X:%02X:%02X",
+                 frame->addr[0], frame->addr[1], frame->addr[2],
+                 frame->addr[3], frame->addr[4], frame->addr[5]);
+      
+      // Line 3: Time ago
+      unsigned long ago = (millis() - frame->timestamp) / 1000;
+      tft.setTextColor(COLOR_TEXT);
+      tft.setCursor(SIDE_MARGIN, y + 22);
+      if (ago < 60) {
+        tft.printf("%2ds ago", ago);
+      } else if (ago < 3600) {
+        tft.printf("%2dm ago", ago / 60);
+      } else {
+        tft.printf("%2dh ago", ago / 3600);
+      }
+    }
+    
+    // Scroll indicator - ONLY if needed
+    if (totalFrames > MAX_ITEMS) {
+      int scrollY = FOOTER_Y + 2;
+      tft.setTextColor(COLOR_DARK_GREEN);
+      tft.setTextSize(1);
+      
+      int currentPage = (bleSnifferScrollOffset / MAX_ITEMS) + 1;
+      int totalPages = (totalFrames + MAX_ITEMS - 1) / MAX_ITEMS;
+      char scrollText[30];
+      sprintf(scrollText, "Page %d/%d [Tap]", currentPage, totalPages);
+      int textWidth = strlen(scrollText) * 6;
+      int centerX = (240 - textWidth) / 2;
+      
+      tft.setCursor(centerX, scrollY);
+      tft.print(scrollText);
+    }
+  }
+  
+  drawCenteredButton("[STOP]", COLOR_RED);
+}
+
+void handleBLEFrameSnifferTouch(int x, int y) {
+  if (y > 300) {
+    stopBLEFrameSniffer();
+    currentState = SNIFFER_MENU;
+    hoveredIndex = -1;
+    drawSnifferMenu();
+    return;
+  }
+  
+  // Scroll through frames
+  if (bleFrameCount > 0 && y > HEADER_HEIGHT + 40 && y < 270) {
+    const int ITEM_HEIGHT = 30;
+    const int FOOTER_Y = 270;
+    const int listY = HEADER_HEIGHT + 37;
+    const int MAX_ITEMS = (FOOTER_Y - listY) / ITEM_HEIGHT;
+    
+    int totalFrames = min(bleFrameIndex, MAX_BLE_FRAMES);
+    int totalPages = (totalFrames + MAX_ITEMS - 1) / MAX_ITEMS;
+    
+    if (totalPages > 1) {
+      int currentPage = bleSnifferScrollOffset / MAX_ITEMS;
+      currentPage = (currentPage + 1) % totalPages;
+      bleSnifferScrollOffset = currentPage * MAX_ITEMS;
+      displayBLEFrameSniffer();
+    }
+  }
+}
+
+// ==================== DRAW SNIFFER MENU ====================
+void drawSnifferMenu() {
+  tft.fillScreen(COLOR_BG);
+  drawTerminalHeader("sniffer tools");
+  
+  const char* menuItems[] = {
+    "WiFi Frame Sniffer", 
+    "BLE Frame Sniffer", 
+    "Probe Request Sniffer",
+    "Management Frame Sniffer",
+    "Beacon Analyzer"
+  };
+  
+  int y = HEADER_HEIGHT + 10;
+  for (int i = 0; i < 5; i++) {  // ← Changed from 3 to 5
+    drawMenuItem(menuItems[i], i, y, hoveredIndex == i, false);
+    y += MENU_ITEM_HEIGHT + MENU_SPACING;
+  }
+  
+  // Info
+  y += 20;
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.println("WiFi: Ch 1-13 hop");
+  
+  y += 12;
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.println("BLE: Advertising capture");
+  
+  drawCenteredButton("[ESC]", COLOR_RED);
+}
+
+// ==================== DISPLAY BEACON ANALYZER ====================
+void displayBeaconAnalyzer() {
+  tft.fillScreen(COLOR_BG);
+  drawTerminalHeader("beacon analyzer");
+  
+  // Live indicator
+  static bool blink = false;
+  blink = !blink;
+  tft.fillCircle(220, 12, 3, blink ? COLOR_ORANGE : COLOR_DARK_GREEN);
+  
+  // Stats bar
+  int statsY = HEADER_HEIGHT + 5;
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(SIDE_MARGIN, statsY);
+  tft.printf("Ch%d", snifferChannel);
+  
+  tft.setTextColor(COLOR_CYAN);
+  tft.setCursor(50, statsY);
+  tft.printf("APs:%d", beaconCount);
+  
+  tft.setTextColor(COLOR_YELLOW);
+  tft.setCursor(120, statsY);
+  tft.printf("Beacons:%d", totalBeacons);
+  
+  // Column headers
+  int listY = HEADER_HEIGHT + 22;
+  tft.drawFastHLine(0, listY - 3, 240, COLOR_DARK_GREEN);
+  
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, listY);
+  tft.print("SSID");
+  tft.setCursor(90, listY);
+  tft.print("CH");
+  tft.setCursor(115, listY);
+  tft.print("ENC");
+  tft.setCursor(150, listY);
+  tft.print("WPS");
+  tft.setCursor(180, listY);
+  tft.print("VENDOR");
+  
+  tft.drawFastHLine(0, listY + 12, 240, COLOR_DARK_GREEN);
+  listY += 15;
+  
+  // Calculate display area
+  const int FOOTER_Y = 270;
+  const int ITEM_HEIGHT = 32;
+  const int MAX_ITEMS = (FOOTER_Y - listY) / ITEM_HEIGHT;
+  
+  if(beaconCount == 0) {
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(SIDE_MARGIN, listY + 40);
+  tft.print("Scanning for beacons...");
+  tft.setCursor(SIDE_MARGIN, listY + 55);
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.print("Tap beacon for details");
+  } else {
+  int displayCount = min((int)(beaconCount - beaconScrollOffset), MAX_ITEMS);
+
+  for (int i = 0; i < displayCount; i++) {
+  int idx = beaconScrollOffset + i;
+  int y = listY + (i * ITEM_HEIGHT);
+  
+  BeaconInfo* beacon = &beacons[idx];
+  
+  // Highlight if selected
+  if (selectedBeaconIndex == idx) {
+    tft.fillRect(0, y - 2, 240, ITEM_HEIGHT, COLOR_SELECTED_BG);
+  }
+  
+  // SSID
+  tft.setTextColor(COLOR_TEXT);
+  tft.setTextSize(1);
+  tft.setCursor(SIDE_MARGIN, y + 2);
+  String displaySSID = beacon->ssid.length() > 0 ? beacon->ssid : "<hidden>";
+  if (displaySSID.length() > 11) displaySSID = displaySSID.substring(0, 10) + "~";
+  tft.print(displaySSID);
+  
+  // Channel
+  tft.setTextColor(COLOR_CYAN);
+  tft.setCursor(90, y + 2);
+  tft.printf("%2d", beacon->channel);
+  
+  // Encryption
+  uint16_t encColor = COLOR_GREEN;
+  const char* encText = "OPEN";
+  if (beacon->encryptionType == 1) {
+    encColor = COLOR_YELLOW;
+    encText = "WPA";
+  } else if (beacon->encryptionType == 2) {
+    encColor = COLOR_ORANGE;
+    encText = "WPA2";
+  }
+  tft.setTextColor(encColor);
+  tft.setCursor(115, y + 2);
+  tft.print(encText);
+  
+  // WPS
+  tft.setTextColor(beacon->wpsEnabled ? COLOR_RED : COLOR_GREEN);
+  tft.setCursor(150, y + 2);
+  tft.print(beacon->wpsEnabled ? "YES" : "NO");
+  
+  // Vendor
+  tft.setTextColor(COLOR_PURPLE);
+  tft.setCursor(180, y + 2);
+  String vendorShort = beacon->vendor;
+  if (vendorShort.length() > 7) vendorShort = vendorShort.substring(0, 6) + "~";
+    tft.print(vendorShort);
+    
+    // BSSID on second line
+    tft.setTextColor(COLOR_DARK_GREEN);
+    tft.setCursor(SIDE_MARGIN, y + 12);
+    tft.printf("%02X:%02X:%02X:%02X:%02X:%02X", 
+              beacon->bssid[0], beacon->bssid[1], beacon->bssid[2],
+              beacon->bssid[3], beacon->bssid[4], beacon->bssid[5]);
+    
+    // RSSI and beacon count
+    tft.setTextColor(beacon->rssi > -50 ? COLOR_GREEN : COLOR_YELLOW);
+    tft.setCursor(SIDE_MARGIN, y + 22);
+    tft.printf("%ddBm", beacon->rssi);
+    
+    tft.setTextColor(COLOR_CYAN);
+    tft.setCursor(75, y + 22);
+    tft.printf("Seen:%d", beacon->beaconCount);
+  }
+
+  // Scroll indicator
+  if (beaconCount > MAX_ITEMS) {
+    tft.setTextColor(COLOR_DARK_GREEN);
+    tft.setCursor(70, FOOTER_Y);
+    int currentPage = (beaconScrollOffset / MAX_ITEMS) + 1;
+    int totalPages = (beaconCount + MAX_ITEMS - 1) / MAX_ITEMS;
+    tft.printf("Page %d/%d [Tap]", currentPage, totalPages);
+  }
+  }
+  drawCenteredButton("[STOP]", COLOR_RED, 305);
+}
+
+// ==================== PROBE REQUEST SNIFFER TOUCH ====================
+void handleProbeRequestSnifferTouch(int x, int y) {
+  if (y > 300) {
+    stopProbeRequestSniffer();
+    currentState = SNIFFER_MENU;
+    hoveredIndex = -1;
+    drawSnifferMenu();
+    return;
+  }
+  
+  // Scroll through probes
+  if (probeRequestCount > 0 && y > HEADER_HEIGHT + 40 && y < 270) {
+    const int MAX_ITEMS = 9;
+    int totalPages = (probeRequestCount + MAX_ITEMS - 1) / MAX_ITEMS;
+    
+    if (totalPages > 1) {
+      int currentPage = probeScrollOffset / MAX_ITEMS;
+      currentPage = (currentPage + 1) % totalPages;
+      probeScrollOffset = currentPage * MAX_ITEMS;
+      displayProbeRequestSniffer();
+    }
+  }
+}
+
+// ==================== MANAGEMENT FRAME SNIFFER TOUCH ====================
+void handleManagementFrameSnifferTouch(int x, int y) {
+  if (y > 300) {
+    stopManagementFrameSniffer();
+    currentState = SNIFFER_MENU;
+    hoveredIndex = -1;
+    drawSnifferMenu();
+    return;
+  }
+  
+  // Scroll through frames
+  if (mgmtFrameCount > 0 && y > HEADER_HEIGHT + 40 && y < 270) {
+    const int MAX_ITEMS = 10;
+    int totalPages = (mgmtFrameCount + MAX_ITEMS - 1) / MAX_ITEMS;
+    
+    if (totalPages > 1) {
+      int currentPage = mgmtScrollOffset / MAX_ITEMS;
+      currentPage = (currentPage + 1) % totalPages;
+      mgmtScrollOffset = currentPage * MAX_ITEMS;
+      displayManagementFrameSniffer();
+    }
+  }
+}
+
+// ==================== BEACON ANALYZER TOUCH ====================
+void handleBeaconAnalyzerTouch(int x, int y) {
+  if (y > 300) {
+    stopBeaconAnalyzer();
+    currentState = SNIFFER_MENU;
+    hoveredIndex = -1;
+    drawSnifferMenu();
+    return;
+  }
+  
+  // Tap to select beacon and print details
+  int listY = HEADER_HEIGHT + 37;
+  const int ITEM_HEIGHT = 32;
+  const int MAX_ITEMS = 7;
+  
+  if (beaconCount > 0 && y >= listY && y < (listY + MAX_ITEMS * ITEM_HEIGHT)) {
+    int clickedIndex = (y - listY) / ITEM_HEIGHT;
+    int actualIndex = beaconScrollOffset + clickedIndex;
+    
+    if (actualIndex >= 0 && actualIndex < beaconCount) {
+      selectedBeaconIndex = actualIndex;
+      displayBeaconAnalyzer();
+      
+      // Print full details to serial
+      BeaconInfo* beacon = &beacons[actualIndex];
+      
+      Serial.println("\n========================================");
+      Serial.println("[*] SELECTED BEACON DETAILS");
+      Serial.println("========================================");
+      Serial.printf("SSID: %s\n", beacon->ssid.length() > 0 ? beacon->ssid.c_str() : "<hidden>");
+      Serial.printf("BSSID: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                    beacon->bssid[0], beacon->bssid[1], beacon->bssid[2],
+                    beacon->bssid[3], beacon->bssid[4], beacon->bssid[5]);
+      Serial.printf("Channel: %d\n", beacon->channel);
+      Serial.printf("RSSI: %d dBm\n", beacon->rssi);
+      
+      const char* encType = "OPEN";
+      if (beacon->encryptionType == 1) encType = "WPA";
+      else if (beacon->encryptionType == 2) encType = "WPA2";
+      Serial.printf("Encryption: %s\n", encType);
+      
+      Serial.printf("Vendor: %s\n", beacon->vendor.c_str());
+      Serial.printf("Beacon Interval: %d ms\n", beacon->beaconInterval);
+      Serial.printf("WPS: %s ", beacon->wpsEnabled ? "YES" : "NO");
+      if (beacon->wpsEnabled) {
+        Serial.println("(âš ï¸  VULNERABLE)");
+      } else {
+        Serial.println("(Secure)");
+      }
+      Serial.printf("WMM: %s\n", beacon->wmmEnabled ? "YES" : "NO");
+      
+      // Supported rates
+      if (beacon->numRates > 0) {
+        Serial.print("Supported Rates: ");
+        for (int i = 0; i < beacon->numRates; i++) {
+          int rate = (beacon->supportedRates[i] & 0x7F) * 0.5;
+          Serial.printf("%d%s", rate, i < beacon->numRates - 1 ? "," : " Mbps\n");
+        }
+      }
+      
+      Serial.printf("Beacons Seen: %d\n", beacon->beaconCount);
+      Serial.printf("First Seen: %lu ms ago\n", millis() - beacon->firstSeen);
+      Serial.printf("Last Seen: %lu ms ago\n", millis() - beacon->lastSeen);
+      Serial.println("========================================\n");
+    }
+  }
+  
+  // Scroll through beacons
+  if (beaconCount > MAX_ITEMS && y >= listY && y < 270) {
+    int totalPages = (beaconCount + MAX_ITEMS - 1) / MAX_ITEMS;
+    int currentPage = beaconScrollOffset / MAX_ITEMS;
+    currentPage = (currentPage + 1) % totalPages;
+    beaconScrollOffset = currentPage * MAX_ITEMS;
+    displayBeaconAnalyzer();
+  }
+}
+
+void handleSnifferMenuTouch(int x, int y) {
+  if (y > 300) {
+    currentState = MAIN_MENU;
+    hoveredIndex = -1;
+    drawMainMenu();
+    return;
+  }
+  
+  int startY = HEADER_HEIGHT + 10;
+  
+  if (y >= startY && y < startY + (5 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {
+    int relativeY = y - startY;
+    int buttonIndex = relativeY / (MENU_ITEM_HEIGHT + MENU_SPACING);
+    
+    int buttonY = startY + (buttonIndex * (MENU_ITEM_HEIGHT + MENU_SPACING));
+    if (y >= buttonY && y <= buttonY + MENU_ITEM_HEIGHT) {
+      switch (buttonIndex) {
+        case 0: // WiFi Frame Sniffer
+          currentState = SNIFFER_ACTIVE;
+          snifferScrollOffset = 0;
+          packetHistoryIndex = 0;
+          startSniffer();
+          break;
+        case 1: // BLE Frame Sniffer
+          currentState = BLE_SNIFFER_ACTIVE;
+          startBLEFrameSniffer();
+          break;
+        case 2: // Probe Request Sniffer
+          currentState = PROBE_SNIFFER_ACTIVE;
+          startProbeRequestSniffer();
+          break;
+        case 3: // Management Frame Sniffer
+          currentState = MGMT_SNIFFER_ACTIVE;
+          startManagementFrameSniffer();
+          break;
+        case 4: // Beacon Analyzer
+          currentState = BEACON_ANALYZER_ACTIVE;
+          startBeaconAnalyzer();
+          break;
+      }
+    }
+  }
+}
+
 // ==================== CAPTURE HANDSHAKE FROM SNIFFER ====================
 void IRAM_ATTR wifiSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
   wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t*)buf;
@@ -783,6 +2170,7 @@ struct PasswordValidationTask {
   bool* result;
   bool* completed;
 };
+
 // ==================== VALIDATE PASSWORD AGAINST HANDSHAKE ====================
 void validatePasswordTask(void* parameter) {
   PasswordValidationTask* params = (PasswordValidationTask*)parameter;
@@ -3725,6 +5113,26 @@ void handleTouch() {
         handleBeaconAddTouch(touchX, touchY);
         break;
 
+      case PROBE_SNIFFER_ACTIVE:
+        handleProbeRequestSnifferTouch(touchX, touchY);
+        break;
+
+      case MGMT_SNIFFER_ACTIVE:
+        handleManagementFrameSnifferTouch(touchX, touchY);
+        break;
+
+      case BEACON_ANALYZER_ACTIVE:
+        handleBeaconAnalyzerTouch(touchX, touchY);
+        break;
+
+      case BLE_SNIFFER_ACTIVE:
+        handleBLEFrameSnifferTouch(touchX, touchY);
+        break;
+
+      case SNIFFER_MENU:
+        handleSnifferMenuTouch(touchX, touchY);
+        break;
+
       case WIFI_BLE_NRF_JAM:
         // Handle both deauth flood and combined jammer
         if (deauthFloodActive) {
@@ -3743,13 +5151,13 @@ void handleTouch() {
         Serial.println("[1] Promiscuous mode disabled");
         snifferActive = false;
         Serial.printf("[2] snifferActive = %d\n", snifferActive);
-        currentState = MAIN_MENU;
-        Serial.printf("[3] currentState = %d (MAIN_MENU)\n", currentState);
+        currentState = SNIFFER_MENU;  // ← CHANGED from MAIN_MENU
+        Serial.printf("[3] currentState = %d (SNIFFER_MENU)\n", currentState);
         delay(50);
         tft.fillScreen(COLOR_BG);
         Serial.println("[4] Screen cleared");
-        drawMainMenu();
-        Serial.println("[5] Main menu drawn");
+        drawSnifferMenu();
+        Serial.println("[5] Sniffer menu drawn");
         addToConsole("Sniffer stopped");
         
         Serial.printf("After: snifferActive=%d, currentState=%d\n", snifferActive, currentState);
@@ -4148,6 +5556,33 @@ void handleBackButton() {
       hoveredIndex = -1;
       drawMainMenu();
       break;
+    
+    case SNIFFER_MENU:
+      currentState = MAIN_MENU;
+      hoveredIndex = -1;
+      drawMainMenu();
+      break;
+
+    case PROBE_SNIFFER_ACTIVE:
+      stopProbeRequestSniffer();
+      currentState = SNIFFER_MENU;
+      hoveredIndex = -1;
+      drawSnifferMenu();
+      break;
+
+    case MGMT_SNIFFER_ACTIVE:
+      stopManagementFrameSniffer();
+      currentState = SNIFFER_MENU;
+      hoveredIndex = -1;
+      drawSnifferMenu();
+      break;
+
+    case BEACON_ANALYZER_ACTIVE:
+      stopBeaconAnalyzer();
+      currentState = SNIFFER_MENU;
+      hoveredIndex = -1;
+      drawSnifferMenu();
+      break;
       
     default:
       currentState = MAIN_MENU;
@@ -4202,9 +5637,9 @@ void handleMainMenuTouch(int x, int y) {
           drawMoreToolsMenu();
           break;
         case 4: // Sniffer Tools
-          snifferScrollOffset = 0;
-          packetHistoryIndex = 0;
-          startSniffer();
+          currentState = SNIFFER_MENU;
+          hoveredIndex = -1;
+          drawSnifferMenu();
           break;
         case 5: // Settings
           currentState = SETTINGS_MENU;
@@ -4765,7 +6200,72 @@ void handleAttackMenuTouch(int x, int y) {
 
 void loop() {
   esp_task_wdt_reset();
+
+  // Probe Request Sniffer with channel hopping
+if (probeSnifferActive) {
+  static unsigned long lastProbeHop = 0;
+  static unsigned long lastProbeUpdate = 0;
   
+  // Fast channel hopping - 150ms per channel
+  if (millis() - lastProbeHop > 150) {
+    snifferChannel = (snifferChannel % 13) + 1;
+    esp_wifi_set_channel(snifferChannel, WIFI_SECOND_CHAN_NONE);
+    lastProbeHop = millis();
+  }
+  
+  // Update display every 300ms
+  if (millis() - lastProbeUpdate > 300) {
+    displayProbeRequestSniffer();
+    lastProbeUpdate = millis();
+  }
+}
+
+// Management Frame Sniffer with channel hopping
+if (mgmtSnifferActive) {
+  static unsigned long lastMgmtHop = 0;
+  static unsigned long lastMgmtUpdate = 0;
+  
+  // Fast channel hopping - 150ms per channel
+  if (millis() - lastMgmtHop > 150) {
+    snifferChannel = (snifferChannel % 13) + 1;
+    esp_wifi_set_channel(snifferChannel, WIFI_SECOND_CHAN_NONE);
+    lastMgmtHop = millis();
+  }
+  
+  // Update display every 300ms
+  if (millis() - lastMgmtUpdate > 300) {
+    displayManagementFrameSniffer();
+    lastMgmtUpdate = millis();
+  }
+}
+
+// Beacon Analyzer with channel hopping
+if (beaconAnalyzerActive) {
+  static unsigned long lastBeaconHop = 0;
+  static unsigned long lastBeaconUpdate = 0;
+  
+  // Channel hopping - 200ms per channel
+  if (millis() - lastBeaconHop > 200) {
+    snifferChannel = (snifferChannel % 13) + 1;
+    esp_wifi_set_channel(snifferChannel, WIFI_SECOND_CHAN_NONE);
+    lastBeaconHop = millis();
+  }
+  
+  // Update display every 300ms
+  if (millis() - lastBeaconUpdate > 300) {
+    displayBeaconAnalyzer();
+    lastBeaconUpdate = millis();
+  }
+}
+  // BLE Frame Sniffer with live updates
+  if (bleSnifferActive && currentState == BLE_SNIFFER_ACTIVE) {
+    static unsigned long lastBLESnifferUpdate = 0;
+    
+    if (millis() - lastBLESnifferUpdate > 500) {
+      displayBLEFrameSniffer();
+      lastBLESnifferUpdate = millis();
+    }
+  }
   // ==================== TURBO MODE: nRF24 JAMMER ONLY - MAXIMUM SPEED ====================
   if (nrfJammerActive && nrfTurboMode) {
     // ⚡ ULTRA-FAST MODE: Touch check only every 100K hops (not every loop!)
@@ -6483,7 +7983,7 @@ void stopSniffer() {
 
 void displaySnifferActive() {
   tft.fillScreen(COLOR_BG);
-  drawTerminalHeader("packet sniffer");
+  drawTerminalHeader("wifi frame sniffer");
   
   // Live indicator
   static bool blink = false;
